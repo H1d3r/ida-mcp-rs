@@ -96,6 +96,9 @@ jobs:
         with:
           path: artifacts
 
+      - name: Install just
+        run: sudo apt-get update && sudo apt-get install -y just
+
       - name: Package artifacts
         run: just ci-package-artifacts
 
