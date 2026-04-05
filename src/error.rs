@@ -51,6 +51,12 @@ pub enum ToolError {
     #[error("Operation timed out after {0} seconds")]
     Timeout(u64),
 
+    #[error("{0}")]
+    TimeoutDetailed(String),
+
+    #[error("{0}")]
+    Cancelled(String),
+
     #[error("Server is busy (request queue full). Please retry.")]
     Busy,
 

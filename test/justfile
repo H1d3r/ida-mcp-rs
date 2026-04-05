@@ -4,6 +4,7 @@ cc := env_var_or_default("CC", "cc")
 cflags := env_var_or_default("CFLAGS", "-O0 -g -fno-omit-frame-pointer")
 test_src := "fixtures/mini.c"
 test_bin := "fixtures/mini"
+test_i64 := "fixtures/mini.i64"
 test_lock := "fixtures/mini.imcp"
 server_bin := env_var_or_default("SERVER_BIN", "../target/release/ida-mcp")
 rust_log := env_var_or_default("RUST_LOG", "ida_mcp=trace")
@@ -15,6 +16,33 @@ default:
 # Build test fixture
 fixture:
     {{ cc }} {{ cflags }} -o "{{ test_bin }}" "{{ test_src }}"
+
+# Bootstrap a deterministic .i64 fixture for tests that should not wait on raw-binary auto-analysis
+test-bootstrap: fixture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'cargo build --release' first"
+        exit 1
+    fi
+    if [ -f "{{ test_i64 }}" ]; then
+        echo "✅ Bootstrap fixture already present: {{ test_i64 }}"
+        exit 0
+    fi
+    LOCK="{{ test_lock }}"
+    if [ -f "$LOCK" ]; then
+        pid=$(awk -F= '$1=="pid"{print $2}' "$LOCK" | tr -d '\r')
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            echo "Lock file $LOCK is held by pid $pid; close that server first." >&2
+            exit 1
+        else
+            rm -f "$LOCK"
+        fi
+    fi
+    echo "🧪 Bootstrapping {{ test_i64 }} via MCP server..."
+    RUST_LOG="{{ rust_log }}" MCP_HTTP_BIN="{{ server_bin }}" IDB_PATH="{{ test_bin }}" bash ./http_bootstrap.sh
+    echo "✅ Bootstrap fixture created: {{ test_i64 }}"
 
 # Run stdio integration test
 test: fixture
@@ -76,7 +104,7 @@ test-http: fixture
     echo "✅ HTTP test passed"
 
 # Run IDAPython script integration test
-test-script: fixture
+test-script: test-bootstrap
     #!/usr/bin/env bash
     set -euo pipefail
     if [ ! -x "{{ server_bin }}" ]; then
@@ -95,52 +123,31 @@ test-script: fixture
         fi
     fi
     echo "🧪 Running IDAPython script test..."
-    tmp="$(mktemp)"
-    # Keep stdin open long enough for open_idb auto-analysis (~10s for raw binaries)
-    (cat payloads/script.jsonl; sleep 30) | RUST_LOG="{{ rust_log }}" "{{ server_bin }}" >"$tmp" 2>&1 || true
-    cat "$tmp"
-
-    # Verify simple inline script execution (id=3)
-    if ! rg -q 'inline_simple_ok function_count=' "$tmp"; then
-        echo "❌ Simple inline script output missing"
-        rm -f "$tmp"
-        exit 1
-    fi
-
-    # Verify file-based script execution (id=4)
-    if ! rg -q 'total_functions=' "$tmp"; then
-        echo "❌ File-based script (fixtures/test_analysis.py) output missing"
-        rm -f "$tmp"
-        exit 1
-    fi
-
-    # Verify complex inline script execution (id=5)
-    if ! rg -q 'complex_ok total=' "$tmp"; then
-        echo "❌ Complex inline script output missing"
-        rm -f "$tmp"
-        exit 1
-    fi
-
-    # Verify syntax error surfaced as MCP-level error (id=6)
-    error_count="$( (rg -o '"isError"\s*:\s*true' "$tmp" || true) | wc -l | tr -d ' ' )"
-    if [ "$error_count" != "1" ]; then
-        echo "❌ Expected exactly one MCP-level error response, got $error_count"
-        rm -f "$tmp"
-        exit 1
-    fi
-    if ! rg -q 'SyntaxError' "$tmp"; then
-        echo "❌ SyntaxError details missing for invalid script case"
-        rm -f "$tmp"
-        exit 1
-    fi
-    if ! rg -q 'IDAPython script execution failed' "$tmp"; then
-        echo "❌ Script failure summary missing for invalid script case"
-        rm -f "$tmp"
-        exit 1
-    fi
-
-    rm -f "$tmp"
+    RUST_LOG="{{ rust_log }}" MCP_HTTP_BIN="{{ server_bin }}" IDB_PATH="{{ test_i64 }}" bash ./http_script_integration.sh
     echo "✅ Script test passed"
+
+# Run foreground observability integration test
+test-observability: test-bootstrap
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'cargo build --release' first"
+        exit 1
+    fi
+    LOCK="{{ test_lock }}"
+    if [ -f "$LOCK" ]; then
+        pid=$(awk -F= '$1=="pid"{print $2}' "$LOCK" | tr -d '\r')
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            echo "Lock file $LOCK is held by pid $pid; close that server first." >&2
+            exit 1
+        else
+            rm -f "$LOCK"
+        fi
+    fi
+    echo "🧪 Running observability integration test..."
+    RUST_LOG="{{ rust_log }}" MCP_HTTP_BIN="{{ server_bin }}" IDB_PATH="{{ test_bin }}" bash ./http_observability.sh
+    echo "✅ Observability test passed"
 
 dsc_test_path := env_var_or_default("DSC_TEST_PATH", "/tmp/ios_sys_mount/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e")
 

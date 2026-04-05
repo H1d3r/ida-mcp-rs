@@ -158,8 +158,9 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
                     The database must be opened before using any other analysis tools. \
                     Call close_idb when finished to release database locks; in multi-client servers, coordinate before closing. \
                     In HTTP/SSE mode, open_idb returns a close_token that must be provided to close_idb. \
+                    Supports timeout_secs (default 300s, max 600s) and emits MCP progress notifications when the client requests progress. \
                     Returns metadata about the binary: file type, processor, bitness, function count.",
-        example: r#"{"path": "/path/to/binary", "load_debug_info": true}"#,
+        example: r#"{"path": "/path/to/binary", "load_debug_info": true, "timeout_secs": 300}"#,
         default: true,
         keywords: &["open", "load", "database", "binary", "idb", "i64", "macho", "elf", "pe"],
     },
@@ -275,6 +276,17 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         keywords: &["help", "docs", "documentation", "schema", "usage"],
     },
     ToolInfo {
+        name: "recent_operations",
+        category: ToolCategory::Core,
+        short_desc: "Inspect recent foreground operation history",
+        full_desc: "Return the currently active foreground operation (if any) and a capped trail of recent \
+                    phase transitions recorded for open_idb, run_script, and analyze_funcs. \
+                    Use this after timeouts, cancellations, or failures to inspect the last known phase.",
+        example: r#"{"limit": 10}"#,
+        default: false,
+        keywords: &["recent", "operations", "history", "progress", "timeout", "cancel", "observability"],
+    },
+    ToolInfo {
         name: "task_status",
         category: ToolCategory::Core,
         short_desc: "Check status of a background task (e.g. DSC loading)",
@@ -355,7 +367,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::Functions,
         short_desc: "Run auto-analysis and wait for completion",
         full_desc: "Run IDA auto-analysis and wait for completion. \
-                    Returns whether analysis completed and current function count.",
+                    Emits progress notifications when the client requests progress, \
+                    and returns whether analysis completed and the current function count.",
         example: r#"{"timeout_secs": 120}"#,
         default: false,
         keywords: &["analyze", "functions", "analysis", "auto"],
@@ -898,7 +911,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
                     Has full access to all ida_* modules (ida_funcs, ida_bytes, ida_segment, etc.), \
                     idc, and idautils. stdout and stderr are captured and returned. \
                     Use this for custom analysis that goes beyond the built-in tools. \
-                    Requires that the IDAPython plugin is loaded (available by default in IDA Pro). \
+                    Supports timeout_secs, emits foreground progress notifications when requested by the client, \
+                    and requires that the IDAPython plugin is loaded (available by default in IDA Pro). \
                     API reference: https://python.docs.hex-rays.com",
         example: r#"{"code": "import idautils\nfor f in idautils.Functions():\n    print(hex(f))"}"#,
         default: false,

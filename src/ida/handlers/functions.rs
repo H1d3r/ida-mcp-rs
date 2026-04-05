@@ -2,9 +2,14 @@
 
 use crate::error::ToolError;
 use crate::ida::handlers::parse_address_str;
+use crate::ida::observability::{
+    emit_progress, ensure_not_cancelled, ProgressHeartbeat, ProgressSender,
+    SINGLE_PHASE_PROGRESS_TOTAL,
+};
 use crate::ida::types::{FunctionInfo, FunctionListResult, FunctionRangeInfo};
 use idalib::IDB;
 use serde_json::{json, Value};
+use tokio_util::sync::CancellationToken;
 
 pub fn handle_list_functions(
     idb: &Option<IDB>,
@@ -127,9 +132,30 @@ pub fn handle_lookup_funcs(idb: &Option<IDB>, queries: &[String]) -> Result<Valu
     Ok(json!({ "results": results }))
 }
 
-pub fn handle_analyze_funcs(idb: &mut Option<IDB>) -> Result<Value, ToolError> {
+pub fn handle_analyze_funcs(
+    idb: &mut Option<IDB>,
+    progress_tx: Option<ProgressSender>,
+    cancel: Option<CancellationToken>,
+) -> Result<Value, ToolError> {
     let db = idb.as_mut().ok_or(ToolError::NoDatabaseOpen)?;
+    ensure_not_cancelled(cancel.as_ref())?;
+    let _heartbeat = ProgressHeartbeat::start(
+        progress_tx.clone(),
+        "analyzing",
+        0.0,
+        0.95,
+        Some(SINGLE_PHASE_PROGRESS_TOTAL),
+        "Waiting for IDA auto-analysis to finish",
+    );
     let completed = db.auto_wait();
+    ensure_not_cancelled(cancel.as_ref())?;
+    emit_progress(
+        progress_tx.as_ref(),
+        "analyzing",
+        0.95,
+        Some(SINGLE_PHASE_PROGRESS_TOTAL),
+        "IDA auto-analysis finished; collecting result",
+    );
     Ok(json!({
         "completed": completed,
         "function_count": db.function_count(),

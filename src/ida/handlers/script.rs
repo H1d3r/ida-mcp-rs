@@ -1,8 +1,13 @@
 //! Script execution handler.
 
 use crate::error::ToolError;
+use crate::ida::observability::{
+    emit_progress, ensure_not_cancelled, ProgressHeartbeat, ProgressSender,
+    SINGLE_PHASE_PROGRESS_TOTAL,
+};
 use idalib::IDB;
 use serde_json::{json, Value};
+use tokio_util::sync::CancellationToken;
 
 fn last_non_empty_line(text: &str) -> Option<&str> {
     text.lines().rev().find_map(|line| {
@@ -38,9 +43,24 @@ fn classify_python_error(details: &str) -> Option<&'static str> {
     None
 }
 
-pub fn handle_run_script(idb: &Option<IDB>, code: &str) -> Result<Value, ToolError> {
+pub fn handle_run_script(
+    idb: &Option<IDB>,
+    code: &str,
+    progress_tx: Option<ProgressSender>,
+    cancel: Option<CancellationToken>,
+) -> Result<Value, ToolError> {
     let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
+    ensure_not_cancelled(cancel.as_ref())?;
+    let _heartbeat = ProgressHeartbeat::start(
+        progress_tx.clone(),
+        "executing",
+        0.0,
+        0.95,
+        Some(SINGLE_PHASE_PROGRESS_TOTAL),
+        "Executing IDAPython script",
+    );
     let output = db.run_python(code)?;
+    ensure_not_cancelled(cancel.as_ref())?;
     let error_summary = output
         .error
         .as_deref()
@@ -73,6 +93,13 @@ pub fn handle_run_script(idb: &Option<IDB>, code: &str) -> Result<Value, ToolErr
     if let Some(kind) = error_kind {
         result["error_kind"] = json!(kind);
     }
+    emit_progress(
+        progress_tx.as_ref(),
+        "executing",
+        0.95,
+        Some(SINGLE_PHASE_PROGRESS_TOTAL),
+        "Script execution finished; packaging result",
+    );
     Ok(result)
 }
 

@@ -14,6 +14,10 @@ use crate::ida::handlers::{
     memory, script, search, segments, strings, structs, types, xrefs,
 };
 use crate::ida::lock::release_mcp_lock;
+use crate::ida::observability::{
+    emit_progress, ensure_not_cancelled, ProgressHeartbeat, OPEN_IDB_PROGRESS_TOTAL,
+    SINGLE_PHASE_PROGRESS_TOTAL,
+};
 use crate::ida::request::IdaRequest;
 
 /// Log result with debug on success and warn on error.
@@ -44,7 +48,19 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>) {
         // Lazily initialize the IDA library on first use.
         // Must happen on the main thread (which this loop runs on).
         if !lib_initialized {
+            if let Err(err) = ensure_not_cancelled(req.cancel_token()) {
+                reject_with_error(req, err);
+                continue;
+            }
             info!("Initializing IDA library on main thread (deferred)");
+            let _heartbeat = ProgressHeartbeat::start(
+                req.progress_sender().cloned(),
+                "initializing",
+                0.0,
+                0.9,
+                Some(OPEN_IDB_PROGRESS_TOTAL),
+                "Initializing IDA runtime on the main thread",
+            );
             idalib::init_library();
             lib_initialized = true;
 
@@ -93,8 +109,21 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>) {
                 file_type,
                 auto_analyse,
                 extra_args,
+                progress_tx,
+                cancel,
                 resp,
             } => {
+                if let Err(err) = ensure_not_cancelled(cancel.as_ref()) {
+                    emit_progress(
+                        progress_tx.as_ref(),
+                        "cancelled",
+                        0.0,
+                        Some(OPEN_IDB_PROGRESS_TOTAL),
+                        "open_idb cancelled before opening database",
+                    );
+                    let _ = resp.send(Err(err));
+                    continue;
+                }
                 info!(path = %path, force, file_type = ?file_type, auto_analyse, "Opening database");
                 let result = database::handle_open(
                     &mut idb,
@@ -108,16 +137,46 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>) {
                     file_type.as_deref(),
                     auto_analyse,
                     &extra_args,
+                    progress_tx.clone(),
+                    cancel.clone(),
                 );
                 match &result {
-                    Ok(info) => info!(
-                        path = %info.path,
-                        processor = %info.processor,
-                        bits = info.bits,
-                        functions = info.function_count,
-                        "Database opened"
-                    ),
-                    Err(e) => error!(path = %path, error = %e, "Failed to open database"),
+                    Ok(info) => {
+                        emit_progress(
+                            progress_tx.as_ref(),
+                            "completed",
+                            OPEN_IDB_PROGRESS_TOTAL,
+                            Some(OPEN_IDB_PROGRESS_TOTAL),
+                            format!("Opened database {}", info.path),
+                        );
+                        info!(
+                            path = %info.path,
+                            processor = %info.processor,
+                            bits = info.bits,
+                            functions = info.function_count,
+                            "Database opened"
+                        );
+                    }
+                    Err(ToolError::Cancelled(message)) => {
+                        emit_progress(
+                            progress_tx.as_ref(),
+                            "cancelled",
+                            0.0,
+                            Some(OPEN_IDB_PROGRESS_TOTAL),
+                            message.clone(),
+                        );
+                        warn!(path = %path, error = %message, "open_idb cancelled");
+                    }
+                    Err(e) => {
+                        emit_progress(
+                            progress_tx.as_ref(),
+                            "failed",
+                            0.0,
+                            Some(OPEN_IDB_PROGRESS_TOTAL),
+                            format!("open_idb failed: {e}"),
+                        );
+                        error!(path = %path, error = %e, "Failed to open database");
+                    }
                 }
                 let _ = resp.send(result);
             }
@@ -812,9 +871,58 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>) {
                 );
                 let _ = resp.send(result);
             }
-            IdaRequest::AnalyzeFuncs { resp } => {
+            IdaRequest::AnalyzeFuncs {
+                progress_tx,
+                cancel,
+                resp,
+            } => {
+                if let Err(err) = ensure_not_cancelled(cancel.as_ref()) {
+                    emit_progress(
+                        progress_tx.as_ref(),
+                        "cancelled",
+                        0.0,
+                        Some(SINGLE_PHASE_PROGRESS_TOTAL),
+                        "analyze_funcs cancelled before starting auto-analysis",
+                    );
+                    let _ = resp.send(Err(err));
+                    continue;
+                }
                 debug!("Running auto-analysis");
-                let result = functions::handle_analyze_funcs(&mut idb);
+                let result =
+                    functions::handle_analyze_funcs(&mut idb, progress_tx.clone(), cancel.clone());
+                match &result {
+                    Ok(value) => emit_progress(
+                        progress_tx.as_ref(),
+                        "completed",
+                        SINGLE_PHASE_PROGRESS_TOTAL,
+                        Some(SINGLE_PHASE_PROGRESS_TOTAL),
+                        format!(
+                            "Auto-analysis completed (completed={}, functions={})",
+                            value
+                                .get("completed")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false),
+                            value
+                                .get("function_count")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0)
+                        ),
+                    ),
+                    Err(ToolError::Cancelled(message)) => emit_progress(
+                        progress_tx.as_ref(),
+                        "cancelled",
+                        0.0,
+                        Some(SINGLE_PHASE_PROGRESS_TOTAL),
+                        message.clone(),
+                    ),
+                    Err(err) => emit_progress(
+                        progress_tx.as_ref(),
+                        "failed",
+                        0.0,
+                        Some(SINGLE_PHASE_PROGRESS_TOTAL),
+                        format!("analyze_funcs failed: {err}"),
+                    ),
+                }
                 let _ = resp.send(result);
             }
             IdaRequest::FindBytes {
@@ -969,10 +1077,27 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>) {
                 }
                 let _ = resp.send(result);
             }
-            IdaRequest::RunScript { code, resp } => {
+            IdaRequest::RunScript {
+                code,
+                progress_tx,
+                cancel,
+                resp,
+            } => {
+                if let Err(err) = ensure_not_cancelled(cancel.as_ref()) {
+                    emit_progress(
+                        progress_tx.as_ref(),
+                        "cancelled",
+                        0.0,
+                        Some(SINGLE_PHASE_PROGRESS_TOTAL),
+                        "run_script cancelled before execution started",
+                    );
+                    let _ = resp.send(Err(err));
+                    continue;
+                }
                 debug!(code_len = code.len(), "Running script");
                 let started = std::time::Instant::now();
-                let result = script::handle_run_script(&idb, &code);
+                let result =
+                    script::handle_run_script(&idb, &code, progress_tx.clone(), cancel.clone());
                 let elapsed_ms = started.elapsed().as_millis();
                 match &result {
                     Ok(value) => {
@@ -988,16 +1113,47 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>) {
                             .map(|s| s.len())
                             .unwrap_or(0);
                         if success {
+                            emit_progress(
+                                progress_tx.as_ref(),
+                                "completed",
+                                SINGLE_PHASE_PROGRESS_TOTAL,
+                                Some(SINGLE_PHASE_PROGRESS_TOTAL),
+                                format!("Script executed successfully in {elapsed_ms}ms"),
+                            );
                             debug!(elapsed_ms, stdout_len, stderr_len, "Script executed");
                         } else {
                             let error = value.get("error").and_then(|v| v.as_str()).unwrap_or("");
+                            emit_progress(
+                                progress_tx.as_ref(),
+                                "failed",
+                                0.0,
+                                Some(SINGLE_PHASE_PROGRESS_TOTAL),
+                                format!("Script execution reported failure: {error}"),
+                            );
                             warn!(
                                 elapsed_ms,
                                 stdout_len, stderr_len, error, "Script execution reported failure"
                             );
                         }
                     }
+                    Err(ToolError::Cancelled(message)) => {
+                        emit_progress(
+                            progress_tx.as_ref(),
+                            "cancelled",
+                            0.0,
+                            Some(SINGLE_PHASE_PROGRESS_TOTAL),
+                            message.clone(),
+                        );
+                        warn!(elapsed_ms, error = %message, "Script execution cancelled");
+                    }
                     Err(e) => {
+                        emit_progress(
+                            progress_tx.as_ref(),
+                            "failed",
+                            0.0,
+                            Some(SINGLE_PHASE_PROGRESS_TOTAL),
+                            format!("Failed to execute script: {e}"),
+                        );
                         warn!(elapsed_ms, error = %e, "Failed to execute script");
                     }
                 }
@@ -1027,8 +1183,10 @@ fn shutdown_cleanup(
 /// Send a version-mismatch error for every request variant so the
 /// agent gets a clear message instead of a segfault.
 fn reject_with_version_error(req: IdaRequest, msg: &str) {
-    let err = ToolError::SdkVersionMismatch(msg.to_owned());
+    reject_with_error(req, ToolError::SdkVersionMismatch(msg.to_owned()));
+}
 
+fn reject_with_error(req: IdaRequest, err: ToolError) {
     /// Helper: send `Err(err)` on a `oneshot::Sender<Result<T, ToolError>>`.
     macro_rules! reject {
         ($resp:expr, $err:expr) => {{

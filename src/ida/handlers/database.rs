@@ -6,15 +6,18 @@ use crate::ida::handlers::analysis::build_analysis_status;
 use crate::ida::lock::{
     acquire_mcp_lock, clean_stale_mcp_lock, detect_db_lock, release_mcp_lock_file,
 };
+use crate::ida::observability::{
+    emit_progress, ensure_not_cancelled, ProgressHeartbeat, ProgressSender, OPEN_IDB_PROGRESS_TOTAL,
+};
 use crate::ida::types::{DbInfo, DebugInfoLoad};
 use idalib::{IDBOpenOptions, IDB};
 use serde_json::{json, Value};
 use std::ffi::OsString;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 /// Build `DbInfo` from an open IDB.
@@ -109,8 +112,11 @@ pub fn handle_open(
     file_type: Option<&str>,
     auto_analyse: bool,
     extra_args: &[String],
+    progress_tx: Option<ProgressSender>,
+    cancel: Option<CancellationToken>,
 ) -> Result<DbInfo, ToolError> {
     let expanded = expand_path(path);
+    ensure_not_cancelled(cancel.as_ref())?;
 
     // Check if a database is already open
     if let Some(db) = idb.as_ref() {
@@ -171,27 +177,42 @@ pub fn handle_open(
     let mcp_lock = acquire_mcp_lock(&expanded)?;
 
     // Open database
-    let done = Arc::new(AtomicBool::new(false));
-    let done_clone = done.clone();
     let path_display = expanded.display().to_string();
+    let (ticker_stop_tx, ticker_stop_rx) = mpsc::channel();
     let ticker = std::thread::spawn(move || {
         let start = Instant::now();
         loop {
-            std::thread::sleep(Duration::from_secs(10));
-            if done_clone.load(Ordering::Relaxed) {
-                break;
+            match ticker_stop_rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    info!(
+                        path = %path_display,
+                        elapsed = start.elapsed().as_secs(),
+                        "Still opening database..."
+                    );
+                }
             }
-            info!(
-                path = %path_display,
-                elapsed = start.elapsed().as_secs(),
-                "Still opening database..."
-            );
         }
     });
 
     let open_start = Instant::now();
     let mut opened_path = expanded.clone();
     let init_args = init_database_args(extra_args);
+    let open_message = if is_idb {
+        "Opening existing IDA database"
+    } else if auto_analyse {
+        "Opening raw binary and waiting for initial auto-analysis"
+    } else {
+        "Opening raw binary"
+    };
+    let _opening_heartbeat = ProgressHeartbeat::start(
+        progress_tx.clone(),
+        "opening",
+        1.0,
+        2.8,
+        Some(OPEN_IDB_PROGRESS_TOTAL),
+        open_message,
+    );
     let db = if is_idb {
         // Open existing IDA database (no auto-analysis needed, but save=true to pack on close)
         let mut opts = IDBOpenOptions::new();
@@ -236,7 +257,7 @@ pub fn handle_open(
         }
         opts.idb(out_path).save(true).open(&expanded)
     };
-    done.store(true, Ordering::Relaxed);
+    let _ = ticker_stop_tx.send(());
     let _ = ticker.join();
     let db = match db {
         Ok(db) => db,
@@ -252,9 +273,27 @@ pub fn handle_open(
             )));
         }
     };
+    ensure_not_cancelled(cancel.as_ref())?;
+    if !is_idb && auto_analyse {
+        emit_progress(
+            progress_tx.as_ref(),
+            "analyzing",
+            2.0,
+            Some(OPEN_IDB_PROGRESS_TOTAL),
+            "Raw binary open finished; collecting post-open analysis state",
+        );
+    }
 
     let mut debug_info = None;
     if load_debug_info {
+        emit_progress(
+            progress_tx.as_ref(),
+            "loading_debug_info",
+            3.0,
+            Some(OPEN_IDB_PROGRESS_TOTAL),
+            "Loading requested debug information",
+        );
+        ensure_not_cancelled(cancel.as_ref())?;
         let mut resolved = None;
         if let Some(path) = debug_info_path {
             resolved = Some(PathBuf::from(path));
@@ -308,6 +347,14 @@ pub fn handle_open(
         }
     } else if !is_idb && should_load_dsym {
         if let Some(path) = dsym_path.as_ref() {
+            emit_progress(
+                progress_tx.as_ref(),
+                "loading_debug_info",
+                3.0,
+                Some(OPEN_IDB_PROGRESS_TOTAL),
+                "Loading sibling dSYM debug information",
+            );
+            ensure_not_cancelled(cancel.as_ref())?;
             info!(path = %path.display(), "Loading dSYM debug info");
             match db.load_debug_info(path, false) {
                 Ok(true) => info!(path = %path.display(), "dSYM debug info loaded"),
@@ -316,6 +363,7 @@ pub fn handle_open(
             }
         }
     }
+    ensure_not_cancelled(cancel.as_ref())?;
 
     let path_str = opened_path.display().to_string();
     let info = build_db_info(&db, &path_str, debug_info);

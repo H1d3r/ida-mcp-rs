@@ -153,6 +153,14 @@ test-http: build
 test-script: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-script
 
+# Bootstrap deterministic .i64 fixture used by script/observability tests
+test-bootstrap: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-bootstrap
+
+# Run foreground observability integration test (debug)
+test-observability: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-observability
+
 # Run cargo unit tests
 cargo-test:
     RUST_BACKTRACE=1 cargo test

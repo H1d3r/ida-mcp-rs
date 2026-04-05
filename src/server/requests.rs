@@ -33,6 +33,8 @@ pub struct OpenIdbRequest {
         e.g. 'Apple DYLD cache for arm64e (single module(s))'. Only applies to raw binaries."
     )]
     pub file_type: Option<String>,
+    #[schemars(description = "Open timeout in seconds (default: 300, max: 600)")]
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -649,6 +651,12 @@ pub struct ToolCatalogRequest {
 pub struct ToolHelpRequest {
     #[schemars(description = "Name of the tool to get help for")]
     pub name: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RecentOperationsRequest {
+    #[schemars(description = "Maximum recent events to return (default: 20, max: 50)")]
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

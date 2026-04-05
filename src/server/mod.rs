@@ -1,21 +1,32 @@
 //! MCP server implementation with IDA Pro tools.
 
+mod operation;
 mod requests;
 pub mod task;
 
 pub use requests::*;
 
 use crate::error::ToolError;
+use crate::ida::observability::{ProgressReceiver, ProgressSender};
+use crate::ida::worker::MAX_TIMEOUT_SECS;
 use crate::ida::IdaWorker;
+use crate::server::operation::{
+    next_operation_id, OperationRegistry, OperationSnapshot, RecentOperations,
+};
 use crate::tool_registry::{self, ToolCategory};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
-    model::{CallToolResult, Content, ServerCapabilities, ServerInfo, Tool},
+    model::{
+        CallToolResult, Content, ProgressNotificationParam, ServerCapabilities, ServerInfo, Tool,
+        ToolAnnotations,
+    },
     schemars::{schema_for, JsonSchema},
     tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler,
 };
 use serde_json::{json, Value};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, info, instrument, warn};
 
 /// MCP server for IDA Pro analysis
@@ -25,6 +36,8 @@ pub struct IdaMcpServer {
     tool_mux: ToolMux<IdaMcpServer>,
     mode: ServerMode,
     task_registry: task::TaskRegistry,
+    operation_registry: OperationRegistry,
+    operation_nonce: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -57,7 +70,7 @@ where
         let mut tools = Vec::new();
         for info in tool_registry::all_tools() {
             if let Some(route) = self.call_router.map.get(info.name) {
-                tools.push(route.attr.clone());
+                tools.push(apply_tool_metadata(route.attr.clone()));
             }
         }
         tools
@@ -79,6 +92,17 @@ struct DscBackgroundCtx {
     frameworks: Vec<String>,
 }
 
+enum ForegroundOperationError {
+    Tool(ToolError),
+    TimedOut {
+        timeout_secs: u64,
+        snapshot: OperationSnapshot,
+    },
+    Cancelled {
+        snapshot: OperationSnapshot,
+    },
+}
+
 impl IdaMcpServer {
     pub fn new(worker: Arc<IdaWorker>, mode: ServerMode) -> Self {
         info!("Creating IDA MCP server");
@@ -88,6 +112,8 @@ impl IdaMcpServer {
             tool_mux: ToolMux::new(call_router),
             mode,
             task_registry: task::TaskRegistry::new(),
+            operation_registry: OperationRegistry::new(),
+            operation_nonce: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -115,7 +141,7 @@ impl IdaMcpServer {
                  \n\nNote: tools/list exposes the full tool set by default; use tool_catalog/tool_help to discover usage. \
                  \n{close_hint} \
                  \n\nTool Categories: \
-                 \n- core: open/close/discover (open_idb, close_idb, tool_catalog, tool_help, idb_meta) \
+                 \n- core: open/close/discover (open_idb, close_idb, tool_catalog, tool_help, recent_operations, idb_meta) \
                  \n- functions: list, resolve, lookup functions \
                  \n- disassembly: disasm at addresses \
                  \n- decompile: Hex-Rays pseudocode \
@@ -129,6 +155,7 @@ impl IdaMcpServer {
                  \n- scripting: run_script (execute IDAPython code) \
                  \n\nTip: Use tool_catalog(query='what you want to do') to find the right tool. \
                  \nTip: If xrefs/decompile look incomplete, call analysis_status to check auto-analysis. \
+                 \nTip: After a timeout or cancellation, call recent_operations to inspect the last recorded foreground phase. \
                  \nTip: After dsc_add_dylib or dsc_add_region, call analysis_status; if auto_is_ok=false, run analyze_funcs before xrefs/decompile.",
             close_hint = self.close_hint()
         )
@@ -339,6 +366,217 @@ impl IdaMcpServer {
         }
     }
 
+    fn new_operation_id(&self) -> String {
+        next_operation_id(self.operation_nonce.as_ref())
+    }
+
+    fn spawn_progress_bridge(
+        &self,
+        op_id: String,
+        ctx: &RequestContext<RoleServer>,
+        mut progress_rx: ProgressReceiver,
+    ) -> tokio::task::JoinHandle<()> {
+        let peer = ctx.peer.clone();
+        let progress_token = ctx.meta.get_progress_token();
+        let registry = self.operation_registry.clone();
+        tokio::spawn(async move {
+            while let Some(update) = progress_rx.recv().await {
+                registry.record_progress(&op_id, update.phase, update.message.clone());
+                if let Some(token) = progress_token.clone() {
+                    let mut notification = ProgressNotificationParam::new(token, update.progress);
+                    if let Some(total) = update.total {
+                        notification = notification.with_total(total);
+                    }
+                    if !update.message.is_empty() {
+                        notification = notification.with_message(update.message.clone());
+                    }
+                    if let Err(err) = peer.notify_progress(notification).await {
+                        warn!(op_id = %op_id, error = %err, "failed to send progress notification");
+                    }
+                }
+            }
+        })
+    }
+
+    async fn run_foreground_operation<T, F, Fut>(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        tool_name: &'static str,
+        target_summary: String,
+        timeout_secs: Option<u64>,
+        default_timeout_secs: u64,
+        run: F,
+    ) -> Result<T, ForegroundOperationError>
+    where
+        F: FnOnce(ProgressSender, tokio_util::sync::CancellationToken) -> Fut,
+        Fut: std::future::Future<Output = Result<T, ToolError>>,
+    {
+        enum Outcome<T> {
+            Finished(Result<T, ToolError>),
+            TimedOut(u64),
+            Cancelled,
+        }
+
+        let op_id = self.new_operation_id();
+        self.operation_registry
+            .start(op_id.clone(), tool_name, target_summary);
+
+        let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        let progress_task = self.spawn_progress_bridge(op_id.clone(), ctx, progress_rx);
+        let worker_cancel = tokio_util::sync::CancellationToken::new();
+        let timeout = timeout_secs
+            .unwrap_or(default_timeout_secs)
+            .min(MAX_TIMEOUT_SECS);
+        let client_cancel = ctx.ct.clone();
+
+        let operation_fut = run(progress_tx, worker_cancel.clone());
+        tokio::pin!(operation_fut);
+
+        let outcome = tokio::select! {
+            biased;
+            result = &mut operation_fut => Outcome::Finished(result),
+            _ = client_cancel.cancelled() => {
+                worker_cancel.cancel();
+                Outcome::Cancelled
+            }
+            _ = tokio::time::sleep(Duration::from_secs(timeout)) => {
+                worker_cancel.cancel();
+                Outcome::TimedOut(timeout)
+            }
+        };
+
+        match outcome {
+            Outcome::Finished(result) => {
+                let _ = progress_task.await;
+                match result {
+                    Ok(value) => {
+                        let _ = self.operation_registry.finish_completed(
+                            &op_id,
+                            format!("{tool_name} completed successfully"),
+                        );
+                        Ok(value)
+                    }
+                    Err(ToolError::Cancelled(_)) => {
+                        let snapshot = self
+                            .operation_registry
+                            .finish_cancelled(&op_id, format!("{tool_name} cancelled"))
+                            .or_else(|| self.operation_registry.snapshot(&op_id))
+                            .unwrap_or_else(|| {
+                                Self::fallback_operation_snapshot(
+                                    &op_id,
+                                    tool_name,
+                                    "cancelled",
+                                    operation::OperationStatus::Cancelled,
+                                    format!("{tool_name} cancelled"),
+                                )
+                            });
+                        Err(ForegroundOperationError::Cancelled { snapshot })
+                    }
+                    Err(error) => {
+                        let _ = self
+                            .operation_registry
+                            .finish_failed(&op_id, format!("{tool_name} failed: {error}"));
+                        Err(ForegroundOperationError::Tool(error))
+                    }
+                }
+            }
+            Outcome::TimedOut(timeout_secs) => {
+                progress_task.abort();
+                let _ = progress_task.await;
+                let snapshot = self
+                    .operation_registry
+                    .finish_timed_out(
+                        &op_id,
+                        format!("{tool_name} timed out after {timeout_secs}s"),
+                    )
+                    .or_else(|| self.operation_registry.snapshot(&op_id))
+                    .unwrap_or_else(|| {
+                        Self::fallback_operation_snapshot(
+                            &op_id,
+                            tool_name,
+                            "timed_out",
+                            operation::OperationStatus::TimedOut,
+                            format!("{tool_name} timed out after {timeout_secs}s"),
+                        )
+                    });
+                Err(ForegroundOperationError::TimedOut {
+                    timeout_secs,
+                    snapshot,
+                })
+            }
+            Outcome::Cancelled => {
+                progress_task.abort();
+                let _ = progress_task.await;
+                let snapshot = self
+                    .operation_registry
+                    .finish_cancelled(&op_id, format!("{tool_name} cancelled by client"))
+                    .or_else(|| self.operation_registry.snapshot(&op_id))
+                    .unwrap_or_else(|| {
+                        Self::fallback_operation_snapshot(
+                            &op_id,
+                            tool_name,
+                            "cancelled",
+                            operation::OperationStatus::Cancelled,
+                            format!("{tool_name} cancelled by client"),
+                        )
+                    });
+                Err(ForegroundOperationError::Cancelled { snapshot })
+            }
+        }
+    }
+
+    fn operation_timeout_message(
+        tool_name: &str,
+        timeout_secs: u64,
+        snapshot: &OperationSnapshot,
+        detail: Option<String>,
+    ) -> String {
+        let mut message = format!(
+            "{tool_name} timed out after {timeout_secs} seconds.\n\
+             Last known phase: {}.\n\
+             Operation id: {}.\n\
+             Elapsed: {} ms.\n\
+             Check recent_operations for the recorded event trail.",
+            snapshot.phase, snapshot.op_id, snapshot.elapsed_ms
+        );
+        if let Some(detail) = detail {
+            message.push_str("\n\n");
+            message.push_str(&detail);
+        }
+        message
+    }
+
+    fn operation_cancelled_message(tool_name: &str, snapshot: &OperationSnapshot) -> String {
+        format!(
+            "{tool_name} was cancelled by the client.\n\
+             Last known phase: {}.\n\
+             Operation id: {}.\n\
+             Elapsed: {} ms.\n\
+             Check recent_operations for the recorded event trail.",
+            snapshot.phase, snapshot.op_id, snapshot.elapsed_ms
+        )
+    }
+
+    fn fallback_operation_snapshot(
+        op_id: &str,
+        tool_name: &str,
+        phase: &str,
+        status: operation::OperationStatus,
+        message: String,
+    ) -> OperationSnapshot {
+        OperationSnapshot {
+            op_id: op_id.to_string(),
+            tool: tool_name.to_string(),
+            target_summary: "unknown".to_string(),
+            phase: phase.to_string(),
+            status,
+            message,
+            started_at_ms: 0,
+            last_update_ms: 0,
+            elapsed_ms: 0,
+        }
+    }
+
     /// Open an existing DSC .i64 synchronously and return db_info.
     async fn open_dsc_i64(
         &self,
@@ -527,6 +765,8 @@ impl IdaMcpServer {
         its DWARF debug info is loaded automatically. \
         Set load_debug_info=true to force loading external debug info after open \
         (optionally specify debug_info_path). \
+        open_idb accepts timeout_secs (default 300s, max 600s) and emits progress \
+        notifications when the client requested a progress token. \
         Call close_idb when finished to release database locks; in multi-client servers, coordinate before closing. \
         In HTTP/SSE mode, open_idb returns a close_token that must be provided to close_idb. \
         NOTE: Opening large databases (like dyld_shared_cache) can take 30+ seconds. \
@@ -536,6 +776,7 @@ impl IdaMcpServer {
     #[instrument(skip(self), fields(path = %req.path))]
     async fn open_idb(
         &self,
+        ctx: RequestContext<RoleServer>,
         Parameters(req): Parameters<OpenIdbRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: open_idb");
@@ -545,16 +786,26 @@ impl IdaMcpServer {
         }
 
         match self
-            .worker
-            .open(
-                &req.path,
-                req.load_debug_info.unwrap_or(false),
-                req.debug_info_path.clone(),
-                req.debug_info_verbose.unwrap_or(false),
-                req.force.unwrap_or(false),
-                req.file_type.clone(),
-                true,
-                Vec::new(),
+            .run_foreground_operation(
+                &ctx,
+                "open_idb",
+                req.path.clone(),
+                req.timeout_secs,
+                300,
+                |progress_tx, cancel| {
+                    self.worker.open_observed(
+                        &req.path,
+                        req.load_debug_info.unwrap_or(false),
+                        req.debug_info_path.clone(),
+                        req.debug_info_verbose.unwrap_or(false),
+                        req.force.unwrap_or(false),
+                        req.file_type.clone(),
+                        true,
+                        Vec::new(),
+                        Some(progress_tx),
+                        Some(cancel),
+                    )
+                },
             )
             .await
         {
@@ -594,7 +845,21 @@ impl IdaMcpServer {
                     serde_json::to_string_pretty(&value).unwrap_or_else(|_| format!("{value:?}")),
                 )]))
             }
-            Err(e) => Ok(e.to_tool_result()),
+            Err(ForegroundOperationError::TimedOut {
+                timeout_secs,
+                snapshot,
+            }) => Ok(ToolError::TimeoutDetailed(Self::operation_timeout_message(
+                "open_idb",
+                timeout_secs,
+                &snapshot,
+                None,
+            ))
+            .to_tool_result()),
+            Err(ForegroundOperationError::Cancelled { snapshot }) => Ok(ToolError::Cancelled(
+                Self::operation_cancelled_message("open_idb", &snapshot),
+            )
+            .to_tool_result()),
+            Err(ForegroundOperationError::Tool(error)) => Ok(error.to_tool_result()),
         }
     }
 
@@ -2421,16 +2686,45 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Analyze functions (not supported)")]
+    #[tool(description = "Run IDA auto-analysis and wait for completion. \
+        Emits progress notifications when the client requested a progress token.")]
     async fn analyze_funcs(
         &self,
+        ctx: RequestContext<RoleServer>,
         Parameters(req): Parameters<AnalyzeFuncsRequest>,
     ) -> Result<CallToolResult, McpError> {
-        match self.worker.analyze_funcs(req.timeout_secs).await {
+        match self
+            .run_foreground_operation(
+                &ctx,
+                "analyze_funcs",
+                "current database".to_string(),
+                req.timeout_secs,
+                120,
+                |progress_tx, cancel| {
+                    self.worker
+                        .analyze_funcs_observed(Some(progress_tx), Some(cancel))
+                },
+            )
+            .await
+        {
             Ok(result) => Ok(CallToolResult::success(vec![Content::text(
                 serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
             )])),
-            Err(e) => Ok(e.to_tool_result()),
+            Err(ForegroundOperationError::TimedOut {
+                timeout_secs,
+                snapshot,
+            }) => Ok(ToolError::TimeoutDetailed(Self::operation_timeout_message(
+                "analyze_funcs",
+                timeout_secs,
+                &snapshot,
+                None,
+            ))
+            .to_tool_result()),
+            Err(ForegroundOperationError::Cancelled { snapshot }) => Ok(ToolError::Cancelled(
+                Self::operation_cancelled_message("analyze_funcs", &snapshot),
+            )
+            .to_tool_result()),
+            Err(ForegroundOperationError::Tool(error)) => Ok(error.to_tool_result()),
         }
     }
 
@@ -2655,7 +2949,7 @@ impl IdaMcpServer {
             .to_tool_result());
         }
 
-        let timeout = Some(req.timeout_secs.unwrap_or(300).min(600));
+        let timeout = Some(req.timeout_secs.unwrap_or(300).min(MAX_TIMEOUT_SECS));
         let script = crate::dsc::dsc_add_dylib_script(&module);
 
         match self.worker.run_script(&script, timeout).await {
@@ -2728,7 +3022,7 @@ impl IdaMcpServer {
             Err(e) => return Ok(e.to_tool_result()),
         };
         let ea_hex = format!("0x{ea:x}");
-        let timeout = Some(req.timeout_secs.unwrap_or(300).min(600));
+        let timeout = Some(req.timeout_secs.unwrap_or(300).min(MAX_TIMEOUT_SECS));
         let script = crate::dsc::dsc_add_region_script(ea);
 
         match self.worker.run_script(&script, timeout).await {
@@ -2839,17 +3133,32 @@ impl IdaMcpServer {
         )]))
     }
 
+    #[tool(description = "Inspect recent foreground operation history. \
+        Returns the currently active foreground operation (if any) and the last \
+        recorded phase transitions for open_idb, run_script, and analyze_funcs.")]
+    async fn recent_operations(
+        &self,
+        Parameters(req): Parameters<RecentOperationsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let recent: RecentOperations = self.operation_registry.recent(req.limit);
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&recent).unwrap_or_else(|_| format!("{recent:?}")),
+        )]))
+    }
+
     #[tool(
         description = "Execute a Python script via IDAPython in the open database. \
         Has full access to all ida_* modules, idc, idautils. \
         stdout and stderr are captured and returned. \
         Provide either 'code' (inline Python) or 'file' (path to a .py file), not both. \
+        run_script emits progress notifications when the client requested a progress token. \
         Use this for custom analysis that goes beyond the built-in tools. \
         API reference: https://python.docs.hex-rays.com"
     )]
     #[instrument(skip(self))]
     async fn run_script(
         &self,
+        ctx: RequestContext<RoleServer>,
         Parameters(req): Parameters<RunScriptRequest>,
     ) -> Result<CallToolResult, McpError> {
         let code = match (req.code, req.file) {
@@ -2882,8 +3191,21 @@ impl IdaMcpServer {
                 .to_tool_result());
             }
         };
-        let timeout = req.timeout_secs.map(|t| t.min(600));
-        match self.worker.run_script(&code, timeout).await {
+        let timeout = req.timeout_secs.unwrap_or(120).min(MAX_TIMEOUT_SECS);
+        match self
+            .run_foreground_operation(
+                &ctx,
+                "run_script",
+                format!("code_len={}", code.len()),
+                Some(timeout),
+                120,
+                |progress_tx, cancel| {
+                    self.worker
+                        .run_script_observed(&code, Some(progress_tx), Some(cancel))
+                },
+            )
+            .await
+        {
             Ok(result) => {
                 if !run_script_succeeded(&result) {
                     let message = run_script_failure_message(&result);
@@ -2895,12 +3217,25 @@ impl IdaMcpServer {
                         .unwrap_or_else(|_| format!("{:?}", result)),
                 )]))
             }
-            Err(ToolError::Timeout(timeout_secs)) => {
-                let message = run_script_timeout_message(timeout_secs, &code);
+            Err(ForegroundOperationError::TimedOut {
+                timeout_secs,
+                snapshot,
+            }) => {
+                let detail = run_script_timeout_message(timeout_secs, &code);
                 warn!(timeout_secs, code_len = code.len(), "run_script timed out");
-                Ok(ToolError::IdaError(message).to_tool_result())
+                Ok(ToolError::TimeoutDetailed(Self::operation_timeout_message(
+                    "run_script",
+                    timeout_secs,
+                    &snapshot,
+                    Some(detail),
+                ))
+                .to_tool_result())
             }
-            Err(e) => Ok(e.to_tool_result()),
+            Err(ForegroundOperationError::Cancelled { snapshot }) => Ok(ToolError::Cancelled(
+                Self::operation_cancelled_message("run_script", &snapshot),
+            )
+            .to_tool_result()),
+            Err(ForegroundOperationError::Tool(error)) => Ok(error.to_tool_result()),
         }
     }
 }
@@ -3125,6 +3460,7 @@ fn tool_params_schema(name: &str) -> Option<Value> {
         "analysis_status" => Some(schema::<EmptyParams>()),
         "tool_catalog" => Some(schema::<ToolCatalogRequest>()),
         "tool_help" => Some(schema::<ToolHelpRequest>()),
+        "recent_operations" => Some(schema::<RecentOperationsRequest>()),
         "idb_meta" => Some(schema::<EmptyParams>()),
 
         // Functions
@@ -3399,6 +3735,41 @@ impl<S> std::ops::Deref for SanitizedIdaServer<S> {
 /// Tools that support task-based invocation (SEP-1686).
 const TASK_CAPABLE_TOOLS: &[&str] = &["open_dsc"];
 
+fn tool_annotations_for(name: &str) -> ToolAnnotations {
+    match name {
+        "run_script" => ToolAnnotations::new()
+            .read_only(false)
+            .destructive(true)
+            .open_world(true),
+        "patch" | "patch_asm" => ToolAnnotations::new().read_only(false).destructive(true),
+        "open_idb" | "open_dsc" | "dsc_add_dylib" | "dsc_add_region" | "close_idb"
+        | "load_debug_info" | "declare_type" | "apply_types" | "declare_stack" | "delete_stack"
+        | "rename" | "set_comments" => ToolAnnotations::new()
+            .read_only(false)
+            .destructive(name == "close_idb")
+            .open_world(false),
+        _ => ToolAnnotations::new()
+            .read_only(true)
+            .destructive(false)
+            .idempotent(true)
+            .open_world(false),
+    }
+}
+
+fn set_tool_metadata(tool: &mut Tool) {
+    tool.annotations = Some(tool_annotations_for(&tool.name));
+    if TASK_CAPABLE_TOOLS.contains(&&*tool.name) {
+        tool.execution = Some(
+            rmcp::model::ToolExecution::new().with_task_support(rmcp::model::TaskSupport::Optional),
+        );
+    }
+}
+
+fn apply_tool_metadata(mut tool: Tool) -> Tool {
+    set_tool_metadata(&mut tool);
+    tool
+}
+
 /// Strips `$schema` keys from tool input schemas and annotates
 /// task-capable tools with `execution.taskSupport = "optional"`.
 fn sanitize_tool_schemas(result: &mut ListToolsResult) {
@@ -3411,24 +3782,13 @@ fn sanitize_tool_schemas(result: &mut ListToolsResult) {
             map.remove("$schema");
             *schema_arc = std::sync::Arc::new(map);
         }
-
-        if TASK_CAPABLE_TOOLS.contains(&&*tool.name) {
-            tool.execution = Some(
-                rmcp::model::ToolExecution::new()
-                    .with_task_support(rmcp::model::TaskSupport::Optional),
-            );
-        }
+        set_tool_metadata(tool);
     }
 }
 
 /// Patch a single tool definition with task support if applicable.
-fn annotate_task_support(mut tool: Tool) -> Tool {
-    if TASK_CAPABLE_TOOLS.contains(&&*tool.name) {
-        tool.execution = Some(
-            rmcp::model::ToolExecution::new().with_task_support(rmcp::model::TaskSupport::Optional),
-        );
-    }
-    tool
+fn annotate_task_support(tool: Tool) -> Tool {
+    apply_tool_metadata(tool)
 }
 
 impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
@@ -3510,11 +3870,32 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
 #[cfg(test)]
 mod tests {
     use crate::server::{
+        operation::{OperationSnapshot, OperationStatus},
         run_script_failure_message, run_script_succeeded, run_script_timeout_message,
-        run_script_truncate_chars, task_payload_result_value,
+        run_script_truncate_chars, task_payload_result_value, IdaMcpServer,
+        RecentOperationsRequest, ToolCatalogRequest, ToolHelpRequest,
     };
+    use rmcp::handler::server::wrapper::Parameters;
     use rmcp::model::CallToolResult;
     use serde_json::json;
+    use std::sync::{mpsc, Arc};
+
+    fn test_server() -> IdaMcpServer {
+        let (tx, _rx) = mpsc::sync_channel(1);
+        IdaMcpServer::new(
+            Arc::new(crate::IdaWorker::new(tx)),
+            crate::ServerMode::Stdio,
+        )
+    }
+
+    fn tool_result_text(result: CallToolResult) -> String {
+        result
+            .content
+            .first()
+            .and_then(|content| content.as_text())
+            .map(|text| text.text.to_string())
+            .unwrap_or_default()
+    }
 
     #[test]
     fn run_script_succeeded_only_for_explicit_true() {
@@ -3543,6 +3924,87 @@ mod tests {
         let message = run_script_timeout_message(120, code);
         assert!(message.contains("run_script timed out after 120 seconds"));
         assert!(message.contains("Script preview: import idaapi for _ in range(1000000000): pass"));
+    }
+
+    #[test]
+    fn operation_timeout_message_includes_phase_snapshot() {
+        let snapshot = OperationSnapshot {
+            op_id: "fg-1".to_string(),
+            tool: "open_idb".to_string(),
+            target_summary: "/tmp/sample.i64".to_string(),
+            phase: "opening".to_string(),
+            status: OperationStatus::TimedOut,
+            message: "open_idb timed out".to_string(),
+            started_at_ms: 1,
+            last_update_ms: 2,
+            elapsed_ms: 3456,
+        };
+        let message = IdaMcpServer::operation_timeout_message(
+            "open_idb",
+            300,
+            &snapshot,
+            Some("detail".to_string()),
+        );
+        assert!(message.contains("Last known phase: opening"));
+        assert!(message.contains("Operation id: fg-1"));
+        assert!(message.contains("detail"));
+    }
+
+    #[tokio::test]
+    async fn recent_operations_tool_reports_queued_active_operation() {
+        let server = test_server();
+        server.operation_registry.start(
+            "fg-test".to_string(),
+            "open_idb",
+            "/tmp/sample.i64".to_string(),
+        );
+
+        let result = server
+            .recent_operations(Parameters(RecentOperationsRequest { limit: Some(5) }))
+            .await
+            .expect("recent_operations call should succeed");
+        let value: serde_json::Value =
+            serde_json::from_str(&tool_result_text(result)).expect("recent_operations JSON");
+
+        assert_eq!(value["active_operation"]["op_id"], "fg-test");
+        assert_eq!(value["active_operation"]["phase"], "queued");
+        assert_eq!(value["recent_events"][0]["tool"], "open_idb");
+    }
+
+    #[tokio::test]
+    async fn tool_help_and_catalog_include_recent_operations() {
+        let server = test_server();
+
+        let help_result = server
+            .tool_help(Parameters(ToolHelpRequest {
+                name: "recent_operations".to_string(),
+            }))
+            .await
+            .expect("tool_help should succeed");
+        let help_value: serde_json::Value =
+            serde_json::from_str(&tool_result_text(help_result)).expect("tool_help JSON");
+        assert_eq!(help_value["name"], "recent_operations");
+        assert!(help_value["parameters"].get("properties").is_some());
+        assert!(help_value["parameters"]["properties"]
+            .get("limit")
+            .is_some());
+
+        let catalog_result = server
+            .tool_catalog(Parameters(ToolCatalogRequest {
+                query: Some("recent operation history".to_string()),
+                category: None,
+                limit: Some(5),
+            }))
+            .await
+            .expect("tool_catalog should succeed");
+        let catalog_value: serde_json::Value =
+            serde_json::from_str(&tool_result_text(catalog_result)).expect("tool_catalog JSON");
+        let tools = catalog_value["tools"]
+            .as_array()
+            .expect("tool_catalog tools array");
+        assert!(tools
+            .iter()
+            .any(|tool| tool.get("name") == Some(&json!("recent_operations"))));
     }
 
     #[test]

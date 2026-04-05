@@ -1,6 +1,7 @@
 //! IDA worker handle for async requests.
 
 use crate::error::ToolError;
+use crate::ida::observability::ProgressSender;
 use crate::ida::request::IdaRequest;
 use crate::ida::types::*;
 use serde_json::Value;
@@ -10,11 +11,12 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 /// Default timeout for IDA operations (2 minutes)
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// Maximum allowed timeout (10 minutes)
-const MAX_TIMEOUT_SECS: u64 = 600;
+pub const MAX_TIMEOUT_SECS: u64 = 600;
 /// Maximum time to retry enqueuing close requests when the queue is full.
 const CLOSE_SEND_TIMEOUT_SECS: u64 = 5;
 /// Backoff between control enqueue retries (milliseconds).
@@ -152,6 +154,10 @@ impl IdaWorker {
         }
     }
 
+    async fn recv<T>(rx: oneshot::Receiver<Result<T, ToolError>>) -> Result<T, ToolError> {
+        rx.await?
+    }
+
     /// Open an IDA database file.
     #[allow(clippy::too_many_arguments)]
     pub async fn open(
@@ -165,6 +171,36 @@ impl IdaWorker {
         auto_analyse: bool,
         extra_args: Vec<String>,
     ) -> Result<DbInfo, ToolError> {
+        self.open_observed(
+            path,
+            load_debug_info,
+            debug_info_path,
+            debug_info_verbose,
+            force,
+            file_type,
+            auto_analyse,
+            extra_args,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Open an IDA database file and stream foreground progress updates.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_observed(
+        &self,
+        path: &str,
+        load_debug_info: bool,
+        debug_info_path: Option<String>,
+        debug_info_verbose: bool,
+        force: bool,
+        file_type: Option<String>,
+        auto_analyse: bool,
+        extra_args: Vec<String>,
+        progress_tx: Option<ProgressSender>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<DbInfo, ToolError> {
         let (tx, rx) = oneshot::channel();
         self.try_send(IdaRequest::Open {
             path: path.to_string(),
@@ -175,9 +211,11 @@ impl IdaWorker {
             file_type,
             auto_analyse,
             extra_args,
+            progress_tx,
+            cancel,
             resp: tx,
         })?;
-        rx.await?
+        Self::recv(rx).await
     }
 
     /// Close the currently open database.
@@ -827,8 +865,27 @@ impl IdaWorker {
     /// Run auto-analysis (functions) and wait for completion.
     pub async fn analyze_funcs(&self, timeout_secs: Option<u64>) -> Result<Value, ToolError> {
         let (tx, rx) = oneshot::channel();
-        self.try_send(IdaRequest::AnalyzeFuncs { resp: tx })?;
+        self.try_send(IdaRequest::AnalyzeFuncs {
+            progress_tx: None,
+            cancel: None,
+            resp: tx,
+        })?;
         Self::recv_with_timeout(rx, timeout_secs).await
+    }
+
+    /// Run auto-analysis (functions) and stream progress for foreground callers.
+    pub async fn analyze_funcs_observed(
+        &self,
+        progress_tx: Option<ProgressSender>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<Value, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::AnalyzeFuncs {
+            progress_tx,
+            cancel,
+            resp: tx,
+        })?;
+        Self::recv(rx).await
     }
 
     /// Find byte pattern in the database.
@@ -1011,9 +1068,28 @@ impl IdaWorker {
         let (tx, rx) = oneshot::channel();
         self.try_send(IdaRequest::RunScript {
             code: code.to_string(),
+            progress_tx: None,
+            cancel: None,
             resp: tx,
         })?;
         Self::recv_with_timeout(rx, timeout_secs).await
+    }
+
+    /// Run a Python script via IDAPython and stream progress for foreground callers.
+    pub async fn run_script_observed(
+        &self,
+        code: &str,
+        progress_tx: Option<ProgressSender>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<Value, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::RunScript {
+            code: code.to_string(),
+            progress_tx,
+            cancel,
+            resp: tx,
+        })?;
+        Self::recv(rx).await
     }
 
     /// Get decompiled pseudocode at a specific address or address range.

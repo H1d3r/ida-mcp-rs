@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PORT="${PORT:-8765}"
+PORT="${PORT:-8766}"
 BIN="${MCP_HTTP_BIN:-./target/release/ida-mcp}"
 ORIGIN="${MCP_HTTP_ORIGIN:-http://localhost}"
 IDB_PATH="${IDB_PATH:-fixtures/mini}"
+BOOTSTRAP_I64="${BOOTSTRAP_I64:-${IDB_PATH}.i64}"
 
 if ! command -v curl >/dev/null 2>&1; then
   echo "curl is required" >&2
@@ -32,7 +33,7 @@ trap cleanup EXIT INT TERM
 "$BIN" serve-http --bind "127.0.0.1:$PORT" --allow-origin "http://localhost,http://127.0.0.1" >"$server_log" 2>&1 &
 server_pid=$!
 
-init_payload='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"test","version":"0.1"},"capabilities":{}}}'
+init_payload='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"bootstrap","version":"0.1"},"capabilities":{}}}'
 
 session_id=""
 for _ in {1..100}; do
@@ -62,7 +63,6 @@ if [[ -z "$session_id" ]]; then
   exit 1
 fi
 
-# Send notifications/initialized
 curl -sS \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
@@ -71,58 +71,32 @@ curl -sS \
   -d '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' \
   "http://127.0.0.1:$PORT/" >/dev/null
 
-# tools/list should include core tools and analysis tools
-list_resp=$(curl -sS \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -H "Origin: $ORIGIN" \
-  -H "Mcp-Session-Id: $session_id" \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
-  "http://127.0.0.1:$PORT/")
-
-echo "$list_resp" | grep -q '"open_idb"' || {
-  echo "tools/list missing open_idb" >&2
-  exit 1
-}
-
-echo "$list_resp" | grep -q '"xrefs_to"' || {
-  echo "tools/list missing xrefs_to" >&2
-  exit 1
-}
-
-echo "$list_resp" | grep -q '"recent_operations"' || {
-  echo "tools/list missing recent_operations" >&2
-  exit 1
-}
-
-# Open mini fixture and verify functions list
 open_resp=$(curl -sS \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -H "Origin: $ORIGIN" \
   -H "Mcp-Session-Id: $session_id" \
-  -d "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"open_idb\",\"arguments\":{\"path\":\"$IDB_PATH\"}}}" \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"open_idb\",\"arguments\":{\"path\":\"$IDB_PATH\",\"timeout_secs\":600}}}" \
   "http://127.0.0.1:$PORT/")
 
 echo "$open_resp" | grep -q "function_count" || {
-  echo "open_idb failed" >&2
+  echo "bootstrap open_idb failed" >&2
   echo "$open_resp" >&2
+  if [[ -s "$server_log" ]]; then
+    echo "server output:" >&2
+    cat "$server_log" >&2
+  fi
   exit 1
 }
 
-func_resp=$(curl -sS \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -H "Origin: $ORIGIN" \
-  -H "Mcp-Session-Id: $session_id" \
-  -d '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"list_functions","arguments":{"limit":10}}}' \
-  "http://127.0.0.1:$PORT/")
-
-echo "$func_resp" | grep -q "interesting_function" || {
-  echo "list_functions missing interesting_function" >&2
-  echo "$func_resp" >&2
+if [[ ! -f "$BOOTSTRAP_I64" ]]; then
+  echo "bootstrap did not create $BOOTSTRAP_I64" >&2
+  if [[ -s "$server_log" ]]; then
+    echo "server output:" >&2
+    cat "$server_log" >&2
+  fi
   exit 1
-}
+fi
 
 close_token="$(echo "$open_resp" | sed -n 's/.*\\\"close_token\\\"[[:space:]]*:[[:space:]]*\\\"\\([^\\\"]*\\)\\\".*/\\1/p')"
 if [[ -n "$close_token" ]]; then
@@ -136,7 +110,7 @@ curl -sS \
   -H "Accept: application/json, text/event-stream" \
   -H "Origin: $ORIGIN" \
   -H "Mcp-Session-Id: $session_id" \
-  -d "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"close_idb\",\"arguments\":$close_args}}" \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"close_idb\",\"arguments\":$close_args}}" \
   "http://127.0.0.1:$PORT/" >/dev/null
 
-echo "HTTP integration test passed"
+echo "HTTP bootstrap test passed"

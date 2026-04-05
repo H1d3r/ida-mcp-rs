@@ -1,9 +1,11 @@
 //! Request types for the IDA worker.
 
 use crate::error::ToolError;
+use crate::ida::observability::ProgressSender;
 use crate::ida::types::*;
 use serde_json::Value;
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 /// Request types for the IDA worker
 pub enum IdaRequest {
@@ -16,6 +18,8 @@ pub enum IdaRequest {
         file_type: Option<String>,
         auto_analyse: bool,
         extra_args: Vec<String>,
+        progress_tx: Option<ProgressSender>,
+        cancel: Option<CancellationToken>,
         resp: oneshot::Sender<Result<DbInfo, ToolError>>,
     },
     Close {
@@ -264,6 +268,8 @@ pub enum IdaRequest {
         resp: oneshot::Sender<Result<StringXrefsResult, ToolError>>,
     },
     AnalyzeFuncs {
+        progress_tx: Option<ProgressSender>,
+        cancel: Option<CancellationToken>,
         resp: oneshot::Sender<Result<Value, ToolError>>,
     },
     FindBytes {
@@ -336,7 +342,29 @@ pub enum IdaRequest {
     },
     RunScript {
         code: String,
+        progress_tx: Option<ProgressSender>,
+        cancel: Option<CancellationToken>,
         resp: oneshot::Sender<Result<Value, ToolError>>,
     },
     Shutdown,
+}
+
+impl IdaRequest {
+    pub fn progress_sender(&self) -> Option<&ProgressSender> {
+        match self {
+            IdaRequest::Open { progress_tx, .. }
+            | IdaRequest::AnalyzeFuncs { progress_tx, .. }
+            | IdaRequest::RunScript { progress_tx, .. } => progress_tx.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub fn cancel_token(&self) -> Option<&CancellationToken> {
+        match self {
+            IdaRequest::Open { cancel, .. }
+            | IdaRequest::AnalyzeFuncs { cancel, .. }
+            | IdaRequest::RunScript { cancel, .. } => cancel.as_ref(),
+            _ => None,
+        }
+    }
 }
