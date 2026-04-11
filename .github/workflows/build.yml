@@ -67,6 +67,16 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7  # stable
 
+      - name: Prepare arm64 link dependencies
+        if: matrix.os == 'linux' && matrix.arch == 'arm64'
+        env:
+          PASSPHRASE: ${{ secrets.ARM64_LINK_DEPS_PASSPHRASE }}
+        run: |
+          sudo mkdir -p "${{ matrix.idadir }}"
+          gpg --batch --yes --decrypt --passphrase "$PASSPHRASE" \
+            .github/ci/link-deps.tar.gz.gpg \
+            | sudo tar xz -C "${{ matrix.idadir }}"
+
       - name: Build Linux
         if: matrix.os == 'linux'
         env:
