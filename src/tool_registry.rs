@@ -150,7 +150,12 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         short_desc: "Open an IDA database or raw binary",
         full_desc: "Open an IDA Pro database file or a raw binary for analysis. \
                     Supports .i64 (64-bit) and .idb (32-bit) databases, as well as raw binaries \
-                    like Mach-O/ELF/PE. Raw binaries are auto-analyzed and saved as .i64 alongside the input. \
+                    like Mach-O/ELF/PE. Raw binaries are saved as .i64 alongside the input. \
+                    Auto-analysis does NOT run by default — open returns quickly with the database \
+                    loaded. Check analysis_status in the response: if auto_is_ok is false and you \
+                    need xrefs/decompile, call analyze_funcs(background=true) and poll task_status. \
+                    list_functions, disasm, strings, get_bytes work immediately without full analysis. \
+                    Set auto_analyse=true for small binaries to wait for analysis inline (risks timeout on large files). \
                     If opening a raw binary with no existing .i64 and a sibling .dSYM is present, \
                     its DWARF debug info is loaded automatically. \
                     Set load_debug_info=true to force loading external debug info after open \
@@ -159,8 +164,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
                     Call close_idb when finished to release database locks; in multi-client servers, coordinate before closing. \
                     In HTTP/SSE mode, open_idb returns a close_token that must be provided to close_idb. \
                     Supports timeout_secs (default 300s, max 600s) and emits MCP progress notifications when the client requests progress. \
-                    Returns metadata about the binary: file type, processor, bitness, function count.",
-        example: r#"{"path": "/path/to/binary", "load_debug_info": true, "timeout_secs": 300}"#,
+                    Returns metadata about the binary: file type, processor, bitness, function count, analysis_status.",
+        example: r#"{"path": "/path/to/binary", "auto_analyse": false}"#,
         default: true,
         keywords: &["open", "load", "database", "binary", "idb", "i64", "macho", "elf", "pe"],
     },
@@ -365,13 +370,16 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "analyze_funcs",
         category: ToolCategory::Functions,
-        short_desc: "Run auto-analysis and wait for completion",
-        full_desc: "Run IDA auto-analysis and wait for completion. \
-                    Emits progress notifications when the client requests progress, \
-                    and returns whether analysis completed and the current function count.",
-        example: r#"{"timeout_secs": 120}"#,
+        short_desc: "Run auto-analysis (foreground or background task)",
+        full_desc: "Run IDA auto-analysis. Set background=true for large binaries (kernelcache, \
+                    DSC modules) — returns a task_id immediately, poll task_status for progress. \
+                    The IDA worker thread blocks on auto_wait() either way, but in background mode \
+                    the MCP request returns instead of timing out, and task_status reads the \
+                    registry without going through the worker. Foreground mode (default) waits \
+                    for completion, emits progress notifications, and respects timeout_secs.",
+        example: r#"{"background": true}"#,
         default: false,
-        keywords: &["analyze", "functions", "analysis", "auto"],
+        keywords: &["analyze", "functions", "analysis", "auto", "background", "task"],
     },
 
     // === DISASSEMBLY ===

@@ -33,6 +33,14 @@ pub struct OpenIdbRequest {
         e.g. 'Apple DYLD cache for arm64e (single module(s))'. Only applies to raw binaries."
     )]
     pub file_type: Option<String>,
+    #[schemars(
+        description = "Run auto-analysis to completion before returning (default: false). \
+        For raw binaries, false returns quickly with the database loaded but analysis incomplete. \
+        Check analysis_status in the response — if auto_is_ok is false and you need xrefs/decompile, \
+        call analyze_funcs(background=true) and poll task_status. \
+        For .i64/.idb files this has no effect (analysis is already in the database)."
+    )]
+    pub auto_analyse: Option<bool>,
     #[schemars(description = "Open timeout in seconds (default: 300, max: 600)")]
     pub timeout_secs: Option<u64>,
 }
@@ -73,7 +81,19 @@ pub struct ListFunctionsRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct AnalyzeFuncsRequest {
-    #[schemars(description = "Timeout in seconds for this operation (default: 120, max: 600)")]
+    #[schemars(
+        description = "Run analysis as a background task and return a task_id immediately \
+        (default: false). When true, poll task_status(task_id) for progress; the database \
+        becomes fully analyzed when the task completes. Other tool calls block until the \
+        IDA worker thread is free, but task_status reads the registry directly and stays \
+        responsive. Use this for large binaries (kernelcache, full DSC modules) where \
+        auto_wait() can exceed the request timeout."
+    )]
+    pub background: Option<bool>,
+    #[schemars(
+        description = "Timeout in seconds for foreground mode (default: 120, max: 600). \
+        Ignored when background=true."
+    )]
     pub timeout_secs: Option<u64>,
 }
 

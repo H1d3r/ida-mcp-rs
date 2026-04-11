@@ -69,7 +69,8 @@ impl TaskRegistry {
 
     /// Create a task with a deduplication key. If a running task with
     /// the same key already exists, returns `Err(existing_task_id)`.
-    pub fn create_keyed(&self, key: &str, message: &str) -> Result<String, String> {
+    /// `prefix` is used in the generated task id (e.g. "dsc-1", "analyze-1").
+    pub fn create_keyed(&self, prefix: &str, key: &str, message: &str) -> Result<String, String> {
         let mut entries = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
         if let Some(existing_id) = entries
@@ -82,7 +83,7 @@ impl TaskRegistry {
             return Err(existing_id);
         }
 
-        let id = next_task_id("dsc");
+        let id = next_task_id(prefix);
         let (now, created) = now_with_iso();
         let state = TaskState {
             id: id.clone(),
@@ -294,7 +295,7 @@ mod tests {
     fn create_and_get() {
         let registry = TaskRegistry::new();
         let id = registry
-            .create_keyed("test-key", "Starting")
+            .create_keyed("dsc", "test-key", "Starting")
             .expect("should succeed");
         assert!(id.starts_with("dsc-"));
         let state = registry.get(&id).expect("task should exist");
@@ -308,7 +309,7 @@ mod tests {
     fn update_message() {
         let registry = TaskRegistry::new();
         let id = registry
-            .create_keyed("k1", "Phase 1")
+            .create_keyed("t", "k1", "Phase 1")
             .expect("should succeed");
         registry.update_message(&id, "Phase 2");
         let state = registry.get(&id).expect("task should exist");
@@ -319,7 +320,7 @@ mod tests {
     fn complete_task() {
         let registry = TaskRegistry::new();
         let id = registry
-            .create_keyed("k2", "Working")
+            .create_keyed("t", "k2", "Working")
             .expect("should succeed");
         let result = json!({"db": "opened"});
         registry.complete(&id, result.clone());
@@ -332,7 +333,7 @@ mod tests {
     fn fail_task() {
         let registry = TaskRegistry::new();
         let id = registry
-            .create_keyed("k3", "Working")
+            .create_keyed("t", "k3", "Working")
             .expect("should succeed");
         registry.fail(&id, "idat exited with code 4");
         let state = registry.get(&id).expect("task should exist");
@@ -350,15 +351,15 @@ mod tests {
     fn keyed_dedup_prevents_duplicate() {
         let registry = TaskRegistry::new();
         let id1 = registry
-            .create_keyed("/path/to/dsc.i64", "First")
+            .create_keyed("dsc", "/path/to/dsc.i64", "First")
             .expect("first should succeed");
-        let dup = registry.create_keyed("/path/to/dsc.i64", "Second");
+        let dup = registry.create_keyed("dsc", "/path/to/dsc.i64", "Second");
         assert_eq!(dup, Err(id1.clone()));
 
         // After completing, a new task with the same key can be created.
         registry.complete(&id1, json!({}));
         let id2 = registry
-            .create_keyed("/path/to/dsc.i64", "Third")
+            .create_keyed("dsc", "/path/to/dsc.i64", "Third")
             .expect("should succeed after first completed");
         assert_ne!(id1, id2);
     }
@@ -367,7 +368,7 @@ mod tests {
     fn cancel_running_task() {
         let registry = TaskRegistry::new();
         let id = registry
-            .create_keyed("k4", "Working")
+            .create_keyed("t", "k4", "Working")
             .expect("should succeed");
         assert!(registry.cancel(&id));
         let state = registry.get(&id).expect("task should exist");
@@ -380,8 +381,8 @@ mod tests {
     #[test]
     fn list_all_tasks() {
         let registry = TaskRegistry::new();
-        let _ = registry.create_keyed("a", "Task A");
-        let _ = registry.create_keyed("b", "Task B");
+        let _ = registry.create_keyed("t", "a", "Task A");
+        let _ = registry.create_keyed("t", "b", "Task B");
         assert_eq!(registry.list_all().len(), 2);
     }
 
@@ -389,7 +390,7 @@ mod tests {
     fn iso_timestamp_format() {
         let registry = TaskRegistry::new();
         let id = registry
-            .create_keyed("ts", "Timestamp test")
+            .create_keyed("t", "ts", "Timestamp test")
             .expect("should succeed");
         let state = registry.get(&id).expect("task should exist");
         // Should match YYYY-MM-DDTHH:MM:SSZ
@@ -431,7 +432,7 @@ mod tests {
         for i in 0..(TERMINAL_TASK_CAP + 20) {
             let key = format!("key-{i}");
             let id = registry
-                .create_keyed(&key, "Working")
+                .create_keyed("t", &key, "Working")
                 .expect("should create keyed task");
             registry.complete(&id, json!({"ok": true}));
         }
@@ -448,7 +449,7 @@ mod tests {
     fn recently_completed_task_not_immediately_evicted() {
         let registry = TaskRegistry::new();
         let long_running_id = registry
-            .create_keyed("long-running", "Working")
+            .create_keyed("t", "long-running", "Working")
             .expect("should create long-running task");
 
         for i in 0..TERMINAL_TASK_CAP {

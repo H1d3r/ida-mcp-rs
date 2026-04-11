@@ -760,7 +760,7 @@ impl IdaMcpServer {
 impl IdaMcpServer {
     #[tool(
         description = "Open an IDA Pro database (.i64/.idb) or a raw binary (Mach-O/ELF/PE). \
-        Raw binaries are auto-analyzed and saved as .i64 alongside the input. \
+        Raw binaries are saved as .i64 alongside the input. \
         If opening a raw binary with no existing .i64 and a sibling .dSYM is present, \
         its DWARF debug info is loaded automatically. \
         Set load_debug_info=true to force loading external debug info after open \
@@ -769,9 +769,12 @@ impl IdaMcpServer {
         notifications when the client requested a progress token. \
         Call close_idb when finished to release database locks; in multi-client servers, coordinate before closing. \
         In HTTP/SSE mode, open_idb returns a close_token that must be provided to close_idb. \
-        NOTE: Opening large databases (like dyld_shared_cache) can take 30+ seconds. \
+        For raw binaries, the database opens quickly but auto-analysis does NOT run by default — \
+        check analysis_status in the response. If auto_is_ok is false and you need xrefs/decompile, \
+        call analyze_funcs(background=true) and poll task_status. list_functions, disasm, strings, \
+        and get_bytes work immediately without full analysis. \
         The database stays open until close_idb is called, so you can make multiple \
-        queries (list_functions, disasm, decompile, etc.) without reopening."
+        queries without reopening."
     )]
     #[instrument(skip(self), fields(path = %req.path))]
     async fn open_idb(
@@ -800,7 +803,7 @@ impl IdaMcpServer {
                         req.debug_info_verbose.unwrap_or(false),
                         req.force.unwrap_or(false),
                         req.file_type.clone(),
-                        true,
+                        req.auto_analyse.unwrap_or(false),
                         Vec::new(),
                         Some(progress_tx),
                         Some(cancel),
@@ -824,18 +827,19 @@ impl IdaMcpServer {
                     }
                 };
                 if let Value::Object(map) = &mut value {
-                    map.insert(
-                        "quick_tools".to_string(),
-                        json!([
-                            "list_functions",
-                            "resolve_function",
-                            "disasm_by_name",
-                            "decompile",
-                            "xrefs_to",
-                            "strings",
-                            "close_idb"
-                        ]),
-                    );
+                    let mut quick_tools = vec![
+                        "list_functions",
+                        "resolve_function",
+                        "disasm_by_name",
+                        "strings",
+                        "analysis_status",
+                        "analyze_funcs",
+                        "close_idb",
+                    ];
+                    if info.analysis_status.auto_is_ok {
+                        quick_tools.extend(["decompile", "xrefs_to"]);
+                    }
+                    map.insert("quick_tools".to_string(), json!(quick_tools));
                     map.insert("close_hint".to_string(), json!(self.close_hint()));
                     if let Some(token) = close_token {
                         map.insert("close_token".to_string(), json!(token));
@@ -2687,12 +2691,18 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "Run IDA auto-analysis and wait for completion. \
-        Emits progress notifications when the client requested a progress token.")]
+        Set background=true for large binaries to return a task_id immediately and poll \
+        task_status — the IDA worker thread runs auto_wait() while task_status stays responsive. \
+        Emits progress notifications when the client requested a progress token (foreground only).")]
     async fn analyze_funcs(
         &self,
         ctx: RequestContext<RoleServer>,
         Parameters(req): Parameters<AnalyzeFuncsRequest>,
     ) -> Result<CallToolResult, McpError> {
+        if req.background.unwrap_or(false) {
+            return Ok(self.analyze_funcs_background());
+        }
+
         match self
             .run_foreground_operation(
                 &ctx,
@@ -2726,6 +2736,72 @@ impl IdaMcpServer {
             .to_tool_result()),
             Err(ForegroundOperationError::Tool(error)) => Ok(error.to_tool_result()),
         }
+    }
+
+    /// Spawn auto-analysis as a background task. Returns a task_id immediately;
+    /// the IDA worker thread runs auto_wait() while task_status reads the registry
+    /// without going through the worker. Only one analysis runs at a time (single
+    /// worker thread), so a fixed dedup key returns the existing task_id if one
+    /// is already in flight.
+    fn analyze_funcs_background(&self) -> CallToolResult {
+        let task_id = match self.task_registry.create_keyed(
+            "analyze",
+            "analyze_funcs",
+            "Waiting for IDA auto-analysis to finish",
+        ) {
+            Ok(id) => id,
+            Err(existing_id) => {
+                return CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&json!({
+                        "status": "already_running",
+                        "task_id": existing_id,
+                        "message": "Auto-analysis is already running. Poll task_status(task_id) for progress.",
+                    }))
+                    .unwrap_or_default(),
+                )]);
+            }
+        };
+
+        info!(task_id = %task_id, "Spawning background auto-analysis");
+
+        let registry = self.task_registry.clone();
+        let worker = Arc::clone(&self.worker);
+        let tid = task_id.clone();
+
+        let handle = tokio::spawn(async move {
+            // Bridge worker progress updates → task registry messages.
+            // The drain task ends when tx is dropped after analyze_funcs_observed returns.
+            let (tx, mut rx): (ProgressSender, ProgressReceiver) =
+                tokio::sync::mpsc::unbounded_channel();
+            let drain_registry = registry.clone();
+            let drain_tid = tid.clone();
+            tokio::spawn(async move {
+                while let Some(update) = rx.recv().await {
+                    drain_registry.update_message(&drain_tid, &update.message);
+                }
+            });
+
+            match worker.analyze_funcs_observed(Some(tx), None).await {
+                Ok(value) => {
+                    info!(task_id = %tid, "Background auto-analysis completed");
+                    registry.complete(&tid, value);
+                }
+                Err(e) => {
+                    warn!(task_id = %tid, error = %e, "Background auto-analysis failed");
+                    registry.fail(&tid, &e.to_string());
+                }
+            }
+        });
+        self.task_registry.set_handle(&task_id, handle);
+
+        CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&json!({
+                "status": "started",
+                "task_id": task_id,
+                "message": "Auto-analysis started in background. Poll task_status(task_id) for progress. Other tool calls will block until the IDA worker thread is free.",
+            }))
+            .unwrap_or_default(),
+        )])
     }
 
     #[tool(description = "Rename symbols")]
@@ -2860,10 +2936,11 @@ impl IdaMcpServer {
         // Use the .i64 path as dedup key to prevent concurrent idat
         // processes writing the same output file.
         let dedup_key = out_i64.display().to_string();
-        let task_id = match self
-            .task_registry
-            .create_keyed(&dedup_key, "Running idat to create .i64 from DSC...")
-        {
+        let task_id = match self.task_registry.create_keyed(
+            "dsc",
+            &dedup_key,
+            "Running idat to create .i64 from DSC...",
+        ) {
             Ok(id) => id,
             Err(existing_id) => {
                 return Ok(CallToolResult::success(vec![Content::text(
