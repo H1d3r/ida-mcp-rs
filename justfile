@@ -148,6 +148,10 @@ test-bootstrap: build
 test-observability: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-observability
 
+# Run dyld_shared_cache integration test (requires mounted iOS DMG; default path is /tmp/ios_sys_mount/...)
+test-dsc dsc_path="": build
+    cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-dsc {{ if dsc_path != "" { dsc_path } else { "" } }}
+
 # Run cargo unit tests
 cargo-test:
     RUST_BACKTRACE=1 cargo test
