@@ -1,6 +1,18 @@
-# ida-mcp-rs
-
-Headless IDA Pro MCP server for AI-powered reverse engineering.
+<p align="center">
+  <!--<a href="https://github.com/blacktop/ida-mcp-rs"><img alt="Logo" src="https://raw.githubusercontent.com/blacktop/ida-mcp-rs/refs/heads/main/docs/logo.svg" height="400"/></a>-->
+  <h1 align="center">ida-mcp-rs</h1>
+  <h4><p align="center">Headless IDA Pro MCP server for AI-powered reverse engineering.</p></h4>
+  <p align="center">
+    <a href="https://github.com/blacktop/ida-mcp-rs/actions" alt="Actions">
+          <img src="https://github.com/blacktop/ida-mcp-rs/actions/workflows/build.yml/badge.svg" /></a>
+    <a href="https://github.com/blacktop/ida-mcp-rs/releases/latest" alt="Downloads">
+          <img src="https://img.shields.io/github/downloads/blacktop/ida-mcp-rs/total.svg" /></a>
+    <a href="https://github.com/blacktop/ida-mcp-rs/releases" alt="GitHub Release">
+          <img src="https://img.shields.io/github/v/release/blacktop/ida-mcp-rs" /></a>
+    <a href="http://doge.mit-license.org" alt="LICENSE">
+          <img src="https://img.shields.io/:license-mit-blue.svg" /></a>
+</p>
+<br>
 
 ## Prerequisites
 
