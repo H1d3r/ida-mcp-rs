@@ -38,6 +38,9 @@ pub struct IdaMcpServer {
     task_registry: task::TaskRegistry,
     operation_registry: OperationRegistry,
     operation_nonce: Arc<AtomicU64>,
+    /// Unique ID for this server instance. Changes on restart, making silent
+    /// auto-restarts (e.g. after a Hex-Rays C++ crash) visible to agents.
+    session_id: String,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -105,7 +108,8 @@ enum ForegroundOperationError {
 
 impl IdaMcpServer {
     pub fn new(worker: Arc<IdaWorker>, mode: ServerMode) -> Self {
-        info!("Creating IDA MCP server");
+        let session_id = uuid::Uuid::new_v4().to_string();
+        info!(session_id = %session_id, "Creating IDA MCP server");
         let call_router = Self::tool_router();
         Self {
             worker,
@@ -114,6 +118,7 @@ impl IdaMcpServer {
             task_registry: task::TaskRegistry::new(),
             operation_registry: OperationRegistry::new(),
             operation_nonce: Arc::new(AtomicU64::new(0)),
+            session_id,
         }
     }
 
@@ -840,6 +845,7 @@ impl IdaMcpServer {
                         quick_tools.extend(["decompile", "xrefs_to"]);
                     }
                     map.insert("quick_tools".to_string(), json!(quick_tools));
+                    map.insert("session_id".to_string(), json!(self.session_id));
                     map.insert("close_hint".to_string(), json!(self.close_hint()));
                     if let Some(token) = close_token {
                         map.insert("close_token".to_string(), json!(token));
@@ -895,9 +901,16 @@ impl IdaMcpServer {
     async fn analysis_status(&self) -> Result<CallToolResult, McpError> {
         debug!("Tool call: analysis_status");
         match self.worker.analysis_status().await {
-            Ok(status) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&status).unwrap_or_else(|_| format!("{status:?}")),
-            )])),
+            Ok(status) => {
+                let mut value =
+                    serde_json::to_value(&status).unwrap_or_else(|_| json!(format!("{status:?}")));
+                if let Value::Object(map) = &mut value {
+                    map.insert("session_id".to_string(), json!(self.session_id));
+                }
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| format!("{status:?}")),
+                )]))
+            }
             Err(e) => Ok(e.to_tool_result()),
         }
     }
@@ -1756,9 +1769,16 @@ impl IdaMcpServer {
     async fn idb_meta(&self) -> Result<CallToolResult, McpError> {
         debug!("Tool call: idb_meta");
         match self.worker.idb_meta().await {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
+            Ok(result) => {
+                let mut value =
+                    serde_json::to_value(&result).unwrap_or_else(|_| json!(format!("{result:?}")));
+                if let Value::Object(map) = &mut value {
+                    map.insert("session_id".to_string(), json!(self.session_id));
+                }
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| format!("{result:?}")),
+                )]))
+            }
             Err(e) => Ok(e.to_tool_result()),
         }
     }

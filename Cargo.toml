@@ -29,6 +29,7 @@ bytes = "1"
 http-body = "1"
 http-body-util = "0.1"
 tower-service = "0.3"
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 idalib-build = { git = "https://github.com/blacktop/idalib.git", branch = "sdk-9.3", package = "idalib-build" }

@@ -857,6 +857,7 @@ dependencies = [
  "tower-service",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
