@@ -6,11 +6,12 @@ description: |
   letting AI assistants disassemble, decompile, and inspect binaries through
   a headless idalib session.
 
-  **Requires a licensed IDA Pro 9.x installation on the host.** This snap
-  does not bundle IDA — it links against libida.so from your existing
-  install. Standard locations (~/ida-pro-9.3, /opt/ida-pro-9.3) are
-  searched automatically; set LD_LIBRARY_PATH for custom paths. IDADIR only
-  affects locating idat for DSC extraction workflows.
+  **Requires a licensed IDA Pro 9.x installation in your home directory.**
+  This snap does not bundle IDA — it links against libida.so from your
+  existing install. The installer default ~/ida-pro-9.3 is auto-detected;
+  for custom paths under $HOME set IDADIR. Installs outside $HOME (e.g.
+  /opt/ida-pro-9.3) are not accessible under strict confinement — use
+  Homebrew or Nix for those.
 
 license: MIT
 source-code: https://github.com/blacktop/ida-mcp-rs
@@ -19,12 +20,10 @@ contact: https://github.com/blacktop/ida-mcp-rs/issues
 
 base: core24
 grade: stable
-# Classic confinement: ida-mcp dynamically links against libida.so /
-# libidalib.so from a user-installed IDA Pro at arbitrary host paths
-# (e.g. ~/ida-pro-9.3). These are proprietary, non-redistributable
-# Hex-Rays libraries that cannot be staged into the snap. The binary
-# already carries RUNPATH entries for common install locations.
-confinement: classic
+# Strict confinement with home interface: ida-mcp links against libida.so
+# from ~/ida-pro-9.3 (the installer default). Users with IDA outside $HOME
+# need Homebrew/Nix instead.
+confinement: strict
 
 platforms:
   amd64:
@@ -37,6 +36,10 @@ platforms:
 apps:
   ida-mcp:
     command: bin/ida-mcp
+    plugs:
+      - home          # access to ~/ida-pro-9.3/libida.so and IDB files
+      - network       # MCP over HTTP (serve-http subcommand)
+      - network-bind  # listen on a port in serve-http mode
 
 parts:
   ida-mcp:
