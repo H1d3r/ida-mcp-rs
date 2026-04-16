@@ -820,8 +820,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     length = bytes.len(),
                     "Patching bytes"
                 );
-                let result =
-                    memory::handle_patch_bytes(&idb, addr, name.as_deref(), offset, &bytes);
+                let result = crate::crash_guard::crash_guarded("handle_patch_bytes", || {
+                    memory::handle_patch_bytes(&idb, addr, name.as_deref(), offset, &bytes)
+                });
                 if let Err(e) = &result {
                     warn!(error = %e, "Failed to patch bytes");
                 }
@@ -999,8 +1000,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     continue;
                 }
                 debug!("Running auto-analysis");
-                let result =
-                    functions::handle_analyze_funcs(&mut idb, progress_tx.clone(), cancel.clone());
+                let result = crate::crash_guard::crash_guarded("handle_analyze_funcs", || {
+                    functions::handle_analyze_funcs(&mut idb, progress_tx.clone(), cancel.clone())
+                });
                 match &result {
                     Ok(value) => emit_progress(
                         progress_tx.as_ref(),
@@ -1081,8 +1083,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     case_insensitive,
                     "Finding instruction sequences"
                 );
-                let result =
-                    search::handle_find_insns(&idb, &patterns, max_results, case_insensitive);
+                let result = crate::crash_guard::crash_guarded("handle_find_insns", || {
+                    search::handle_find_insns(&idb, &patterns, max_results, case_insensitive)
+                });
                 let _ = resp.send(result);
             }
             IdaRequest::FindInsnOperands {
@@ -1231,8 +1234,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 }
                 debug!(code_len = code.len(), "Running script");
                 let started = std::time::Instant::now();
-                let result =
-                    script::handle_run_script(&idb, &code, progress_tx.clone(), cancel.clone());
+                let result = crate::crash_guard::crash_guarded("handle_run_script", || {
+                    script::handle_run_script(&idb, &code, progress_tx.clone(), cancel.clone())
+                });
                 let elapsed_ms = started.elapsed().as_millis();
                 match &result {
                     Ok(value) => {

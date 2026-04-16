@@ -152,6 +152,10 @@ test-observability: build
 test-dsc dsc_path="": build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-dsc {{ if dsc_path != "" { dsc_path } else { "" } }}
 
+# Run crash-guard integration test (triggers SIGSEGV, verifies server survives)
+test-crash-guard: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-crash-guard
+
 # Run cargo unit tests
 cargo-test:
     RUST_BACKTRACE=1 cargo test

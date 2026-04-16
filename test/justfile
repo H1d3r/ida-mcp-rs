@@ -77,6 +77,18 @@ test: fixture
         rm -f "$tmp"
         exit 1
     fi
+    if ! rg -q 'function_count' "$tmp"; then
+        echo "❌ open_idb did not complete successfully"
+        cat "$tmp"
+        rm -f "$tmp"
+        exit 1
+    fi
+    if ! rg -q 'Database closed' "$tmp"; then
+        echo "❌ close_idb did not complete successfully"
+        cat "$tmp"
+        rm -f "$tmp"
+        exit 1
+    fi
     rm -f "$tmp"
     echo "✅ Stdio test passed"
 
@@ -157,6 +169,141 @@ test-observability: test-bootstrap
     echo "🧪 Running observability integration test..."
     RUST_LOG="{{ rust_log }}" MCP_HTTP_BIN="{{ server_bin }}" IDB_PATH="{{ test_bin }}" bash ./http_observability.sh
     echo "✅ Observability test passed"
+
+# Run crash-guard integration test
+# Verifies that SIGSEGV during a handler call is caught and converted to a
+# ToolError instead of killing the server. Triggers a real segfault via
+# IDAPython ctypes.string_at(0) and checks the session_id stays stable
+
+# across the crash (proof the server process didn't restart).
+test-crash-guard: test-bootstrap
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        exit 1
+    fi
+    if ! command -v jq &>/dev/null; then
+        echo "jq is required for crash-guard test (brew install jq)"
+        exit 1
+    fi
+    LOCK="{{ test_lock }}"
+    if [ -f "$LOCK" ]; then
+        pid=$(awk -F= '$1=="pid"{print $2}' "$LOCK" | tr -d '\r')
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            echo "Lock file $LOCK is held by pid $pid; close that server first." >&2
+            exit 1
+        else
+            rm -f "$LOCK"
+        fi
+    fi
+    echo "🧪 Running crash-guard integration test..."
+
+    fifo_in="$(mktemp -u).fifo"
+    mkfifo "$fifo_in"
+    log="$(mktemp)"
+
+    RUST_LOG="{{ rust_log }}" "{{ server_bin }}" < "$fifo_in" > "$log" 2>&1 &
+    server_pid=$!
+    exec 3>"$fifo_in"
+
+    cleanup() {
+        exec 3>&- 2>/dev/null || true
+        rm -f "$fifo_in"
+        kill "$server_pid" 2>/dev/null || true
+        wait "$server_pid" 2>/dev/null || true
+    }
+    trap cleanup EXIT
+
+    send() { echo "$1" >&3; }
+
+    wait_response() {
+        local target_id="$1"
+        local timeout="${2:-30}"
+        local elapsed=0
+        while [ "$elapsed" -lt "$timeout" ]; do
+            local line
+            line=$(grep -m1 "\"id\":${target_id}[,}]" "$log" 2>/dev/null | grep '"jsonrpc"' || true)
+            if [ -n "$line" ]; then
+                echo "$line"
+                return 0
+            fi
+            if ! kill -0 "$server_pid" 2>/dev/null; then
+                echo "   ❌ server process died waiting for id=$target_id" >&2
+                cat "$log" >&2
+                return 1
+            fi
+            sleep 1
+            elapsed=$((elapsed + 1))
+        done
+        echo "Timeout waiting for response id=$target_id" >&2
+        return 1
+    }
+
+    # Init
+    send '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"cg","version":"0.1"},"capabilities":{}}}'
+    send '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}'
+    wait_response 1 10 >/dev/null
+    echo "   initialized"
+
+    # Open the pre-built .i64 fixture
+    send '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"open_idb","arguments":{"path":"fixtures/mini.i64"}}}'
+    open_resp=$(wait_response 2 30)
+    session_before=$(echo "$open_resp" | jq -r '.result.content[0].text' | jq -r '.session_id // empty')
+    if [ -z "$session_before" ]; then
+        echo "❌ open_idb did not return a session_id"
+        echo "$open_resp" | jq .
+        exit 1
+    fi
+    echo "   opened session=${session_before:0:8}"
+
+    # Test 1: decompile at invalid address — clean error path through the guard
+    send '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"decompile","arguments":{"address":"0xDEADBEEF"}}}'
+    resp=$(wait_response 3 10)
+    text=$(echo "$resp" | jq -r '.result.content[0].text // empty')
+    echo "   decompile 0xDEADBEEF → ${text:0:60}"
+
+    # Test 2: deliberate SIGSEGV via IDAPython — Linux-only.
+    # macOS delivers EXC_BAD_ACCESS as a Mach exception which bypasses Unix
+    # signal handlers when IDA registers its own Mach handler. The crash guard
+    # works for IDA-internal crashes on both platforms (verified against
+    # kernelcache decompile) but this synthetic ctypes.string_at(0) path
+    # exercises signal-delivered SIGSEGV which only works on Linux.
+    if [ "$(uname -s)" = "Linux" ]; then
+        # Raise SIGSEGV synchronously on the IDA worker thread. Expected
+        # outcome: the signal is caught, an ERROR is logged, but the
+        # run_script response itself may be dropped (tokio foreground
+        # operation machinery is in a weird state after siglongjmp skipped
+        # its destructors). The real verification is that the SERVER is
+        # still alive and processing subsequent requests.
+        send '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"run_script","arguments":{"code":"import signal\nsignal.raise_signal(signal.SIGSEGV)"}}}'
+        sleep 3   # let the crash path complete and log the ERROR line
+        if ! grep -q 'crashed in IDA SDK (signal 11)\|signal 11 caught' "$log"; then
+            echo "❌ expected crash-guard catch message not in log" >&2
+            tail -20 "$log" >&2
+            exit 1
+        fi
+        echo "   SIGSEGV caught by guard (ERROR logged)"
+    else
+        echo "   (skipping forced SIGSEGV on macOS — Mach exceptions bypass signal handlers)"
+    fi
+
+    # Test 3: server is still alive and session_id is unchanged
+    # (this is the real proof the crash guard did its job — server survived
+    # the signal and can still process new requests on the same session)
+    send '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"analysis_status","arguments":{}}}'
+    resp=$(wait_response 5 15) || { echo "❌ server died or hung after Test 2"; exit 1; }
+    session_after=$(echo "$resp" | jq -r '.result.content[0].text' | jq -r '.session_id // empty')
+    if [ "$session_before" != "$session_after" ]; then
+        echo "❌ session_id changed: ${session_before:0:8} → ${session_after:0:8} (server restarted)"
+        exit 1
+    fi
+    echo "   server alive after crash, session_id stable: ${session_after:0:8}"
+
+    # Close
+    send '{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"close_idb","arguments":{}}}'
+    wait_response 99 10 >/dev/null
+    echo "✅ Crash-guard test passed"
 
 dsc_test_path := env_var_or_default("DSC_TEST_PATH", "/tmp/ios_sys_mount/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e")
 
