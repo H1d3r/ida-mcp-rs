@@ -233,7 +233,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 resp,
             } => {
                 debug!(path = ?path, verbose, "Loading debug info");
-                let result = database::handle_load_debug_info(&idb, path.as_deref(), verbose);
+                let result = crate::crash_guard::crash_guarded("handle_load_debug_info", || {
+                    database::handle_load_debug_info(&idb, path.as_deref(), verbose)
+                });
                 match &result {
                     Ok(v) => debug!(result = %v, "Loaded debug info"),
                     Err(e) => warn!(error = %e, "Failed to load debug info"),
@@ -242,7 +244,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
             }
             IdaRequest::AnalysisStatus { resp } => {
                 debug!("Reporting analysis status");
-                let result = analysis::handle_analysis_status(&idb);
+                let result = crate::crash_guard::crash_guarded("handle_analysis_status", || {
+                    analysis::handle_analysis_status(&idb)
+                });
                 match &result {
                     Ok(status) => debug!(
                         auto_enabled = status.auto_enabled,
@@ -275,7 +279,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
             }
             IdaRequest::ResolveFunction { name, resp } => {
                 debug!(name = %name, "Resolving function");
-                let result = functions::handle_resolve_function(&idb, &name);
+                let result = crate::crash_guard::crash_guarded("handle_resolve_function", || {
+                    functions::handle_resolve_function(&idb, &name)
+                });
                 match &result {
                     Ok(info) => {
                         debug!(name = %info.name, address = %info.address, "Resolved function")
@@ -286,7 +292,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
             }
             IdaRequest::DisasmByName { name, count, resp } => {
                 debug!(name = %name, count, "Disassembling by name");
-                let result = disasm::handle_disasm_by_name(&idb, &name, count);
+                let result = crate::crash_guard::crash_guarded("handle_disasm_by_name", || {
+                    disasm::handle_disasm_by_name(&idb, &name, count)
+                });
                 match &result {
                     Ok(text) => {
                         debug!(name = %name, lines = text.lines().count(), "Disassembly complete")
@@ -297,7 +305,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
             }
             IdaRequest::Disasm { addr, count, resp } => {
                 debug!(address = format!("{:#x}", addr), count, "Disassembling");
-                let result = disasm::handle_disasm(&idb, addr, count);
+                let result = crate::crash_guard::crash_guarded("handle_disasm", || {
+                    disasm::handle_disasm(&idb, addr, count)
+                });
                 match &result {
                     Ok(text) => debug!(lines = text.lines().count(), "Disassembly complete"),
                     Err(e) => {
@@ -308,7 +318,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
             }
             IdaRequest::Decompile { addr, resp } => {
                 debug!(address = format!("{:#x}", addr), "Decompiling");
-                let result = disasm::handle_decompile(&idb, addr);
+                let result = crate::crash_guard::crash_guarded("handle_decompile", || {
+                    disasm::handle_decompile(&idb, addr)
+                });
                 match &result {
                     Ok(code) => debug!(lines = code.lines().count(), "Decompilation complete"),
                     Err(e) => {
@@ -319,7 +331,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
             }
             IdaRequest::Segments { resp } => {
                 debug!("Listing segments");
-                let result = segments::handle_segments(&idb);
+                let result = crate::crash_guard::crash_guarded("handle_segments", || {
+                    segments::handle_segments(&idb)
+                });
                 match &result {
                     Ok(segs) => debug!(count = segs.len(), "Listed segments"),
                     Err(e) => warn!(error = %e, "Failed to list segments"),
@@ -333,7 +347,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 resp,
             } => {
                 debug!(offset, limit, filter = ?filter, "Listing strings");
-                let result = strings::handle_strings(&idb, offset, limit, filter.as_deref());
+                let result = crate::crash_guard::crash_guarded("handle_strings", || {
+                    strings::handle_strings(&idb, offset, limit, filter.as_deref())
+                });
                 match &result {
                     Ok(r) => debug!(count = r.strings.len(), total = r.total, "Listed strings"),
                     Err(e) => warn!(error = %e, "Failed to list strings"),
@@ -347,7 +363,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 resp,
             } => {
                 debug!(offset, limit, filter = ?filter, "Listing local types");
-                let result = types::handle_local_types(&idb, offset, limit, filter.as_deref());
+                let result = crate::crash_guard::crash_guarded("handle_local_types", || {
+                    types::handle_local_types(&idb, offset, limit, filter.as_deref())
+                });
                 match &result {
                     Ok(r) => debug!(count = r.types.len(), total = r.total, "Listed local types"),
                     Err(e) => warn!(error = %e, "Failed to list local types"),
@@ -362,7 +380,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 resp,
             } => {
                 debug!(relaxed, replace, multi, "Declaring type");
-                let result = types::handle_declare_type(&idb, &decl, relaxed, replace, multi);
+                let result = crate::crash_guard::crash_guarded("handle_declare_type", || {
+                    types::handle_declare_type(&idb, &decl, relaxed, replace, multi)
+                });
                 log_result!(result, "Declared type", "Failed to declare type");
                 let _ = resp.send(result);
             }
@@ -390,19 +410,21 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     strict,
                     "Applying type"
                 );
-                let result = types::handle_apply_types(
-                    &idb,
-                    addr,
-                    name.as_deref(),
-                    offset,
-                    stack_offset,
-                    stack_name.as_deref(),
-                    decl.as_deref(),
-                    type_name.as_deref(),
-                    relaxed,
-                    delay,
-                    strict,
-                );
+                let result = crate::crash_guard::crash_guarded("handle_apply_types", || {
+                    types::handle_apply_types(
+                        &idb,
+                        addr,
+                        name.as_deref(),
+                        offset,
+                        stack_offset,
+                        stack_name.as_deref(),
+                        decl.as_deref(),
+                        type_name.as_deref(),
+                        relaxed,
+                        delay,
+                        strict,
+                    )
+                });
                 log_result!(result, "Applied type", "Failed to apply type");
                 let _ = resp.send(result);
             }
@@ -413,7 +435,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 resp,
             } => {
                 debug!(address = ?addr, name = ?name, offset, "Inferring type");
-                let result = types::handle_infer_types(&idb, addr, name.as_deref(), offset);
+                let result = crate::crash_guard::crash_guarded("handle_infer_types", || {
+                    types::handle_infer_types(&idb, addr, name.as_deref(), offset)
+                });
                 match &result {
                     Ok(res) => debug!(code = res.code, "Inferred type"),
                     Err(e) => warn!(error = %e, "Failed to infer type"),
@@ -489,15 +513,17 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     relaxed,
                     "Declaring stack variable"
                 );
-                let result = types::handle_declare_stack(
-                    &idb,
-                    addr,
-                    name.as_deref(),
-                    offset,
-                    var_name.as_deref(),
-                    &decl,
-                    relaxed,
-                );
+                let result = crate::crash_guard::crash_guarded("handle_declare_stack", || {
+                    types::handle_declare_stack(
+                        &idb,
+                        addr,
+                        name.as_deref(),
+                        offset,
+                        var_name.as_deref(),
+                        &decl,
+                        relaxed,
+                    )
+                });
                 match &result {
                     Ok(res) => debug!(code = res.code, "Declared stack variable"),
                     Err(e) => warn!(error = %e, "Failed to declare stack variable"),
@@ -518,13 +544,15 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     var_name = ?var_name,
                     "Deleting stack variable"
                 );
-                let result = types::handle_delete_stack(
-                    &idb,
-                    addr,
-                    name.as_deref(),
-                    offset,
-                    var_name.as_deref(),
-                );
+                let result = crate::crash_guard::crash_guarded("handle_delete_stack", || {
+                    types::handle_delete_stack(
+                        &idb,
+                        addr,
+                        name.as_deref(),
+                        offset,
+                        var_name.as_deref(),
+                    )
+                });
                 match &result {
                     Ok(res) => debug!(code = res.code, "Deleted stack variable"),
                     Err(e) => warn!(error = %e, "Failed to delete stack variable"),
@@ -533,7 +561,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
             }
             IdaRequest::StackFrame { addr, resp } => {
                 debug!(address = format!("{:#x}", addr), "Getting stack frame");
-                let result = types::handle_stack_frame(&idb, addr);
+                let result = crate::crash_guard::crash_guarded("handle_stack_frame", || {
+                    types::handle_stack_frame(&idb, addr)
+                });
                 match &result {
                     Ok(r) => debug!(members = r.members.len(), "Got stack frame"),
                     Err(e) => warn!(error = %e, "Failed to get stack frame"),
@@ -547,7 +577,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 resp,
             } => {
                 debug!(offset, limit, filter = ?filter, "Listing structs");
-                let result = structs::handle_structs(&idb, offset, limit, filter.as_deref());
+                let result = crate::crash_guard::crash_guarded("handle_structs", || {
+                    structs::handle_structs(&idb, offset, limit, filter.as_deref())
+                });
                 match &result {
                     Ok(r) => debug!(count = r.structs.len(), total = r.total, "Listed structs"),
                     Err(e) => warn!(error = %e, "Failed to list structs"),
@@ -560,7 +592,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 resp,
             } => {
                 debug!(ordinal = ?ordinal, name = ?name, "Getting struct info");
-                let result = structs::handle_struct_info(&idb, ordinal, name.as_deref());
+                let result = crate::crash_guard::crash_guarded("handle_struct_info", || {
+                    structs::handle_struct_info(&idb, ordinal, name.as_deref())
+                });
                 match &result {
                     Ok(info) => {
                         debug!(name = %info.name, ordinal = info.ordinal, "Got struct info")
@@ -576,7 +610,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 resp,
             } => {
                 debug!(address = format!("{:#x}", addr), ordinal = ?ordinal, name = ?name, "Reading struct");
-                let result = structs::handle_read_struct(&idb, addr, ordinal, name.as_deref());
+                let result = crate::crash_guard::crash_guarded("handle_read_struct", || {
+                    structs::handle_read_struct(&idb, addr, ordinal, name.as_deref())
+                });
                 match &result {
                     Ok(info) => debug!(name = %info.name, ordinal = info.ordinal, "Read struct"),
                     Err(e) => warn!(error = %e, "Failed to read struct"),
@@ -585,7 +621,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
             }
             IdaRequest::XRefsTo { addr, resp } => {
                 debug!(address = format!("{:#x}", addr), "Getting xrefs to");
-                let result = xrefs::handle_xrefs_to(&idb, addr);
+                let result = crate::crash_guard::crash_guarded("handle_xrefs_to", || {
+                    xrefs::handle_xrefs_to(&idb, addr)
+                });
                 match &result {
                     Ok(refs) => debug!(count = refs.len(), "Got xrefs to"),
                     Err(e) => warn!(error = %e, "Failed to get xrefs"),
@@ -594,7 +632,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
             }
             IdaRequest::XRefsFrom { addr, resp } => {
                 debug!(address = format!("{:#x}", addr), "Getting xrefs from");
-                let result = xrefs::handle_xrefs_from(&idb, addr);
+                let result = crate::crash_guard::crash_guarded("handle_xrefs_from", || {
+                    xrefs::handle_xrefs_from(&idb, addr)
+                });
                 match &result {
                     Ok(refs) => debug!(count = refs.len(), "Got xrefs from"),
                     Err(e) => warn!(error = %e, "Failed to get xrefs"),
@@ -617,14 +657,16 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     limit,
                     "Getting xrefs to struct field"
                 );
-                let result = structs::handle_xrefs_to_field(
-                    &idb,
-                    ordinal,
-                    name.as_deref(),
-                    member_index,
-                    member_name.as_deref(),
-                    limit,
-                );
+                let result = crate::crash_guard::crash_guarded("handle_xrefs_to_field", || {
+                    structs::handle_xrefs_to_field(
+                        &idb,
+                        ordinal,
+                        name.as_deref(),
+                        member_index,
+                        member_name.as_deref(),
+                        limit,
+                    )
+                });
                 match &result {
                     Ok(refs) => debug!(count = refs.xrefs.len(), "Got xrefs to struct field"),
                     Err(e) => warn!(error = %e, "Failed to get xrefs to struct field"),
@@ -637,7 +679,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 resp,
             } => {
                 debug!(offset, limit, "Listing imports");
-                let result = imports::handle_imports(&idb, offset, limit);
+                let result = crate::crash_guard::crash_guarded("handle_imports", || {
+                    imports::handle_imports(&idb, offset, limit)
+                });
                 match &result {
                     Ok(imps) => debug!(count = imps.len(), "Listed imports"),
                     Err(e) => warn!(error = %e, "Failed to list imports"),
@@ -650,7 +694,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 resp,
             } => {
                 debug!(offset, limit, "Listing exports");
-                let result = imports::handle_exports(&idb, offset, limit);
+                let result = crate::crash_guard::crash_guarded("handle_exports", || {
+                    imports::handle_exports(&idb, offset, limit)
+                });
                 match &result {
                     Ok(exps) => debug!(count = exps.len(), "Listed exports"),
                     Err(e) => warn!(error = %e, "Failed to list exports"),
@@ -659,7 +705,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
             }
             IdaRequest::Entrypoints { resp } => {
                 debug!("Listing entrypoints");
-                let result = imports::handle_entrypoints(&idb);
+                let result = crate::crash_guard::crash_guarded("handle_entrypoints", || {
+                    imports::handle_entrypoints(&idb)
+                });
                 match &result {
                     Ok(eps) => debug!(count = eps.len(), "Listed entrypoints"),
                     Err(e) => warn!(error = %e, "Failed to list entrypoints"),
@@ -683,7 +731,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     size,
                     "Getting bytes"
                 );
-                let result = memory::handle_get_bytes(&idb, addr, name.as_deref(), offset, size);
+                let result = crate::crash_guard::crash_guarded("handle_get_bytes", || {
+                    memory::handle_get_bytes(&idb, addr, name.as_deref(), offset, size)
+                });
                 match &result {
                     Ok(b) => debug!(length = b.length, "Got bytes"),
                     Err(e) => warn!(error = %e, "Failed to get bytes"),
@@ -708,14 +758,16 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     repeatable,
                     "Setting comment"
                 );
-                let result = annotations::handle_set_comments(
-                    &idb,
-                    addr,
-                    name.as_deref(),
-                    offset,
-                    &comment,
-                    repeatable,
-                );
+                let result = crate::crash_guard::crash_guarded("handle_set_comments", || {
+                    annotations::handle_set_comments(
+                        &idb,
+                        addr,
+                        name.as_deref(),
+                        offset,
+                        &comment,
+                        repeatable,
+                    )
+                });
                 if let Err(e) = &result {
                     warn!(error = %e, "Failed to set comment");
                 }
@@ -737,13 +789,15 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     flags,
                     "Renaming symbol"
                 );
-                let result = annotations::handle_rename(
-                    &idb,
-                    addr,
-                    current_name.as_deref(),
-                    &new_name,
-                    flags,
-                );
+                let result = crate::crash_guard::crash_guarded("handle_rename", || {
+                    annotations::handle_rename(
+                        &idb,
+                        addr,
+                        current_name.as_deref(),
+                        &new_name,
+                        flags,
+                    )
+                });
                 if let Err(e) = &result {
                     warn!(error = %e, "Failed to rename");
                 }
@@ -790,7 +844,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     line = %line,
                     "Patching asm"
                 );
-                let result = memory::handle_patch_asm(&idb, addr, name.as_deref(), offset, &line);
+                let result = crate::crash_guard::crash_guarded("handle_patch_asm", || {
+                    memory::handle_patch_asm(&idb, addr, name.as_deref(), offset, &line)
+                });
                 if let Err(e) = &result {
                     warn!(error = %e, "Failed to patch asm");
                 }
@@ -798,7 +854,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
             }
             IdaRequest::BasicBlocks { addr, resp } => {
                 debug!(address = format!("{:#x}", addr), "Getting basic blocks");
-                let result = controlflow::handle_basic_blocks(&idb, addr);
+                let result = crate::crash_guard::crash_guarded("handle_basic_blocks", || {
+                    controlflow::handle_basic_blocks(&idb, addr)
+                });
                 match &result {
                     Ok(bbs) => debug!(count = bbs.len(), "Got basic blocks"),
                     Err(e) => warn!(error = %e, "Failed to get basic blocks"),
@@ -807,7 +865,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
             }
             IdaRequest::Callees { addr, resp } => {
                 debug!(address = format!("{:#x}", addr), "Getting callees");
-                let result = controlflow::handle_callees(&idb, addr);
+                let result = crate::crash_guard::crash_guarded("handle_callees", || {
+                    controlflow::handle_callees(&idb, addr)
+                });
                 match &result {
                     Ok(funcs) => debug!(count = funcs.len(), "Got callees"),
                     Err(e) => warn!(error = %e, "Failed to get callees"),
@@ -816,7 +876,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
             }
             IdaRequest::Callers { addr, resp } => {
                 debug!(address = format!("{:#x}", addr), "Getting callers");
-                let result = controlflow::handle_callers(&idb, addr);
+                let result = crate::crash_guard::crash_guarded("handle_callers", || {
+                    controlflow::handle_callers(&idb, addr)
+                });
                 match &result {
                     Ok(funcs) => debug!(count = funcs.len(), "Got callers"),
                     Err(e) => warn!(error = %e, "Failed to get callers"),
@@ -825,12 +887,16 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
             }
             IdaRequest::IdbMeta { resp } => {
                 debug!("Getting IDB metadata");
-                let result = globals::handle_idb_meta(&idb);
+                let result = crate::crash_guard::crash_guarded("handle_idb_meta", || {
+                    globals::handle_idb_meta(&idb)
+                });
                 let _ = resp.send(result);
             }
             IdaRequest::LookupFunctions { queries, resp } => {
                 debug!(count = queries.len(), "Looking up functions");
-                let result = functions::handle_lookup_funcs(&idb, &queries);
+                let result = crate::crash_guard::crash_guarded("handle_lookup_funcs", || {
+                    functions::handle_lookup_funcs(&idb, &queries)
+                });
                 let _ = resp.send(result);
             }
             IdaRequest::ListGlobals {
@@ -840,7 +906,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 resp,
             } => {
                 debug!(offset, limit, query = ?query, "Listing globals");
-                let result = globals::handle_list_globals(&idb, query.as_deref(), offset, limit);
+                let result = crate::crash_guard::crash_guarded("handle_list_globals", || {
+                    globals::handle_list_globals(&idb, query.as_deref(), offset, limit)
+                });
                 let _ = resp.send(result);
             }
             IdaRequest::AnalyzeStrings {
@@ -850,7 +918,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 resp,
             } => {
                 debug!(offset, limit, query = ?query, "Analyzing strings");
-                let result = strings::handle_analyze_strings(&idb, query.as_deref(), offset, limit);
+                let result = crate::crash_guard::crash_guarded("handle_analyze_strings", || {
+                    strings::handle_analyze_strings(&idb, query.as_deref(), offset, limit)
+                });
                 let _ = resp.send(result);
             }
             IdaRequest::FindString {
@@ -869,14 +939,16 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     limit,
                     "Finding strings"
                 );
-                let result = strings::handle_find_string(
-                    &idb,
-                    &query,
-                    exact,
-                    case_insensitive,
-                    offset,
-                    limit,
-                );
+                let result = crate::crash_guard::crash_guarded("handle_find_string", || {
+                    strings::handle_find_string(
+                        &idb,
+                        &query,
+                        exact,
+                        case_insensitive,
+                        offset,
+                        limit,
+                    )
+                });
                 let _ = resp.send(result);
             }
             IdaRequest::XrefsToString {
@@ -897,15 +969,17 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     max_xrefs,
                     "Getting xrefs to strings"
                 );
-                let result = strings::handle_xrefs_to_string(
-                    &idb,
-                    &query,
-                    exact,
-                    case_insensitive,
-                    offset,
-                    limit,
-                    max_xrefs,
-                );
+                let result = crate::crash_guard::crash_guarded("handle_xrefs_to_string", || {
+                    strings::handle_xrefs_to_string(
+                        &idb,
+                        &query,
+                        exact,
+                        case_insensitive,
+                        offset,
+                        limit,
+                        max_xrefs,
+                    )
+                });
                 let _ = resp.send(result);
             }
             IdaRequest::AnalyzeFuncs {
@@ -968,7 +1042,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 resp,
             } => {
                 debug!(pattern = %pattern, max_results, "Finding bytes");
-                let result = search::handle_find_bytes(&idb, &pattern, max_results);
+                let result = crate::crash_guard::crash_guarded("handle_find_bytes", || {
+                    search::handle_find_bytes(&idb, &pattern, max_results)
+                });
                 let _ = resp.send(result);
             }
             IdaRequest::SearchText {
@@ -977,7 +1053,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 resp,
             } => {
                 debug!(text = %text, max_results, "Searching text");
-                let result = search::handle_search_text(&idb, &text, max_results);
+                let result = crate::crash_guard::crash_guarded("handle_search_text", || {
+                    search::handle_search_text(&idb, &text, max_results)
+                });
                 let _ = resp.send(result);
             }
             IdaRequest::SearchImm {
@@ -986,7 +1064,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 resp,
             } => {
                 debug!(imm, max_results, "Searching immediate");
-                let result = search::handle_search_imm(&idb, imm, max_results);
+                let result = crate::crash_guard::crash_guarded("handle_search_imm", || {
+                    search::handle_search_imm(&idb, imm, max_results)
+                });
                 let _ = resp.send(result);
             }
             IdaRequest::FindInsns {
@@ -1017,17 +1097,21 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     case_insensitive,
                     "Finding instruction operands"
                 );
-                let result = search::handle_find_insn_operands(
-                    &idb,
-                    &patterns,
-                    max_results,
-                    case_insensitive,
-                );
+                let result = crate::crash_guard::crash_guarded("handle_find_insn_operands", || {
+                    search::handle_find_insn_operands(
+                        &idb,
+                        &patterns,
+                        max_results,
+                        case_insensitive,
+                    )
+                });
                 let _ = resp.send(result);
             }
             IdaRequest::ReadInt { addr, size, resp } => {
                 debug!(address = format!("{:#x}", addr), size, "Reading int");
-                let result = memory::handle_read_int(&idb, addr, size);
+                let result = crate::crash_guard::crash_guarded("handle_read_int", || {
+                    memory::handle_read_int(&idb, addr, size)
+                });
                 let _ = resp.send(result);
             }
             IdaRequest::GetString {
@@ -1036,12 +1120,16 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 resp,
             } => {
                 debug!(address = format!("{:#x}", addr), max_len, "Reading string");
-                let result = strings::handle_get_string(&idb, addr, max_len);
+                let result = crate::crash_guard::crash_guarded("handle_get_string", || {
+                    strings::handle_get_string(&idb, addr, max_len)
+                });
                 let _ = resp.send(result);
             }
             IdaRequest::GetGlobalValue { query, resp } => {
                 debug!(query = %query, "Getting global value");
-                let result = globals::handle_get_global_value(&idb, &query);
+                let result = crate::crash_guard::crash_guarded("handle_get_global_value", || {
+                    globals::handle_get_global_value(&idb, &query)
+                });
                 let _ = resp.send(result);
             }
             IdaRequest::FindPaths {
@@ -1058,7 +1146,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     max_depth,
                     "Finding paths"
                 );
-                let result = controlflow::handle_find_paths(&idb, start, end, max_paths, max_depth);
+                let result = crate::crash_guard::crash_guarded("handle_find_paths", || {
+                    controlflow::handle_find_paths(&idb, start, end, max_paths, max_depth)
+                });
                 let _ = resp.send(result);
             }
             IdaRequest::CallGraph {
@@ -1071,12 +1161,16 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     address = format!("{:#x}", addr),
                     max_depth, max_nodes, "Building call graph"
                 );
-                let result = controlflow::handle_callgraph(&idb, addr, max_depth, max_nodes);
+                let result = crate::crash_guard::crash_guarded("handle_callgraph", || {
+                    controlflow::handle_callgraph(&idb, addr, max_depth, max_nodes)
+                });
                 let _ = resp.send(result);
             }
             IdaRequest::XrefMatrix { addrs, resp } => {
                 debug!(count = addrs.len(), "Building xref matrix");
-                let result = xrefs::handle_xref_matrix(&idb, &addrs);
+                let result = crate::crash_guard::crash_guarded("handle_xref_matrix", || {
+                    xrefs::handle_xref_matrix(&idb, &addrs)
+                });
                 let _ = resp.send(result);
             }
             IdaRequest::ExportFuncs {
@@ -1085,7 +1179,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 resp,
             } => {
                 debug!(offset, limit, "Exporting functions");
-                let result = functions::handle_list_functions(&idb, offset, limit, None);
+                let result = crate::crash_guard::crash_guarded("handle_list_functions", || {
+                    functions::handle_list_functions(&idb, offset, limit, None)
+                });
                 let _ = resp.send(result);
             }
             IdaRequest::PseudocodeAt {
@@ -1098,7 +1194,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     end_addr = end_addr.map(|a| format!("{:#x}", a)),
                     "Getting pseudocode at address"
                 );
-                let result = disasm::handle_pseudocode_at(&idb, addr, end_addr);
+                let result = crate::crash_guard::crash_guarded("handle_pseudocode_at", || {
+                    disasm::handle_pseudocode_at(&idb, addr, end_addr)
+                });
                 match &result {
                     Ok(v) => debug!(
                         count = v

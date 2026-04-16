@@ -17,6 +17,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         idalib_build::configure_linkage()?;
     }
 
+    // Compile the C crash guard (sigsetjmp-based signal isolation)
+    #[cfg(unix)]
+    cc::Build::new()
+        .file("src/crash_guard.c")
+        .warnings(false)
+        .compile("crash_guard");
+
     // Always set rpaths for runtime library discovery.
     // This adds the specified install path plus common default locations
     // so the binary can find IDA libraries without DYLD_LIBRARY_PATH.

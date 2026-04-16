@@ -107,22 +107,18 @@ pub fn handle_disasm_function_at(
 pub fn handle_decompile(idb: &Option<IDB>, addr: u64) -> Result<String, ToolError> {
     let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
 
-    // Check if decompiler is available
     if !db.decompiler_available() {
         return Err(ToolError::DecompilerUnavailable);
     }
 
-    // Find the function at this address
     let func = db
         .function_at(addr)
         .ok_or(ToolError::FunctionNotFound(addr))?;
 
-    // Decompile function
     let cfunc = db
         .decompile(&func)
         .map_err(|e| ToolError::IdaError(e.to_string()))?;
 
-    // Get the pseudocode as string
     Ok(cfunc.pseudocode())
 }
 
@@ -150,7 +146,6 @@ pub fn handle_pseudocode_at(
         .name()
         .unwrap_or_else(|| format!("sub_{:x}", func_start));
 
-    // Decompile function
     let cfunc = db
         .decompile(&func)
         .map_err(|e| ToolError::IdaError(e.to_string()))?;
