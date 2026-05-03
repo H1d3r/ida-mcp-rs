@@ -10,16 +10,16 @@
 use axum::Router;
 use clap::{Args, Parser, Subcommand};
 use ida_mcp::server::http_access::{HttpAccessPolicy, HttpAccessService};
-use ida_mcp::server::http_config::{build_streamable_config, HttpServerOptions};
+use ida_mcp::server::http_config::{
+    build_session_manager, build_streamable_config, HttpServerOptions,
+};
 use ida_mcp::{
     disasm::generate_disasm_line, expand_path, ida, DbInfo, FunctionInfo, IdaMcpServer, IdaWorker,
     ServerMode,
 };
 use idalib::{idb::IDBOpenOptions, Address, IDB};
 use rmcp::transport::stdio;
-use rmcp::transport::streamable_http_server::{
-    session::local::LocalSessionManager, StreamableHttpService,
-};
+use rmcp::transport::streamable_http_server::StreamableHttpService;
 use rmcp::ServiceExt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -59,6 +59,11 @@ struct ServeHttpArgs {
     /// SSE keep-alive interval in seconds (0 disables)
     #[arg(long, default_value_t = 15)]
     sse_keep_alive_secs: u64,
+    /// HTTP session inactivity timeout in seconds (0 disables, but may leak
+    /// zombie sessions on silent disconnects). rmcp defaults to 300s, which
+    /// kills sessions during long IDA analyses; see issue #19.
+    #[arg(long, default_value_t = 1800)]
+    session_keep_alive_secs: u64,
     /// Use stateless mode (POST only; no sessions)
     #[arg(long)]
     stateless: bool,
@@ -293,7 +298,7 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
             );
             info!("HTTP Host guard: {}", access_policy.host_policy_summary());
 
-            let session_manager = Arc::new(LocalSessionManager::default());
+            let session_manager = build_session_manager(args.session_keep_alive_secs);
             let cancel = tokio_util::sync::CancellationToken::new();
             let config = build_streamable_config(
                 HttpServerOptions {

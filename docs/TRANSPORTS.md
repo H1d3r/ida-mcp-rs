@@ -48,6 +48,7 @@ Options:
 - `--allow-host`: comma-separated extra `Host` allowlist for DNS names or
   alternate authorities; pass a quoted `*` or an empty value to disable the check
 - `--sse-keep-alive-secs`: keep-alive interval (0 disables)
+- `--session-keep-alive-secs`: HTTP session inactivity timeout (default: 1800; 0 disables)
 
 ## Concurrency model
 
