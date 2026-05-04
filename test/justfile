@@ -229,6 +229,31 @@ test-elicitation: fixture
     RUST_LOG="{{ rust_log }}" MCP_STDIO_BIN="{{ server_bin }}" bash ./stdio_elicitation.sh
     echo "✅ Elicitation test passed"
 
+# Run callees-indirect regression test (PR #20)
+# Builds a tiny C fixture with both a direct and an indirect call, opens it
+# at a bundle-id-style path, and checks that callees() returns only the direct
+# callee (no bogus entry from the indirect call's Mem/Displ operand).
+test-callees-indirect:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'cargo build --release' first"
+        exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "jq is required for callees-indirect test (brew install jq)"
+        exit 1
+    fi
+    if ! command -v {{ cc }} >/dev/null 2>&1; then
+        echo "{{ cc }} is required to build the fixture"
+        exit 1
+    fi
+    echo "🧪 Running callees-indirect regression test..."
+    RUST_LOG="{{ rust_log }}" MCP_STDIO_BIN="{{ server_bin }}" CC="{{ cc }}" \
+        bash ./stdio_callees_indirect.sh
+    echo "✅ callees-indirect test passed"
+
 # Run crash-guard integration test
 # Verifies that SIGSEGV during a handler call is caught and converted to a
 # ToolError instead of killing the server. Triggers a real segfault via

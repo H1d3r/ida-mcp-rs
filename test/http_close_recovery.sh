@@ -65,7 +65,7 @@ init_session() {
   local body="$tmpdir/init.b.$$"
   local payload
   payload=$(printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"recovery","version":"0.1"},"capabilities":{}}}')
-  for _ in {1..100}; do
+  for _ in {1..300}; do  # 30s upper bound — generous for Rosetta-emulated Windows VM
     if curl -sS -D "$headers" -o "$body" \
       "${curl_headers[@]}" \
       -d "$payload" \
