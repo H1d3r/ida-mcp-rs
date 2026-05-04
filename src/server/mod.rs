@@ -4183,7 +4183,9 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
 
 #[cfg(test)]
 mod tests {
+    use crate::ida::worker::CloseTokenGrant;
     use crate::server::{
+        apply_close_metadata, close_hint_for,
         operation::{OperationSnapshot, OperationStatus},
         run_script_failure_message, run_script_succeeded, run_script_timeout_message,
         run_script_truncate_chars, task_payload_result_value, IdaMcpServer,
@@ -4191,7 +4193,7 @@ mod tests {
     };
     use rmcp::handler::server::wrapper::Parameters;
     use rmcp::model::CallToolResult;
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::sync::{mpsc, Arc};
 
     fn test_server() -> IdaMcpServer {
@@ -4409,5 +4411,75 @@ mod tests {
         let file = std::fs::File::create(&path)?;
         file.set_len(len)?;
         Ok(path)
+    }
+
+    fn metadata_map(
+        grant: Option<Result<CloseTokenGrant, String>>,
+    ) -> serde_json::Map<String, Value> {
+        let mut map = serde_json::Map::new();
+        apply_close_metadata(&mut map, grant, close_hint_for(crate::ServerMode::Http));
+        map
+    }
+
+    #[test]
+    fn close_metadata_grant_emits_token_owner_and_hint() {
+        let map = metadata_map(Some(Ok(CloseTokenGrant {
+            token: "tok-1".into(),
+            reused: false,
+            owner_session_id: "session-a".into(),
+        })));
+        assert_eq!(
+            map.get("close_token").and_then(Value::as_str),
+            Some("tok-1")
+        );
+        assert_eq!(
+            map.get("close_owner_session_id").and_then(Value::as_str),
+            Some("session-a")
+        );
+        assert!(map.contains_key("close_hint"));
+        assert!(!map.contains_key("close_token_reused"));
+        assert!(!map.contains_key("close_recovery_hint"));
+    }
+
+    #[test]
+    fn close_metadata_marks_reused_grant() {
+        let map = metadata_map(Some(Ok(CloseTokenGrant {
+            token: "tok-2".into(),
+            reused: true,
+            owner_session_id: "session-a".into(),
+        })));
+        assert_eq!(
+            map.get("close_token_reused").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn close_metadata_denial_emits_owner_recovery_hint_and_no_token() {
+        let map = metadata_map(Some(Err("session-original".into())));
+        assert!(!map.contains_key("close_token"));
+        assert_eq!(
+            map.get("close_owner_session_id").and_then(Value::as_str),
+            Some("session-original")
+        );
+        let recovery = map
+            .get("close_recovery_hint")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(recovery.contains("force=true"));
+        let hint = map
+            .get("close_hint")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(hint.contains("session-original"));
+    }
+
+    #[test]
+    fn close_metadata_none_emits_only_hint() {
+        let map = metadata_map(None);
+        assert!(map.contains_key("close_hint"));
+        assert!(!map.contains_key("close_token"));
+        assert!(!map.contains_key("close_owner_session_id"));
+        assert!(!map.contains_key("close_recovery_hint"));
     }
 }

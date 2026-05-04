@@ -136,6 +136,10 @@ test: build
 test-http: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-http
 
+# Run HTTP close-ownership recovery test (issue #19, PRs #18 / #21)
+test-http-recovery: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-http-recovery
+
 # Run IDAPython script integration test (debug)
 test-script: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-script

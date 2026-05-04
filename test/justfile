@@ -136,6 +136,36 @@ test-http: fixture
         ./http_integration.sh
     echo "✅ HTTP test passed"
 
+# Run HTTP close-ownership recovery test (issue #19, PRs #18 / #21)
+test-http-recovery: fixture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'cargo build --release' first"
+        exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "jq is required for close-recovery test (brew install jq)"
+        exit 1
+    fi
+    LOCK="{{ test_lock }}"
+    if [ -f "$LOCK" ]; then
+        pid=$(awk -F= '$1=="pid"{print $2}' "$LOCK" | tr -d '\r')
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            echo "Lock file $LOCK is held by pid $pid; close that server first." >&2
+            exit 1
+        else
+            rm -f "$LOCK"
+        fi
+    fi
+    echo "🧪 Running HTTP close-ownership recovery test..."
+    PORT=$((9100 + RANDOM % 800)) \
+        RUST_LOG="{{ rust_log }}" IDB_PATH="{{ test_bin }}" \
+        MCP_HTTP_BIN="{{ server_bin }}" \
+        ./http_close_recovery.sh
+    echo "✅ HTTP close-recovery test passed"
+
 # Run IDAPython script integration test
 test-script: test-bootstrap
     #!/usr/bin/env bash
