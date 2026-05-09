@@ -13,6 +13,7 @@ use ida_mcp::server::http_access::{HttpAccessPolicy, HttpAccessService};
 use ida_mcp::server::http_config::{
     build_session_manager, build_streamable_config, HttpServerOptions,
 };
+use ida_mcp::server::task::TaskRegistry;
 use ida_mcp::server::tool_filter::ToolFilter;
 use ida_mcp::server::SanitizedIdaServer;
 use ida_mcp::{
@@ -238,7 +239,7 @@ fn init_stdio_ida_state() -> anyhow::Result<ida::IdaInitState> {
     }
 }
 
-fn cancel_background_tasks(registry: &ida_mcp::server::task::TaskRegistry, message: &'static str) {
+fn cancel_background_tasks(registry: &TaskRegistry, message: &str) {
     let cancelled = registry.cancel_all_running(message);
     if cancelled > 0 {
         info!(
@@ -274,7 +275,7 @@ fn run_server(filter: Arc<ToolFilter>) -> anyhow::Result<()> {
                 ServerMode::Stdio,
                 filter_for_server.clone(),
             );
-            let task_registry = server.task_registry();
+            let task_registry = server.task_registry().clone();
             let sanitized = SanitizedIdaServer::with_filter(server, filter_for_server);
             let mut service = Some(sanitized.serve(stdio()).await?);
             let shutdown_notify = Arc::new(Notify::new());

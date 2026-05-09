@@ -47,7 +47,73 @@ pub struct TaskState {
 struct TaskEntry {
     state: TaskState,
     handle: Option<JoinHandle<()>>,
-    cancel: Option<CancellationToken>,
+    cancel_token: Option<CancellationToken>,
+}
+
+impl TaskEntry {
+    fn new(state: TaskState) -> Self {
+        Self {
+            state,
+            handle: None,
+            cancel_token: None,
+        }
+    }
+
+    fn set_handle(&mut self, handle: JoinHandle<()>, cancel_token: Option<CancellationToken>) {
+        self.handle = Some(handle);
+        self.cancel_token = cancel_token;
+    }
+
+    fn clear_runtime(&mut self) {
+        self.handle = None;
+        self.cancel_token = None;
+    }
+
+    fn abort_runtime(&mut self) {
+        if let Some(cancel_token) = self.cancel_token.take() {
+            cancel_token.cancel();
+        }
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+
+    fn complete(&mut self, result: Value) -> bool {
+        if self.state.status != TaskStatus::Running {
+            return false;
+        }
+
+        self.state.status = TaskStatus::Completed;
+        self.state.message = "Completed".to_string();
+        self.state.result = Some(result);
+        refresh_updated(&mut self.state);
+        self.clear_runtime();
+        true
+    }
+
+    fn fail(&mut self, error: &str) -> bool {
+        if self.state.status != TaskStatus::Running {
+            return false;
+        }
+
+        self.state.status = TaskStatus::Failed;
+        self.state.message = error.to_string();
+        refresh_updated(&mut self.state);
+        self.clear_runtime();
+        true
+    }
+
+    fn mark_cancelled(&mut self, message: &str) -> bool {
+        if self.state.status != TaskStatus::Running {
+            return false;
+        }
+
+        self.abort_runtime();
+        self.state.status = TaskStatus::Cancelled;
+        self.state.message = message.to_string();
+        refresh_updated(&mut self.state);
+        true
+    }
 }
 
 /// Thread-safe registry of background tasks.
@@ -98,14 +164,7 @@ impl TaskRegistry {
             updated_at_iso: created,
             key: Some(key.to_string()),
         };
-        entries.insert(
-            id.clone(),
-            TaskEntry {
-                state,
-                handle: None,
-                cancel: None,
-            },
-        );
+        entries.insert(id.clone(), TaskEntry::new(state));
         prune_terminal_tasks(&mut entries);
         Ok(id)
     }
@@ -129,14 +188,7 @@ impl TaskRegistry {
             updated_at_iso: created,
             key: None,
         };
-        entries.insert(
-            id.clone(),
-            TaskEntry {
-                state,
-                handle: None,
-                cancel: None,
-            },
-        );
+        entries.insert(id.clone(), TaskEntry::new(state));
         prune_terminal_tasks(&mut entries);
         id
     }
@@ -145,22 +197,20 @@ impl TaskRegistry {
     pub fn set_handle(&self, id: &str, handle: JoinHandle<()>) {
         let mut entries = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = entries.get_mut(id) {
-            entry.handle = Some(handle);
-            entry.cancel = None;
+            entry.set_handle(handle, None);
         }
     }
 
     /// Store the `JoinHandle` and cancellation token for a task.
-    pub fn set_handle_with_cancel(
+    pub fn set_handle_with_cancel_token(
         &self,
         id: &str,
         handle: JoinHandle<()>,
-        cancel: CancellationToken,
+        cancel_token: CancellationToken,
     ) {
         let mut entries = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = entries.get_mut(id) {
-            entry.handle = Some(handle);
-            entry.cancel = Some(cancel);
+            entry.set_handle(handle, Some(cancel_token));
         }
     }
 
@@ -188,72 +238,48 @@ impl TaskRegistry {
     /// Mark a task as completed with a JSON result.
     pub fn complete(&self, id: &str, result: Value) {
         let mut entries = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = entries.get_mut(id) {
-            entry.state.status = TaskStatus::Completed;
-            entry.state.message = "Completed".to_string();
-            entry.state.result = Some(result);
-            refresh_updated(&mut entry.state);
-            entry.handle = None;
-            entry.cancel = None;
+        let completed = match entries.get_mut(id) {
+            Some(entry) => entry.complete(result),
+            None => false,
+        };
+        if completed {
+            prune_terminal_tasks(&mut entries);
         }
-        prune_terminal_tasks(&mut entries);
     }
 
     /// Mark a task as failed with an error message.
     pub fn fail(&self, id: &str, error: &str) {
         let mut entries = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = entries.get_mut(id) {
-            entry.state.status = TaskStatus::Failed;
-            entry.state.message = error.to_string();
-            refresh_updated(&mut entry.state);
-            entry.handle = None;
-            entry.cancel = None;
+        let failed = match entries.get_mut(id) {
+            Some(entry) => entry.fail(error),
+            None => false,
+        };
+        if failed {
+            prune_terminal_tasks(&mut entries);
         }
-        prune_terminal_tasks(&mut entries);
     }
 
     /// Cancel a running task. Returns `true` if the task was running
     /// and has been aborted.
     pub fn cancel(&self, id: &str) -> bool {
         let mut entries = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = entries.get_mut(id) {
-            if entry.state.status == TaskStatus::Running {
-                if let Some(cancel) = entry.cancel.take() {
-                    cancel.cancel();
-                }
-                if let Some(handle) = entry.handle.take() {
-                    handle.abort();
-                }
-                entry.state.status = TaskStatus::Cancelled;
-                entry.state.message = "Cancelled by client".to_string();
-                refresh_updated(&mut entry.state);
-                prune_terminal_tasks(&mut entries);
-                return true;
-            }
+        let cancelled = match entries.get_mut(id) {
+            Some(entry) => entry.mark_cancelled("Cancelled by client"),
+            None => false,
+        };
+        if cancelled {
+            prune_terminal_tasks(&mut entries);
         }
-        false
+        cancelled
     }
 
     /// Cancel every currently running task. Returns the number of tasks marked
     /// as cancelled.
     pub fn cancel_all_running(&self, message: &str) -> usize {
         let mut entries = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let mut cancelled = 0;
-
-        for entry in entries.values_mut() {
-            if entry.state.status == TaskStatus::Running {
-                if let Some(cancel) = entry.cancel.take() {
-                    cancel.cancel();
-                }
-                if let Some(handle) = entry.handle.take() {
-                    handle.abort();
-                }
-                entry.state.status = TaskStatus::Cancelled;
-                entry.state.message = message.to_string();
-                refresh_updated(&mut entry.state);
-                cancelled += 1;
-            }
-        }
+        let cancelled = entries.values_mut().fold(0, |count, entry| {
+            count + usize::from(entry.mark_cancelled(message))
+        });
 
         if cancelled > 0 {
             prune_terminal_tasks(&mut entries);
@@ -431,18 +457,35 @@ mod tests {
         assert!(!registry.cancel(&id));
     }
 
+    #[test]
+    fn terminal_tasks_ignore_late_complete_or_fail_updates() {
+        let registry = TaskRegistry::new();
+        let id = registry
+            .create_keyed("t", "late", "Working")
+            .expect("should succeed");
+
+        assert!(registry.cancel(&id));
+        registry.complete(&id, json!({"ok": true}));
+        registry.fail(&id, "late failure");
+
+        let state = registry.get(&id).expect("task should exist");
+        assert_eq!(state.status, TaskStatus::Cancelled);
+        assert_eq!(state.message, "Cancelled by client");
+        assert!(state.result.is_none());
+    }
+
     #[tokio::test]
     async fn cancel_running_task_signals_cancellation_token() {
         let registry = TaskRegistry::new();
         let id = registry
             .create_keyed("t", "k-cancel", "Working")
             .expect("should succeed");
-        let cancel = CancellationToken::new();
-        let observed = cancel.clone();
+        let cancel_token = CancellationToken::new();
+        let observed = cancel_token.clone();
         let handle = tokio::spawn(async {
             std::future::pending::<()>().await;
         });
-        registry.set_handle_with_cancel(&id, handle, cancel);
+        registry.set_handle_with_cancel_token(&id, handle, cancel_token);
 
         assert!(registry.cancel(&id));
         assert!(observed.is_cancelled());
@@ -459,18 +502,18 @@ mod tests {
             .expect("should succeed");
         let completed = registry.create_completed("Done", json!({"ok": true}));
 
-        let cancel1 = CancellationToken::new();
-        let cancel2 = CancellationToken::new();
-        let observed1 = cancel1.clone();
-        let observed2 = cancel2.clone();
+        let cancel_token1 = CancellationToken::new();
+        let cancel_token2 = CancellationToken::new();
+        let observed1 = cancel_token1.clone();
+        let observed2 = cancel_token2.clone();
         let handle1 = tokio::spawn(async {
             std::future::pending::<()>().await;
         });
         let handle2 = tokio::spawn(async {
             std::future::pending::<()>().await;
         });
-        registry.set_handle_with_cancel(&id1, handle1, cancel1);
-        registry.set_handle_with_cancel(&id2, handle2, cancel2);
+        registry.set_handle_with_cancel_token(&id1, handle1, cancel_token1);
+        registry.set_handle_with_cancel_token(&id2, handle2, cancel_token2);
 
         assert_eq!(registry.cancel_all_running("Cancelled by shutdown"), 2);
         assert!(observed1.is_cancelled());

@@ -158,8 +158,8 @@ impl IdaMcpServer {
         &self.filter
     }
 
-    pub fn task_registry(&self) -> task::TaskRegistry {
-        self.task_registry.clone()
+    pub fn task_registry(&self) -> &task::TaskRegistry {
+        &self.task_registry
     }
 
     fn close_hint(&self) -> &'static str {
@@ -3052,8 +3052,8 @@ impl IdaMcpServer {
         let registry = self.task_registry.clone();
         let worker = Arc::clone(&self.worker);
         let tid = task_id.clone();
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let worker_cancel = cancel.clone();
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        let worker_cancel_token = cancel_token.clone();
 
         let handle = tokio::spawn(async move {
             // Bridge worker progress updates → task registry messages.
@@ -3069,7 +3069,7 @@ impl IdaMcpServer {
             });
 
             match worker
-                .analyze_funcs_observed(Some(tx), Some(worker_cancel))
+                .analyze_funcs_observed(Some(tx), Some(worker_cancel_token))
                 .await
             {
                 Ok(value) => {
@@ -3083,7 +3083,7 @@ impl IdaMcpServer {
             }
         });
         self.task_registry
-            .set_handle_with_cancel(&task_id, handle, cancel);
+            .set_handle_with_cancel_token(&task_id, handle, cancel_token);
         Ok(task_id)
     }
 
