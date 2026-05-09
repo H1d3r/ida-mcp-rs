@@ -234,7 +234,56 @@ All `ida_*` modules, `idc`, and `idautils` are available. See the [IDAPython API
 
 ---
 
-The default tool list includes all tools. Use `tool_catalog`/`tool_help` to discover capabilities and avoid dumping the full list into context.
+## Context Optimization
+
+`ida-mcp` exposes 71 tools (~10k tokens of `tools/list` payload). Frontier models with 1M context don't notice; smaller models and agents without lazy tool loading do. Filter the surface to only what you need:
+
+| Flag | Env var | Effect |
+|---|---|---|
+| `--toolsets=cat1,cat2` | `IDA_MCP_TOOLSETS` | Replaces "all tools" with the union of selected categories |
+| `--tools=t1,t2`        | `IDA_MCP_TOOLS`         | Adds individual tools (additive to `--toolsets`) |
+| `--exclude-tools=t1,t2`| `IDA_MCP_EXCLUDE_TOOLS` | Subtracts from the include set; always wins |
+| `--read-only`          | `IDA_MCP_READ_ONLY`     | Strips mutating/arbitrary-code tools (`run_script`, `patch*`, `rename`, `set_comments`, type/stack edits, `dsc_add_*`, `analyze_funcs`); keeps lifecycle/discovery |
+
+No flags = all 71 tools (default). Categories: `core`, `functions`, `disassembly`, `decompile`, `xrefs`, `control_flow`, `memory`, `search`, `metadata`, `types`, `editing`, `scripting` (run `tool_catalog` to enumerate). Flags override env vars; unknown names rejected at startup.
+
+### Recommendations by client
+
+- **Claude Code, Cursor:** no action — both clients already lazy-load MCP tool schemas. Claude Code's MCP Tool Search auto-defers when tools exceed 10% of context (Cursor's Dynamic Context Discovery does similar).
+- **Codex CLI, OpenCode:** every session pays the full ~10k tokens. Pick a focused subset:
+  ```bash
+  ida-mcp --toolsets=core,functions,disassembly,decompile,xrefs
+  ```
+- **Gemini CLI:** the Gemini API caps at 512 function declarations across all MCP servers. Shrink `ida-mcp` so it fits alongside others:
+  ```bash
+  ida-mcp --toolsets=core,functions,disassembly,decompile --read-only
+  ```
+- **Small / local models:** prefer the smallest workable surface. For triage:
+  ```bash
+  ida-mcp --toolsets=core,functions --tools=decompile,callees,callers --read-only
+  ```
+
+### Configuring through `mcpServers.json`
+
+Most installed MCP configs run `ida-mcp` directly without a subcommand. The env vars apply on that path too:
+
+```json
+{
+  "mcpServers": {
+    "ida-mcp": {
+      "command": "ida-mcp",
+      "env": {
+        "IDA_MCP_TOOLSETS": "core,functions,disassembly,decompile,xrefs",
+        "IDA_MCP_READ_ONLY": "true"
+      }
+    }
+  }
+}
+```
+
+### Measuring
+
+Run `just measure-tools` to see the per-tool char/token breakdown. Filtering doesn't change the numbers reported there (it acts at the protocol boundary), but the difference shows up in your client's context view (`/context` in Claude Code, equivalents elsewhere).
 
 ## Docs
 
