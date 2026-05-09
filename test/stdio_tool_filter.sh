@@ -196,6 +196,27 @@ if echo "$names" | grep -q '^decompile$'; then
 fi
 echo "   ✓ filter flags apply when running ida-mcp without explicit serve"
 
+# --- Phase B4: bool-like env values for IDA_MCP_READ_ONLY ---
+echo "── Phase B4: IDA_MCP_READ_ONLY accepts 1/0 env values ──"
+IDA_MCP_READ_ONLY=1 start_server
+initialize
+send '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+list_resp=$(wait_response 2 10)
+names=$(echo "$list_resp" | jq -r '.result.tools[].name' | sort)
+echo "$names" | grep -q '^open_idb$' || { echo "FAIL: read-only env should keep open_idb"; exit 1; }
+if echo "$names" | grep -q '^run_script$'; then
+  echo "FAIL: IDA_MCP_READ_ONLY=1 should drop run_script" >&2
+  exit 1
+fi
+
+IDA_MCP_READ_ONLY=0 start_server
+initialize
+send '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+list_resp=$(wait_response 2 10)
+names=$(echo "$list_resp" | jq -r '.result.tools[].name' | sort)
+echo "$names" | grep -q '^run_script$' || { echo "FAIL: IDA_MCP_READ_ONLY=0 should leave run_script enabled"; exit 1; }
+echo "   ✓ IDA_MCP_READ_ONLY accepts 1/0"
+
 # --- Phase C: flags override env vars ---
 # Env says 'core' (12 tools); flag forces 'decompile' (smaller set).
 # The decompile category should win and core tools should NOT appear.

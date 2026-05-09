@@ -86,7 +86,12 @@ struct ToolFilterArgs {
     /// Strip mutating and arbitrary-code tools (run_script, patch, rename,
     /// type/stack edits, dsc_add_*, analyze_funcs). Lifecycle/discovery
     /// tools (open_idb, close_idb, status, catalog, help) stay enabled.
-    #[arg(long, env = "IDA_MCP_READ_ONLY", global = true)]
+    #[arg(
+        long,
+        env = "IDA_MCP_READ_ONLY",
+        global = true,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
     read_only: bool,
 }
 
@@ -177,14 +182,18 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let filter = Arc::new(
+    // Filter is only used by the MCP server paths. Probe doesn't load any
+    // tools, so don't reject probe runs because a bad IDA_MCP_TOOLSETS is
+    // sitting in the inherited env from a sibling mcpServers.json config.
+    let build_filter = || {
         cli.filter
             .build()
-            .map_err(|e| anyhow::anyhow!("invalid tool filter: {e}"))?,
-    );
+            .map(Arc::new)
+            .map_err(|e| anyhow::anyhow!("invalid tool filter: {e}"))
+    };
     match cli.command.unwrap_or(Command::Serve) {
-        Command::Serve => run_server(filter),
-        Command::ServeHttp(args) => run_server_http(args, filter),
+        Command::Serve => run_server(build_filter()?),
+        Command::ServeHttp(args) => run_server_http(args, build_filter()?),
         Command::Probe(args) => run_probe(args),
     }
 }
