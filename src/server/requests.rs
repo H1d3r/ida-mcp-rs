@@ -8,44 +8,28 @@ use serde_json::Value;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct OpenIdbRequest {
-    #[schemars(
-        description = "Path to an IDA database (.i64/.idb) or raw binary. Call close_idb when finished to release locks; in multi-client mode coordinate before closing."
-    )]
+    #[schemars(description = "Path to .i64/.idb or raw binary.")]
     pub path: String,
-    #[schemars(description = "If true, load external debug info (dSYM/DWARF) after open")]
+    #[schemars(description = "Load external debug info (dSYM/DWARF) after open.")]
     #[serde(alias = "load_dsym")]
     pub load_debug_info: Option<bool>,
-    #[schemars(
-        description = "Optional debug info path (dSYM DWARF). If omitted, tries sibling .dSYM"
-    )]
+    #[schemars(description = "Debug info path; defaults to sibling .dSYM.")]
     #[serde(alias = "dsym_path")]
     pub debug_info_path: Option<String>,
-    #[schemars(description = "Verbose debug-info loading (default: false)")]
+    #[schemars(description = "Verbose debug-info loading.")]
     pub debug_info_verbose: Option<bool>,
-    #[schemars(
-        description = "If true, clean up stale lock files from crashed sessions before opening. \
-        Use this when a previous ida-mcp session crashed and left behind lock files."
-    )]
+    #[schemars(description = "Clean up stale lock files from crashed sessions before opening.")]
     #[serde(alias = "recover")]
     pub force: Option<bool>,
-    #[schemars(
-        description = "IDA file type selector (-T flag). Used to choose a specific loader, \
-        e.g. 'Apple DYLD cache for arm64e (single module(s))'. Only applies to raw binaries."
-    )]
+    #[schemars(description = "IDA file-type selector (-T). Raw binaries only.")]
     pub file_type: Option<String>,
     #[schemars(
-        description = "Run auto-analysis to completion before returning (default: false). \
-        For raw binaries, false returns quickly with the database loaded but analysis incomplete. \
-        Check analysis_status in the response — if auto_is_ok is false and you need xrefs/decompile, \
-        call analyze_funcs(background=true) and poll task_status. \
-        For .i64/.idb files this has no effect (analysis is already in the database). \
-        Note: when set to true and the raw input exceeds 50 MiB, the server may prompt the user (via MCP \
-        elicitation) or silently route auto-analysis to a background task when elicitation is unavailable \
-        or unanswered; in that case the response returns immediately with analysis_task_id rather than \
-        blocking until analysis finishes."
+        description = "Run full auto-analysis before returning (default: false). \
+        For raw binaries, false returns fast with analysis incomplete; .i64/.idb ignore this. \
+        Inputs >50 MiB may route to a background task (response includes analysis_task_id)."
     )]
     pub auto_analyse: Option<bool>,
-    #[schemars(description = "Open timeout in seconds (default: 300, max: 600)")]
+    #[schemars(description = "Open timeout in seconds (default 300, max 600).")]
     pub timeout_secs: Option<u64>,
 }
 
@@ -104,17 +88,12 @@ pub struct ListFunctionsRequest {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct AnalyzeFuncsRequest {
     #[schemars(
-        description = "Run analysis as a background task and return a task_id immediately \
-        (default: false). When true, poll task_status(task_id) for progress; the database \
-        becomes fully analyzed when the task completes. Other tool calls block until the \
-        IDA worker thread is free, but task_status reads the registry directly and stays \
-        responsive. Use this for large binaries (kernelcache, full DSC modules) where \
-        auto_wait() can exceed the request timeout."
+        description = "Return a task_id immediately and run analysis in the background. \
+        Use for large binaries (kernelcache, full DSC) that exceed the request timeout."
     )]
     pub background: Option<bool>,
     #[schemars(
-        description = "Timeout in seconds for foreground mode (default: 120, max: 600). \
-        Ignored when background=true."
+        description = "Foreground timeout in seconds (default 120, max 600). Ignored if background=true."
     )]
     pub timeout_secs: Option<u64>,
 }
@@ -703,16 +682,13 @@ pub struct RecentOperationsRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RunScriptRequest {
-    #[schemars(
-        description = "Python code to execute via IDAPython. Has full access to ida_* modules, \
-        idc, idautils. stdout/stderr are captured and returned. \
-        Provide either 'code' (inline) or 'file' (path to .py), not both."
-    )]
+    #[schemars(description = "Inline Python code (mutually exclusive with 'file').")]
     pub code: Option<String>,
-    #[schemars(description = "Path to a .py file to execute via IDAPython. \
-        Alternative to 'code' for longer scripts. The file is read server-side.")]
+    #[schemars(
+        description = "Path to a .py file (mutually exclusive with 'code'). Read server-side."
+    )]
     pub file: Option<String>,
-    #[schemars(description = "Execution timeout in seconds (default: 120, max: 600)")]
+    #[schemars(description = "Execution timeout in seconds (default 120, max 600).")]
     pub timeout_secs: Option<u64>,
 }
 
@@ -724,48 +700,37 @@ pub struct TaskStatusRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct OpenDscRequest {
-    #[schemars(description = "Path to the dyld_shared_cache file")]
+    #[schemars(description = "Path to the dyld_shared_cache file.")]
     pub path: String,
-    #[schemars(description = "CPU architecture (e.g. 'arm64e', 'arm64', 'x86_64h')")]
+    #[schemars(description = "CPU arch (e.g. 'arm64e', 'arm64', 'x86_64h').")]
     pub arch: String,
-    #[schemars(description = "Primary dylib to load (e.g. '/usr/lib/libobjc.A.dylib')")]
+    #[schemars(description = "Primary dylib path (e.g. '/usr/lib/libobjc.A.dylib').")]
     pub module: String,
-    #[schemars(description = "Additional frameworks to load after opening \
-        (e.g. ['/System/Library/Frameworks/Foundation.framework/Foundation'])")]
+    #[schemars(description = "Additional frameworks to load (absolute DSC paths).")]
     pub frameworks: Option<Vec<String>>,
-    #[schemars(description = "IDA version: 8 or 9. Determines the -T format string. Default: 9")]
+    #[schemars(description = "IDA version 8 or 9 (default 9).")]
     pub ida_version: Option<u8>,
-    #[schemars(description = "Path to write idat's log file (-L flag). \
-        If omitted, no log is created. Useful for debugging DSC loading failures.")]
+    #[schemars(
+        description = "Path for idat's log file (-L). Useful for debugging DSC load failures."
+    )]
     pub log_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DscAddDylibRequest {
     #[schemars(
-        description = "DSC-internal dylib path to load (e.g. '/usr/lib/libSystem.B.dylib'). \
-        Must be an absolute path inside the dyld_shared_cache."
+        description = "DSC-internal dylib path (absolute, e.g. '/usr/lib/libSystem.B.dylib')."
     )]
     pub module: String,
-    #[schemars(
-        description = "Execution timeout in seconds (default: 300, max: 600). \
-        Large frameworks may need more time. \
-        Note: this tool performs lightweight ObjC analysis only; it does not force full auto-analysis."
-    )]
+    #[schemars(description = "Timeout in seconds (default 300, max 600).")]
     pub timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DscAddRegionRequest {
-    #[schemars(
-        description = "Exactly one region address to load from the currently open DSC database (string/number). \
-        Accepts hex (e.g. '0x180116000') or decimal."
-    )]
+    #[schemars(description = "Single region address (hex '0x...' or decimal).")]
     #[serde(alias = "ea", alias = "addr")]
     pub address: Value,
-    #[schemars(
-        description = "Execution timeout in seconds (default: 300, max: 600). \
-        Use this for loading data/GOT/stub regions on-demand from DSC."
-    )]
+    #[schemars(description = "Timeout in seconds (default 300, max 600).")]
     pub timeout_secs: Option<u64>,
 }
