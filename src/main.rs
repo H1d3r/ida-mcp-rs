@@ -332,8 +332,32 @@ fn run_server(filter: Arc<ToolFilter>) -> anyhow::Result<()> {
                 }
             }
             info!("MCP server shutting down");
-            let _ = worker_for_shutdown.close_for_shutdown().await;
-            let _ = worker_for_shutdown.shutdown().await;
+            // Bounded worker shutdown. If IDA is wedged inside auto_wait()
+            // these requests sit behind it and the process can stay alive
+            // indefinitely (issue #32). After the timeout we forcibly exit
+            // so the OS reclaims IDA's mmap'd memory regardless. 124
+            // matches GNU `timeout`'s "did its best, timed out" convention.
+            const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+            let close_result = tokio::time::timeout(
+                WORKER_SHUTDOWN_TIMEOUT,
+                worker_for_shutdown.close_for_shutdown(),
+            )
+            .await;
+            let shutdown_result = tokio::time::timeout(
+                WORKER_SHUTDOWN_TIMEOUT,
+                worker_for_shutdown.shutdown(),
+            )
+            .await;
+            if close_result.is_err() || shutdown_result.is_err() {
+                warn!(
+                    timeout_secs = WORKER_SHUTDOWN_TIMEOUT.as_secs(),
+                    close_timed_out = close_result.is_err(),
+                    shutdown_timed_out = shutdown_result.is_err(),
+                    "IDA worker shutdown timed out (likely wedged in auto_wait); \
+                     forcing process exit to release IDA-side memory"
+                );
+                std::process::exit(124);
+            }
             Ok::<_, anyhow::Error>(())
         })
     });
