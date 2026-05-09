@@ -168,6 +168,34 @@ if echo "$names" | grep -q '^open_idb$'; then
 fi
 echo "   ✓ env vars apply when running ida-mcp without explicit serve"
 
+# --- Phase B3: filter FLAGS also apply on the default stdio command ---
+# Regression for https://github.com/blacktop/ida-mcp-rs/...: clap rejected
+# `ida-mcp --toolsets=core` because the flag was only defined on serve/serve-http
+# subcommands. With the global=true fix on Cli, this should now parse and run.
+echo "── Phase B3: filter flag on default command (no explicit serve) ──"
+cleanup_stale_pid
+pid=
+rm -f "$fifo"
+mkfifo "$fifo"
+: > "$log"
+"$BIN" --toolsets=core --exclude-tools=run_script < "$fifo" > "$log" 2>&1 &
+pid=$!
+exec 3>"$fifo"
+initialize
+send '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+list_resp=$(wait_response 2 10)
+names=$(echo "$list_resp" | jq -r '.result.tools[].name' | sort)
+echo "$names" | grep -q '^open_idb$' || { echo "FAIL: default-command flag should expose open_idb (core)"; exit 1; }
+if echo "$names" | grep -q '^run_script$'; then
+  echo "FAIL: default-command --exclude-tools should drop run_script" >&2
+  exit 1
+fi
+if echo "$names" | grep -q '^decompile$'; then
+  echo "FAIL: default-command --toolsets=core should not expose decompile" >&2
+  exit 1
+fi
+echo "   ✓ filter flags apply when running ida-mcp without explicit serve"
+
 # --- Phase C: flags override env vars ---
 # Env says 'core' (12 tools); flag forces 'decompile' (smaller set).
 # The decompile category should win and core tools should NOT appear.

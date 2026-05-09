@@ -40,6 +40,8 @@ const REQUEST_QUEUE_CAPACITY: usize = 64;
 #[derive(Parser)]
 #[command(name = "ida-mcp", version, about = "Headless IDA Pro MCP Server")]
 struct Cli {
+    #[command(flatten)]
+    filter: ToolFilterArgs,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -47,49 +49,48 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run the MCP server (default)
-    Serve(ServeArgs),
+    Serve,
     /// Run the MCP server over Streamable HTTP (SSE)
     ServeHttp(ServeHttpArgs),
     /// Run a direct CLI probe to exercise idalib
     Probe(ProbeArgs),
 }
 
-/// Tool filter flags shared by both `serve` and `serve-http`.
-///
-/// Compose order (locked): no include flags → all tools; otherwise the
-/// union of `--toolsets` and `--tools`; then `--exclude-tools`; then
-/// `--read-only` strips the curated mutating/arbitrary-code deny-list.
-/// Flags override env vars (clap behavior with `env =`).
+// Tool filter flags. Defined at the top level with `global = true` so they
+// work on the default stdio invocation (`ida-mcp --toolsets=core`) as well
+// as on `ida-mcp serve …` and `ida-mcp serve-http …`.
+//
+// Compose order (locked): no include flags → all tools; otherwise the
+// union of `--toolsets` and `--tools`; then `--exclude-tools`; then
+// `--read-only` strips the curated mutating/arbitrary-code deny-list.
+// Flags override env vars (clap behavior with `env =`).
 #[derive(Args, Debug, Clone, Default)]
+#[command(next_help_heading = "Tool filter")]
 struct ToolFilterArgs {
     /// Categories to include (comma-separated). When set, replaces the
     /// implicit "all tools" default. Example: --toolsets=disassembly,decompile
-    #[arg(long, value_delimiter = ',', env = "IDA_MCP_TOOLSETS")]
+    #[arg(long, value_delimiter = ',', env = "IDA_MCP_TOOLSETS", global = true)]
     toolsets: Vec<String>,
     /// Individual tool names to include (additive to --toolsets).
     /// Example: --tools=open_idb,decompile,callees
-    #[arg(long, value_delimiter = ',', env = "IDA_MCP_TOOLS")]
+    #[arg(long, value_delimiter = ',', env = "IDA_MCP_TOOLS", global = true)]
     tools: Vec<String>,
     /// Tool names to exclude (always wins over includes).
-    #[arg(long, value_delimiter = ',', env = "IDA_MCP_EXCLUDE_TOOLS")]
+    #[arg(
+        long,
+        value_delimiter = ',',
+        env = "IDA_MCP_EXCLUDE_TOOLS",
+        global = true
+    )]
     exclude_tools: Vec<String>,
     /// Strip mutating and arbitrary-code tools (run_script, patch, rename,
     /// type/stack edits, dsc_add_*, analyze_funcs). Lifecycle/discovery
     /// tools (open_idb, close_idb, status, catalog, help) stay enabled.
-    #[arg(long, env = "IDA_MCP_READ_ONLY")]
+    #[arg(long, env = "IDA_MCP_READ_ONLY", global = true)]
     read_only: bool,
 }
 
 impl ToolFilterArgs {
-    fn from_env() -> Result<Self, String> {
-        Ok(Self {
-            toolsets: env_csv("IDA_MCP_TOOLSETS")?,
-            tools: env_csv("IDA_MCP_TOOLS")?,
-            exclude_tools: env_csv("IDA_MCP_EXCLUDE_TOOLS")?,
-            read_only: env_bool("IDA_MCP_READ_ONLY")?,
-        })
-    }
-
     fn build(&self) -> Result<ToolFilter, String> {
         ToolFilter::from_inputs(
             &self.toolsets,
@@ -99,41 +100,6 @@ impl ToolFilterArgs {
         )
         .map_err(|e| e.to_string())
     }
-}
-
-fn env_csv(name: &str) -> Result<Vec<String>, String> {
-    match std::env::var(name) {
-        Ok(value) => Ok(value
-            .split(',')
-            .map(str::trim)
-            .filter(|entry| !entry.is_empty())
-            .map(ToOwned::to_owned)
-            .collect()),
-        Err(std::env::VarError::NotPresent) => Ok(Vec::new()),
-        Err(err) => Err(format!("failed to read {name}: {err}")),
-    }
-}
-
-fn env_bool(name: &str) -> Result<bool, String> {
-    let value = match std::env::var(name) {
-        Ok(value) => value,
-        Err(std::env::VarError::NotPresent) => return Ok(false),
-        Err(err) => return Err(format!("failed to read {name}: {err}")),
-    };
-    let value = value.trim().to_ascii_lowercase();
-    match value.as_str() {
-        "" | "0" | "false" | "no" | "off" => Ok(false),
-        "1" | "true" | "yes" | "on" => Ok(true),
-        _ => Err(format!(
-            "{name} must be boolean (true/false/1/0), got '{value}'"
-        )),
-    }
-}
-
-#[derive(Args, Default)]
-struct ServeArgs {
-    #[command(flatten)]
-    filter: ToolFilterArgs,
 }
 
 #[derive(Args)]
@@ -167,8 +133,6 @@ struct ServeHttpArgs {
     /// Pass `*` or an empty value to disable the Host check.
     #[arg(long, value_delimiter = ',')]
     allow_host: Option<Vec<String>>,
-    #[command(flatten)]
-    filter: ToolFilterArgs,
 }
 
 #[derive(Args)]
@@ -213,16 +177,14 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let command = match cli.command {
-        Some(command) => command,
-        None => Command::Serve(ServeArgs {
-            filter: ToolFilterArgs::from_env()
-                .map_err(|e| anyhow::anyhow!("invalid tool filter env: {e}"))?,
-        }),
-    };
-    match command {
-        Command::Serve(args) => run_server(args),
-        Command::ServeHttp(args) => run_server_http(args),
+    let filter = Arc::new(
+        cli.filter
+            .build()
+            .map_err(|e| anyhow::anyhow!("invalid tool filter: {e}"))?,
+    );
+    match cli.command.unwrap_or(Command::Serve) {
+        Command::Serve => run_server(filter),
+        Command::ServeHttp(args) => run_server_http(args, filter),
         Command::Probe(args) => run_probe(args),
     }
 }
@@ -267,13 +229,8 @@ fn init_stdio_ida_state() -> anyhow::Result<ida::IdaInitState> {
     }
 }
 
-fn run_server(args: ServeArgs) -> anyhow::Result<()> {
+fn run_server(filter: Arc<ToolFilter>) -> anyhow::Result<()> {
     info!("Starting IDA MCP Server (server mode)");
-    let filter = Arc::new(
-        args.filter
-            .build()
-            .map_err(|e| anyhow::anyhow!("invalid tool filter: {e}"))?,
-    );
     let init_state = init_stdio_ida_state()?;
 
     // Create channel for IDA requests
@@ -358,13 +315,8 @@ fn run_server(args: ServeArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
+fn run_server_http(args: ServeHttpArgs, filter: Arc<ToolFilter>) -> anyhow::Result<()> {
     info!("Starting IDA MCP Server (streamable HTTP mode)");
-    let filter = Arc::new(
-        args.filter
-            .build()
-            .map_err(|e| anyhow::anyhow!("invalid tool filter: {e}"))?,
-    );
     let init_state = ida::IdaInitState::deferred();
     if args.json_response && !args.stateless {
         info!("--json-response is ignored unless --stateless is also set");
