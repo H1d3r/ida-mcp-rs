@@ -13,6 +13,8 @@ use ida_mcp::server::http_access::{HttpAccessPolicy, HttpAccessService};
 use ida_mcp::server::http_config::{
     build_session_manager, build_streamable_config, HttpServerOptions,
 };
+use ida_mcp::server::tool_filter::ToolFilter;
+use ida_mcp::server::SanitizedIdaServer;
 use ida_mcp::{
     disasm::generate_disasm_line, expand_path, ida, DbInfo, FunctionInfo, IdaMcpServer, IdaWorker,
     ServerMode,
@@ -45,11 +47,93 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run the MCP server (default)
-    Serve,
+    Serve(ServeArgs),
     /// Run the MCP server over Streamable HTTP (SSE)
     ServeHttp(ServeHttpArgs),
     /// Run a direct CLI probe to exercise idalib
     Probe(ProbeArgs),
+}
+
+/// Tool filter flags shared by both `serve` and `serve-http`.
+///
+/// Compose order (locked): no include flags → all tools; otherwise the
+/// union of `--toolsets` and `--tools`; then `--exclude-tools`; then
+/// `--read-only` strips the curated mutating/arbitrary-code deny-list.
+/// Flags override env vars (clap behavior with `env =`).
+#[derive(Args, Debug, Clone, Default)]
+struct ToolFilterArgs {
+    /// Categories to include (comma-separated). When set, replaces the
+    /// implicit "all tools" default. Example: --toolsets=disassembly,decompile
+    #[arg(long, value_delimiter = ',', env = "IDA_MCP_TOOLSETS")]
+    toolsets: Vec<String>,
+    /// Individual tool names to include (additive to --toolsets).
+    /// Example: --tools=open_idb,decompile,callees
+    #[arg(long, value_delimiter = ',', env = "IDA_MCP_TOOLS")]
+    tools: Vec<String>,
+    /// Tool names to exclude (always wins over includes).
+    #[arg(long, value_delimiter = ',', env = "IDA_MCP_EXCLUDE_TOOLS")]
+    exclude_tools: Vec<String>,
+    /// Strip mutating and arbitrary-code tools (run_script, patch, rename,
+    /// type/stack edits, dsc_add_*, analyze_funcs). Lifecycle/discovery
+    /// tools (open_idb, close_idb, status, catalog, help) stay enabled.
+    #[arg(long, env = "IDA_MCP_READ_ONLY")]
+    read_only: bool,
+}
+
+impl ToolFilterArgs {
+    fn from_env() -> Result<Self, String> {
+        Ok(Self {
+            toolsets: env_csv("IDA_MCP_TOOLSETS")?,
+            tools: env_csv("IDA_MCP_TOOLS")?,
+            exclude_tools: env_csv("IDA_MCP_EXCLUDE_TOOLS")?,
+            read_only: env_bool("IDA_MCP_READ_ONLY")?,
+        })
+    }
+
+    fn build(&self) -> Result<ToolFilter, String> {
+        ToolFilter::from_inputs(
+            &self.toolsets,
+            &self.tools,
+            &self.exclude_tools,
+            self.read_only,
+        )
+        .map_err(|e| e.to_string())
+    }
+}
+
+fn env_csv(name: &str) -> Result<Vec<String>, String> {
+    match std::env::var(name) {
+        Ok(value) => Ok(value
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(ToOwned::to_owned)
+            .collect()),
+        Err(std::env::VarError::NotPresent) => Ok(Vec::new()),
+        Err(err) => Err(format!("failed to read {name}: {err}")),
+    }
+}
+
+fn env_bool(name: &str) -> Result<bool, String> {
+    let value = match std::env::var(name) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(false),
+        Err(err) => return Err(format!("failed to read {name}: {err}")),
+    };
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "" | "0" | "false" | "no" | "off" => Ok(false),
+        "1" | "true" | "yes" | "on" => Ok(true),
+        _ => Err(format!(
+            "{name} must be boolean (true/false/1/0), got '{value}'"
+        )),
+    }
+}
+
+#[derive(Args, Default)]
+struct ServeArgs {
+    #[command(flatten)]
+    filter: ToolFilterArgs,
 }
 
 #[derive(Args)]
@@ -83,6 +167,8 @@ struct ServeHttpArgs {
     /// Pass `*` or an empty value to disable the Host check.
     #[arg(long, value_delimiter = ',')]
     allow_host: Option<Vec<String>>,
+    #[command(flatten)]
+    filter: ToolFilterArgs,
 }
 
 #[derive(Args)]
@@ -127,8 +213,15 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    match cli.command.unwrap_or(Command::Serve) {
-        Command::Serve => run_server(),
+    let command = match cli.command {
+        Some(command) => command,
+        None => Command::Serve(ServeArgs {
+            filter: ToolFilterArgs::from_env()
+                .map_err(|e| anyhow::anyhow!("invalid tool filter env: {e}"))?,
+        }),
+    };
+    match command {
+        Command::Serve(args) => run_server(args),
         Command::ServeHttp(args) => run_server_http(args),
         Command::Probe(args) => run_probe(args),
     }
@@ -174,8 +267,13 @@ fn init_stdio_ida_state() -> anyhow::Result<ida::IdaInitState> {
     }
 }
 
-fn run_server() -> anyhow::Result<()> {
+fn run_server(args: ServeArgs) -> anyhow::Result<()> {
     info!("Starting IDA MCP Server (server mode)");
+    let filter = Arc::new(
+        args.filter
+            .build()
+            .map_err(|e| anyhow::anyhow!("invalid tool filter: {e}"))?,
+    );
     let init_state = init_stdio_ida_state()?;
 
     // Create channel for IDA requests
@@ -185,6 +283,7 @@ fn run_server() -> anyhow::Result<()> {
     // Spawn background thread for tokio runtime and MCP server
     let worker_for_server = worker.clone();
     let worker_for_shutdown = worker.clone();
+    let filter_for_server = filter.clone();
     let server_handle = thread::spawn(move || {
         // Create tokio runtime on this background thread
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -194,8 +293,12 @@ fn run_server() -> anyhow::Result<()> {
 
         rt.block_on(async move {
             info!("MCP server listening on stdio");
-            let server = IdaMcpServer::new(Arc::new(worker_for_server), ServerMode::Stdio);
-            let sanitized = ida_mcp::server::SanitizedIdaServer(server);
+            let server = IdaMcpServer::with_filter(
+                Arc::new(worker_for_server),
+                ServerMode::Stdio,
+                filter_for_server.clone(),
+            );
+            let sanitized = SanitizedIdaServer::with_filter(server, filter_for_server);
             let mut service = Some(sanitized.serve(stdio()).await?);
             let shutdown_notify = Arc::new(Notify::new());
             let shutdown_signal = shutdown_notify.clone();
@@ -257,6 +360,11 @@ fn run_server() -> anyhow::Result<()> {
 
 fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
     info!("Starting IDA MCP Server (streamable HTTP mode)");
+    let filter = Arc::new(
+        args.filter
+            .build()
+            .map_err(|e| anyhow::anyhow!("invalid tool filter: {e}"))?,
+    );
     let init_state = ida::IdaInitState::deferred();
     if args.json_response && !args.stateless {
         info!("--json-response is ignored unless --stateless is also set");
@@ -272,6 +380,7 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
 
     let worker_for_factory = worker.clone();
     let worker_for_shutdown = worker.clone();
+    let filter_for_factory = filter.clone();
     let server_handle = thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -312,10 +421,15 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
 
             let service = StreamableHttpService::new(
                 move || {
-                    Ok(ida_mcp::server::SanitizedIdaServer(IdaMcpServer::new(
+                    let inner = IdaMcpServer::with_filter(
                         worker_for_factory.clone(),
                         ServerMode::Http,
-                    )))
+                        filter_for_factory.clone(),
+                    );
+                    Ok(SanitizedIdaServer::with_filter(
+                        inner,
+                        filter_for_factory.clone(),
+                    ))
                 },
                 session_manager,
                 config,
