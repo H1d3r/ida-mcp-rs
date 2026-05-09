@@ -809,27 +809,14 @@ fn apply_close_metadata(
 #[tool_router]
 impl IdaMcpServer {
     #[tool(
-        description = "Open an IDA Pro database (.i64/.idb) or a raw binary (Mach-O/ELF/PE). \
+        description = "Open an IDA database (.i64/.idb) or raw binary (Mach-O/ELF/PE). \
         Raw binaries are saved as .i64 alongside the input. \
-        If opening a raw binary with no existing .i64 and a sibling .dSYM is present, \
-        its DWARF debug info is loaded automatically. \
-        Set load_debug_info=true to force loading external debug info after open \
-        (optionally specify debug_info_path). \
-        open_idb accepts timeout_secs (default 300s, max 600s). \
-        Phase transitions are observable via recent_operations. \
-        Call close_idb when finished to release database locks; in multi-client servers, coordinate before closing. \
-        In HTTP/SSE mode, open_idb returns a close_token that must be provided to close_idb. \
-        For raw binaries, the database opens quickly but auto-analysis does NOT run by default — \
-        check analysis_status in the response. If auto_is_ok is false and you need xrefs/decompile, \
-        call analyze_funcs(background=true) and poll task_status. list_functions, disasm, strings, \
-        and get_bytes work immediately without full analysis. \
-        When auto_analyse=true and the raw input exceeds 50 MiB, the server may prompt the user via MCP \
-        elicitation (or auto-route silently when elicitation is unavailable or unanswered) and run \
-        auto-analysis as a background task; the response then includes analysis_background=true, \
-        analysis_task_id, analysis_task_status, and analysis_background_reason — poll \
-        task_status(analysis_task_id) for completion. \
-        The database stays open until close_idb is called, so you can make multiple \
-        queries without reopening."
+        For raw binaries, auto-analysis is OFF by default — check analysis_status; \
+        call analyze_funcs(background=true) for full xrefs/decompile. \
+        Returns close_token in HTTP/SSE mode (provide to close_idb). \
+        Inputs >50 MiB with auto_analyse=true may route to a background task; \
+        poll task_status(analysis_task_id) when present. \
+        Call tool_help('open_idb') for full details."
     )]
     #[instrument(skip(self), fields(path = %req.path))]
     async fn open_idb(
@@ -1281,8 +1268,7 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "List all functions in the database (paginated). \
-        For large databases, consider setting timeout_secs (default: 120, max: 600).")]
+    #[tool(description = "List all functions in the database (paginated).")]
     #[instrument(skip(self), fields(offset = req.offset, limit = req.limit))]
     async fn list_functions(
         &self,
@@ -1306,8 +1292,7 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "List functions (ida-pro-mcp compatible alias). \
-        For large databases, consider setting timeout_secs (default: 120, max: 600).")]
+    #[tool(description = "List functions (ida-pro-mcp compatible alias).")]
     #[instrument(skip(self), fields(offset = req.offset, limit = req.limit, filter = ?req.filter))]
     async fn list_funcs(
         &self,
@@ -1579,10 +1564,7 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(
-        description = "List strings in the database with pagination and optional filter. \
-        For large databases, consider setting timeout_secs (default: 120, max: 600)."
-    )]
+    #[tool(description = "List strings in the database with pagination and optional filter.")]
     #[instrument(skip(self), fields(offset = req.offset, limit = req.limit, filter = ?req.filter))]
     async fn strings(
         &self,
@@ -1605,8 +1587,7 @@ impl IdaMcpServer {
     }
 
     #[tool(
-        description = "Find strings matching a query (supports exact/case-insensitive options). \
-        For large databases, consider setting timeout_secs (default: 120, max: 600)."
+        description = "Find strings matching a query (supports exact/case-insensitive options)."
     )]
     async fn find_string(
         &self,
@@ -1635,8 +1616,7 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Find strings and return xrefs to each match. \
-        For large databases, consider setting timeout_secs (default: 120, max: 600).")]
+    #[tool(description = "Find strings and return xrefs to each match.")]
     async fn xrefs_to_string(
         &self,
         Parameters(req): Parameters<XrefsToStringRequest>,
@@ -2016,8 +1996,7 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "List global names (non-function symbols). \
-        For large databases, consider setting timeout_secs (default: 120, max: 600).")]
+    #[tool(description = "List global names (non-function symbols).")]
     #[instrument(skip(self), fields(offset = req.offset, limit = req.limit, query = ?req.query))]
     async fn list_globals(
         &self,
@@ -2038,10 +2017,7 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(
-        description = "Analyze strings with xrefs (ida-pro-mcp compatibility). \
-        For large databases, consider setting timeout_secs (default: 120, max: 600)."
-    )]
+    #[tool(description = "Analyze strings with xrefs (ida-pro-mcp compatibility).")]
     #[instrument(skip(self), fields(offset = req.offset, limit = req.limit, query = ?req.query))]
     async fn analyze_strings(
         &self,
@@ -2062,8 +2038,7 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Find byte patterns (ida-pro-mcp compatibility). \
-        For large databases, consider setting timeout_secs (default: 120, max: 600).")]
+    #[tool(description = "Find byte patterns (ida-pro-mcp compatibility).")]
     #[instrument(skip(self))]
     async fn find_bytes(
         &self,
@@ -2123,10 +2098,7 @@ impl IdaMcpServer {
         )]))
     }
 
-    #[tool(
-        description = "Search for text or immediates (ida-pro-mcp compatibility). \
-        For large databases, consider setting timeout_secs (default: 120, max: 600)."
-    )]
+    #[tool(description = "Search for text or immediates (ida-pro-mcp compatibility).")]
     #[instrument(skip(self))]
     async fn search(
         &self,
@@ -2700,10 +2672,7 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(
-        description = "List structs in the database with pagination and optional filter. \
-        For large databases, consider setting timeout_secs (default: 120, max: 600)."
-    )]
+    #[tool(description = "List structs in the database with pagination and optional filter.")]
     #[instrument(skip(self), fields(offset = req.offset, limit = req.limit, filter = ?req.filter))]
     async fn structs(
         &self,
@@ -2924,10 +2893,8 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Run IDA auto-analysis and wait for completion. \
-        Set background=true for large binaries to return a task_id immediately and poll \
-        task_status — the IDA worker thread runs auto_wait() while task_status stays responsive. \
-        Phase transitions are observable via recent_operations.")]
+    #[tool(description = "Run IDA auto-analysis to completion. \
+        Use background=true for large binaries (returns task_id; poll task_status).")]
     async fn analyze_funcs(
         &self,
         ctx: RequestContext<RoleServer>,
@@ -3094,16 +3061,12 @@ impl IdaMcpServer {
     }
 
     #[tool(
-        description = "Open a dyld_shared_cache file and load a single module (dylib) for analysis. \
-        If the .i64 database already exists, opens it immediately and returns db_info. \
-        If the .i64 must be created (first time), spawns idat in the background and returns \
-        a task_id immediately. Poll task_status(task_id) to check progress — when completed, \
-        the database is already open and ready for analysis tools. \
-        Use this instead of open_idb when working with Apple's dyld_shared_cache files. \
-        The module parameter specifies which dylib to extract (e.g. '/usr/lib/libobjc.A.dylib'). \
-        Additional frameworks can be loaded to resolve cross-module references. \
-        To add more dylibs later, call dsc_add_dylib. \
-        To load data/GOT/stub regions by address later, call dsc_add_region."
+        description = "Open a dyld_shared_cache and load a single dylib (e.g. \
+        '/usr/lib/libobjc.A.dylib'). Use instead of open_idb for Apple DSCs. \
+        If .i64 exists, opens immediately; otherwise returns task_id and creates \
+        it in the background — poll task_status(task_id). \
+        Use dsc_add_dylib to load more modules, dsc_add_region for raw regions. \
+        Call tool_help('open_dsc') for full details."
     )]
     #[instrument(skip(self), fields(path = %req.path, arch = %req.arch, module = %req.module))]
     async fn open_dsc(
@@ -3229,16 +3192,9 @@ impl IdaMcpServer {
         )]))
     }
 
-    #[tool(
-        description = "Load an additional dylib into an already-open DSC database. \
-        Requires a database previously opened via open_dsc. \
-        Uses the dscu plugin to incrementally add one module at a time. \
-        Runs ObjC type analysis on the newly loaded module but skips \
-        full auto-analysis to keep the operation fast. \
-        After loading, call analysis_status; if auto_is_ok=false, run analyze_funcs \
-        before relying on xrefs/decompile for the new module. \
-        Example: after open_dsc loaded libobjc, use this to add Foundation."
-    )]
+    #[tool(description = "Load an additional dylib into an open DSC database \
+        (requires prior open_dsc). Skips full auto-analysis for speed; \
+        check analysis_status and run analyze_funcs if needed.")]
     #[instrument(skip(self), fields(module = %req.module))]
     async fn dsc_add_dylib(
         &self,
@@ -3312,12 +3268,9 @@ impl IdaMcpServer {
     }
 
     #[tool(
-        description = "Load an additional DSC memory region by address into an already-open \
-        DSC database. Uses dscu region mode to load data/GOT/stub areas on-demand. \
-        Accepts exactly one address per call. \
-        Requires a database previously opened via open_dsc. \
-        This does not force full auto-analysis; after loading, call analysis_status \
-        and run analyze_funcs if auto_is_ok=false before relying on xrefs/decompile."
+        description = "Load a DSC region by address into an open DSC database \
+        (data/GOT/stub areas; one address per call; requires prior open_dsc). \
+        Skips full auto-analysis."
     )]
     #[instrument(skip(self), fields(address = ?req.address))]
     async fn dsc_add_region(
@@ -3461,13 +3414,9 @@ impl IdaMcpServer {
     }
 
     #[tool(
-        description = "Execute a Python script via IDAPython in the open database. \
-        Has full access to all ida_* modules, idc, idautils. \
-        stdout and stderr are captured and returned. \
-        Provide either 'code' (inline Python) or 'file' (path to a .py file), not both. \
-        Phase transitions are observable via recent_operations. \
-        Use this for custom analysis that goes beyond the built-in tools. \
-        API reference: https://python.docs.hex-rays.com"
+        description = "Execute IDAPython in the open database. Provide 'code' (inline) \
+        or 'file' (path to .py), not both. Returns captured stdout/stderr. \
+        Full access to ida_*, idc, idautils."
     )]
     #[instrument(skip(self))]
     async fn run_script(
