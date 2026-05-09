@@ -254,6 +254,25 @@ test-callees-indirect:
         bash ./stdio_callees_indirect.sh
     echo "✅ callees-indirect test passed"
 
+# Measure tools/list payload size; useful for regression-watching
+# tool description bloat (issue: #11364). Set FAIL_OVER_CHARS=N to fail
+# the recipe when the total exceeds N (CI guard); leave unset to just print.
+measure-tools:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'just build' first"
+        exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "jq is required (brew install jq)"
+        exit 1
+    fi
+    BIN="{{ server_bin }}" TOP="${TOP:-10}" \
+        FAIL_OVER_CHARS="${FAIL_OVER_CHARS:-0}" \
+        bash ./measure_tools.sh
+
 # Run crash-guard integration test
 # Verifies that SIGSEGV during a handler call is caught and converted to a
 # ToolError instead of killing the server. Triggers a real segfault via

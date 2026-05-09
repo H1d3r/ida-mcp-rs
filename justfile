@@ -168,6 +168,10 @@ test-crash-guard: build
 test-callees-indirect: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-callees-indirect
 
+# Measure the tools/list payload size (per-tool char ranking + descriptions/schemas split)
+measure-tools: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp just measure-tools
+
 # Run cargo unit tests
 cargo-test:
     RUST_BACKTRACE=1 cargo test
