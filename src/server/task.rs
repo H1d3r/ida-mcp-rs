@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 pub const TERMINAL_TASK_CAP: usize = 256;
 /// `ttl` value exposed via MCP task metadata.
@@ -46,6 +47,7 @@ pub struct TaskState {
 struct TaskEntry {
     state: TaskState,
     handle: Option<JoinHandle<()>>,
+    cancel: Option<CancellationToken>,
 }
 
 /// Thread-safe registry of background tasks.
@@ -101,6 +103,7 @@ impl TaskRegistry {
             TaskEntry {
                 state,
                 handle: None,
+                cancel: None,
             },
         );
         prune_terminal_tasks(&mut entries);
@@ -131,6 +134,7 @@ impl TaskRegistry {
             TaskEntry {
                 state,
                 handle: None,
+                cancel: None,
             },
         );
         prune_terminal_tasks(&mut entries);
@@ -142,6 +146,21 @@ impl TaskRegistry {
         let mut entries = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = entries.get_mut(id) {
             entry.handle = Some(handle);
+            entry.cancel = None;
+        }
+    }
+
+    /// Store the `JoinHandle` and cancellation token for a task.
+    pub fn set_handle_with_cancel(
+        &self,
+        id: &str,
+        handle: JoinHandle<()>,
+        cancel: CancellationToken,
+    ) {
+        let mut entries = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = entries.get_mut(id) {
+            entry.handle = Some(handle);
+            entry.cancel = Some(cancel);
         }
     }
 
@@ -175,6 +194,7 @@ impl TaskRegistry {
             entry.state.result = Some(result);
             refresh_updated(&mut entry.state);
             entry.handle = None;
+            entry.cancel = None;
         }
         prune_terminal_tasks(&mut entries);
     }
@@ -187,6 +207,7 @@ impl TaskRegistry {
             entry.state.message = error.to_string();
             refresh_updated(&mut entry.state);
             entry.handle = None;
+            entry.cancel = None;
         }
         prune_terminal_tasks(&mut entries);
     }
@@ -197,6 +218,9 @@ impl TaskRegistry {
         let mut entries = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = entries.get_mut(id) {
             if entry.state.status == TaskStatus::Running {
+                if let Some(cancel) = entry.cancel.take() {
+                    cancel.cancel();
+                }
                 if let Some(handle) = entry.handle.take() {
                     handle.abort();
                 }
@@ -208,6 +232,34 @@ impl TaskRegistry {
             }
         }
         false
+    }
+
+    /// Cancel every currently running task. Returns the number of tasks marked
+    /// as cancelled.
+    pub fn cancel_all_running(&self, message: &str) -> usize {
+        let mut entries = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cancelled = 0;
+
+        for entry in entries.values_mut() {
+            if entry.state.status == TaskStatus::Running {
+                if let Some(cancel) = entry.cancel.take() {
+                    cancel.cancel();
+                }
+                if let Some(handle) = entry.handle.take() {
+                    handle.abort();
+                }
+                entry.state.status = TaskStatus::Cancelled;
+                entry.state.message = message.to_string();
+                refresh_updated(&mut entry.state);
+                cancelled += 1;
+            }
+        }
+
+        if cancelled > 0 {
+            prune_terminal_tasks(&mut entries);
+        }
+
+        cancelled
     }
 }
 
@@ -290,6 +342,7 @@ mod tests {
     use crate::server::task::{TaskRegistry, TaskStatus, TERMINAL_TASK_CAP};
     use serde_json::json;
     use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn create_and_get() {
@@ -376,6 +429,61 @@ mod tests {
 
         // Cancelling again returns false.
         assert!(!registry.cancel(&id));
+    }
+
+    #[tokio::test]
+    async fn cancel_running_task_signals_cancellation_token() {
+        let registry = TaskRegistry::new();
+        let id = registry
+            .create_keyed("t", "k-cancel", "Working")
+            .expect("should succeed");
+        let cancel = CancellationToken::new();
+        let observed = cancel.clone();
+        let handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        registry.set_handle_with_cancel(&id, handle, cancel);
+
+        assert!(registry.cancel(&id));
+        assert!(observed.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cancel_all_running_cancels_tokens_and_preserves_terminal_tasks() {
+        let registry = TaskRegistry::new();
+        let id1 = registry
+            .create_keyed("t", "k-all-1", "Working 1")
+            .expect("should succeed");
+        let id2 = registry
+            .create_keyed("t", "k-all-2", "Working 2")
+            .expect("should succeed");
+        let completed = registry.create_completed("Done", json!({"ok": true}));
+
+        let cancel1 = CancellationToken::new();
+        let cancel2 = CancellationToken::new();
+        let observed1 = cancel1.clone();
+        let observed2 = cancel2.clone();
+        let handle1 = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        let handle2 = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        registry.set_handle_with_cancel(&id1, handle1, cancel1);
+        registry.set_handle_with_cancel(&id2, handle2, cancel2);
+
+        assert_eq!(registry.cancel_all_running("Cancelled by shutdown"), 2);
+        assert!(observed1.is_cancelled());
+        assert!(observed2.is_cancelled());
+
+        let state1 = registry.get(&id1).expect("task should exist");
+        let state2 = registry.get(&id2).expect("task should exist");
+        let completed_state = registry.get(&completed).expect("task should exist");
+        assert_eq!(state1.status, TaskStatus::Cancelled);
+        assert_eq!(state1.message, "Cancelled by shutdown");
+        assert_eq!(state2.status, TaskStatus::Cancelled);
+        assert_eq!(completed_state.status, TaskStatus::Completed);
+        assert_eq!(registry.cancel_all_running("again"), 0);
     }
 
     #[test]

@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 const REQUEST_QUEUE_CAPACITY: usize = 64;
@@ -238,6 +238,16 @@ fn init_stdio_ida_state() -> anyhow::Result<ida::IdaInitState> {
     }
 }
 
+fn cancel_background_tasks(registry: &ida_mcp::server::task::TaskRegistry, message: &'static str) {
+    let cancelled = registry.cancel_all_running(message);
+    if cancelled > 0 {
+        info!(
+            cancelled_tasks = cancelled,
+            message, "Cancelled background tasks"
+        );
+    }
+}
+
 fn run_server(filter: Arc<ToolFilter>) -> anyhow::Result<()> {
     info!("Starting IDA MCP Server (server mode)");
     let init_state = init_stdio_ida_state()?;
@@ -264,17 +274,20 @@ fn run_server(filter: Arc<ToolFilter>) -> anyhow::Result<()> {
                 ServerMode::Stdio,
                 filter_for_server.clone(),
             );
+            let task_registry = server.task_registry();
             let sanitized = SanitizedIdaServer::with_filter(server, filter_for_server);
             let mut service = Some(sanitized.serve(stdio()).await?);
             let shutdown_notify = Arc::new(Notify::new());
             let shutdown_signal = shutdown_notify.clone();
 
-            let shutdown_worker = worker_for_shutdown.clone();
+            let shutdown_tasks = task_registry.clone();
             tokio::spawn(async move {
                 if wait_for_shutdown_signal().await.is_ok() {
                     info!("Shutdown signal received");
-                    let _ = shutdown_worker.close_for_shutdown().await;
-                    let _ = shutdown_worker.shutdown().await;
+                    cancel_background_tasks(
+                        &shutdown_tasks,
+                        "Cancelled by server shutdown",
+                    );
                     shutdown_signal.notify_one();
                 } else {
                     info!("Shutdown signal handler failed; server will continue running");
@@ -284,6 +297,10 @@ fn run_server(filter: Arc<ToolFilter>) -> anyhow::Result<()> {
             loop {
                 tokio::select! {
                     _ = shutdown_notify.notified() => {
+                        cancel_background_tasks(
+                            &task_registry,
+                            "Cancelled by server shutdown",
+                        );
                         if let Some(mut running) = service.take() {
                             let _ = running.close().await?;
                         }
@@ -292,8 +309,20 @@ fn run_server(filter: Arc<ToolFilter>) -> anyhow::Result<()> {
                     _ = tokio::time::sleep(Duration::from_millis(200)) => {
                         if let Some(running) = service.as_ref() {
                             if running.is_transport_closed() {
-                                if let Some(running) = service.take() {
-                                    let _ = running.waiting().await?;
+                                cancel_background_tasks(
+                                    &task_registry,
+                                    "Cancelled by client disconnect",
+                                );
+                                if let Some(mut running) = service.take() {
+                                    if running
+                                        .close_with_timeout(Duration::from_secs(2))
+                                        .await?
+                                        .is_none()
+                                    {
+                                        warn!(
+                                            "Timed out waiting for stdio transport cleanup after client disconnect"
+                                        );
+                                    }
                                 }
                                 break;
                             }
