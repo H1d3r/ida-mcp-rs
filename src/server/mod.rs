@@ -23,7 +23,7 @@ use rmcp::{
     schemars::{schema_for, JsonSchema},
     tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler,
 };
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
@@ -3790,7 +3790,9 @@ fn bytes_to_ascii(bytes: &[u8]) -> String {
 
 fn tool_params_schema(name: &str) -> Option<Value> {
     fn schema<T: JsonSchema>() -> Value {
-        serde_json::to_value(schema_for!(T)).unwrap_or_else(|_| json!({}))
+        let mut value = serde_json::to_value(schema_for!(T)).unwrap_or_else(|_| json!({}));
+        sanitize_schema_value(&mut value);
+        value
     }
 
     match name {
@@ -4129,22 +4131,158 @@ fn set_tool_metadata(tool: &mut Tool) {
 }
 
 fn apply_tool_metadata(mut tool: Tool) -> Tool {
+    sanitize_tool_input_schema(&mut tool);
     set_tool_metadata(&mut tool);
     tool
 }
 
-/// Strips `$schema` keys from tool input schemas and annotates
+fn is_null_schema(value: &Value) -> bool {
+    value
+        .as_object()
+        .and_then(|schema| schema.get("type"))
+        .and_then(Value::as_str)
+        == Some("null")
+}
+
+fn nullable_any_of_replacement(schema: &Map<String, Value>) -> Option<Map<String, Value>> {
+    let any_of = schema.get("anyOf")?.as_array()?;
+    let mut non_null = None;
+    let mut null_count = 0usize;
+
+    for branch in any_of {
+        if is_null_schema(branch) {
+            null_count += 1;
+        } else if non_null.replace(branch).is_some() {
+            return None;
+        }
+    }
+
+    if null_count != 1 {
+        return None;
+    }
+
+    let mut replacement = match non_null? {
+        Value::Object(branch) => branch.clone(),
+        Value::Bool(true) => Map::new(),
+        _ => return None,
+    };
+
+    for (key, value) in schema {
+        if key != "anyOf" {
+            replacement.insert(key.clone(), value.clone());
+        }
+    }
+    if replacement.get("default").is_some_and(Value::is_null) {
+        replacement.remove("default");
+    }
+
+    Some(replacement)
+}
+
+fn nullable_type_array_replacement(schema: &Map<String, Value>) -> Option<Option<Value>> {
+    let types = schema.get("type")?.as_array()?;
+    let mut non_null_types = Vec::new();
+    let mut saw_null = false;
+
+    for value in types {
+        if value.as_str() == Some("null") {
+            saw_null = true;
+        } else {
+            non_null_types.push(value.clone());
+        }
+    }
+
+    if !saw_null {
+        return None;
+    }
+
+    Some(match non_null_types.len() {
+        0 => None,
+        1 => non_null_types.into_iter().next(),
+        _ => Some(Value::Array(non_null_types)),
+    })
+}
+
+/// Integer `format` values that Vertex/Gemini's OpenAPI schema validator
+/// accepts. schemars emits `uint`, `uint8`, …, `uint64` for unsigned Rust
+/// types — those are not in OpenAPI's standard set and cause Gemini to
+/// reject the function declaration. We strip the format hint; the
+/// underlying `type: "integer"` plus `minimum: 0` still conveys
+/// non-negative intent, and server-side serde deserialization enforces
+/// the actual bit-width.
+fn is_vertex_supported_integer_format(format: &str) -> bool {
+    matches!(format, "int32" | "int64")
+}
+
+fn sanitize_schema_value(value: &mut Value) {
+    match value {
+        Value::Object(schema) => {
+            if let Some(replacement) = nullable_any_of_replacement(schema) {
+                *schema = replacement;
+            }
+            schema.remove("$schema");
+
+            if let Some(type_replacement) = nullable_type_array_replacement(schema) {
+                match type_replacement {
+                    Some(replacement) => {
+                        schema.insert("type".to_string(), replacement);
+                    }
+                    None => {
+                        schema.remove("type");
+                    }
+                }
+            }
+
+            // Drop non-OpenAPI integer formats (uint, uint8, …, uint64) so
+            // Vertex/Gemini's function-declaration validator accepts the
+            // schema. See issue #34-class reports.
+            let drop_format = schema
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|t| t == "integer")
+                && schema
+                    .get("format")
+                    .and_then(Value::as_str)
+                    .is_some_and(|f| !is_vertex_supported_integer_format(f));
+            if drop_format {
+                schema.remove("format");
+            }
+
+            for child in schema.values_mut() {
+                sanitize_schema_value(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                sanitize_schema_value(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn sanitize_tool_input_schema(tool: &mut Tool) {
+    let schema_arc = &mut tool.input_schema;
+    if let Some(map) = std::sync::Arc::get_mut(schema_arc) {
+        let mut value = Value::Object(std::mem::take(map));
+        sanitize_schema_value(&mut value);
+        if let Value::Object(sanitized) = value {
+            *map = sanitized;
+        }
+    } else {
+        let mut value = Value::Object((**schema_arc).clone());
+        sanitize_schema_value(&mut value);
+        if let Value::Object(sanitized) = value {
+            *schema_arc = std::sync::Arc::new(sanitized);
+        }
+    }
+}
+
+/// Strips client-hostile schema forms from tool input schemas and annotates
 /// task-capable tools with `execution.taskSupport = "optional"`.
 fn sanitize_tool_schemas(result: &mut ListToolsResult) {
     for tool in &mut result.tools {
-        let schema_arc = &mut tool.input_schema;
-        if let Some(map) = std::sync::Arc::get_mut(schema_arc) {
-            map.remove("$schema");
-        } else {
-            let mut map = (**schema_arc).clone();
-            map.remove("$schema");
-            *schema_arc = std::sync::Arc::new(map);
-        }
+        sanitize_tool_input_schema(tool);
         set_tool_metadata(tool);
     }
 }
@@ -4267,8 +4405,9 @@ mod tests {
         apply_close_metadata, close_hint_for,
         operation::{OperationSnapshot, OperationStatus},
         run_script_failure_message, run_script_succeeded, run_script_timeout_message,
-        run_script_truncate_chars, task_payload_result_value, IdaMcpServer,
-        RecentOperationsRequest, ToolCatalogRequest, ToolHelpRequest,
+        run_script_truncate_chars, sanitize_schema_value, task_payload_result_value,
+        tool_params_schema, IdaMcpServer, RecentOperationsRequest, ToolCatalogRequest,
+        ToolHelpRequest,
     };
     use rmcp::handler::server::wrapper::Parameters;
     use rmcp::model::CallToolResult;
@@ -4290,6 +4429,37 @@ mod tests {
             .and_then(|content| content.as_text())
             .map(|text| text.text.to_string())
             .unwrap_or_default()
+    }
+
+    fn contains_nullable_any_of(value: &Value) -> bool {
+        match value {
+            Value::Object(map) => {
+                map.get("anyOf")
+                    .and_then(Value::as_array)
+                    .is_some_and(|branches| {
+                        branches.iter().any(|branch| {
+                            branch
+                                .as_object()
+                                .and_then(|schema| schema.get("type"))
+                                .and_then(Value::as_str)
+                                == Some("null")
+                        })
+                    })
+                    || map.values().any(contains_nullable_any_of)
+            }
+            Value::Array(items) => items.iter().any(contains_nullable_any_of),
+            _ => false,
+        }
+    }
+
+    fn contains_schema_key(value: &Value) -> bool {
+        match value {
+            Value::Object(map) => {
+                map.contains_key("$schema") || map.values().any(contains_schema_key)
+            }
+            Value::Array(items) => items.iter().any(contains_schema_key),
+            _ => false,
+        }
     }
 
     #[test]
@@ -4393,6 +4563,150 @@ mod tests {
             IdaMcpServer::open_idb_elicitation_timeout_secs(Some(600)),
             crate::server::OPEN_IDB_ELICITATION_TIMEOUT_SECS
         );
+    }
+
+    #[test]
+    fn schema_sanitizer_collapses_nullable_any_of() {
+        let mut schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "timeout_secs": {
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "description": "Timeout in seconds",
+                    "anyOf": [
+                        { "type": "integer", "format": "uint64", "minimum": 0 },
+                        { "type": "null" }
+                    ],
+                    "default": null
+                },
+                "query": {
+                    "type": ["string", "null"],
+                    "description": "Optional query"
+                }
+            }
+        });
+
+        sanitize_schema_value(&mut schema);
+
+        assert!(!contains_schema_key(&schema));
+        assert!(!contains_nullable_any_of(&schema));
+
+        let timeout = schema
+            .pointer("/properties/timeout_secs")
+            .and_then(Value::as_object)
+            .expect("timeout_secs schema");
+        assert_eq!(timeout.get("type"), Some(&json!("integer")));
+        // `format: "uint64"` is stripped because it's not in Vertex/Gemini's
+        // OpenAPI-supported integer format set; the underlying type +
+        // minimum: 0 still encodes non-negative integer.
+        assert!(!timeout.contains_key("format"));
+        assert_eq!(timeout.get("minimum"), Some(&json!(0)));
+        assert_eq!(
+            timeout.get("description"),
+            Some(&json!("Timeout in seconds"))
+        );
+        assert!(!timeout.contains_key("anyOf"));
+        assert!(!timeout.contains_key("default"));
+
+        let query = schema
+            .pointer("/properties/query")
+            .and_then(Value::as_object)
+            .expect("query schema");
+        assert_eq!(query.get("type"), Some(&json!("string")));
+    }
+
+    #[test]
+    fn generated_tool_param_schemas_are_gemini_compatible() {
+        let analyze_funcs = tool_params_schema("analyze_funcs").expect("analyze_funcs schema");
+        let timeout_secs = analyze_funcs
+            .pointer("/properties/timeout_secs")
+            .and_then(Value::as_object)
+            .expect("timeout_secs schema");
+        assert_eq!(timeout_secs.get("type"), Some(&json!("integer")));
+        assert!(
+            !timeout_secs.contains_key("format"),
+            "uint64 format must be stripped for Vertex/Gemini compatibility"
+        );
+        assert!(!timeout_secs.contains_key("anyOf"));
+
+        let background = analyze_funcs
+            .pointer("/properties/background")
+            .and_then(Value::as_object)
+            .expect("background schema");
+        assert_eq!(background.get("type"), Some(&json!("boolean")));
+        assert!(!background.contains_key("anyOf"));
+
+        for tool in crate::tool_registry::all_tools() {
+            let Some(schema) = tool_params_schema(tool.name) else {
+                continue;
+            };
+            assert!(
+                !contains_schema_key(&schema),
+                "{} parameters still contain $schema",
+                tool.name
+            );
+            assert!(
+                !contains_nullable_any_of(&schema),
+                "{} parameters still contain nullable anyOf",
+                tool.name
+            );
+            let blob = serde_json::to_string(&schema).unwrap();
+            for bad in [
+                "\"format\":\"uint\"",
+                "\"format\":\"uint8\"",
+                "\"format\":\"uint16\"",
+                "\"format\":\"uint32\"",
+                "\"format\":\"uint64\"",
+            ] {
+                assert!(
+                    !blob.contains(bad),
+                    "{} parameters still contain Vertex-incompatible {}",
+                    tool.name,
+                    bad
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sanitizer_drops_unsigned_integer_formats_keeps_signed() {
+        for bad in ["uint", "uint8", "uint16", "uint32", "uint64"] {
+            let mut schema = json!({
+                "type": "integer",
+                "format": bad,
+                "minimum": 0,
+            });
+            sanitize_schema_value(&mut schema);
+            let obj = schema.as_object().unwrap();
+            assert!(
+                !obj.contains_key("format"),
+                "format '{bad}' should be stripped"
+            );
+            assert_eq!(obj.get("type"), Some(&json!("integer")));
+            assert_eq!(obj.get("minimum"), Some(&json!(0)));
+        }
+
+        for good in ["int32", "int64"] {
+            let mut schema = json!({ "type": "integer", "format": good });
+            sanitize_schema_value(&mut schema);
+            assert_eq!(
+                schema.get("format").and_then(Value::as_str),
+                Some(good),
+                "format '{good}' is OpenAPI-standard and must be preserved"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitizer_does_not_touch_string_or_number_formats() {
+        let mut schema = json!({ "type": "string", "format": "date-time" });
+        sanitize_schema_value(&mut schema);
+        assert_eq!(schema.get("format"), Some(&json!("date-time")));
+
+        let mut schema = json!({ "type": "number", "format": "double" });
+        sanitize_schema_value(&mut schema);
+        assert_eq!(schema.get("format"), Some(&json!("double")));
     }
 
     #[tokio::test]
