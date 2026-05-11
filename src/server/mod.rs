@@ -4131,7 +4131,6 @@ fn set_tool_metadata(tool: &mut Tool) {
 }
 
 fn apply_tool_metadata(mut tool: Tool) -> Tool {
-    sanitize_tool_input_schema(&mut tool);
     set_tool_metadata(&mut tool);
     tool
 }
@@ -4203,14 +4202,14 @@ fn nullable_type_array_replacement(schema: &Map<String, Value>) -> Option<Option
     })
 }
 
-/// Integer `format` values that Vertex/Gemini's OpenAPI schema validator
-/// accepts. schemars emits `uint`, `uint8`, …, `uint64` for unsigned Rust
-/// types — those are not in OpenAPI's standard set and cause Gemini to
-/// reject the function declaration. We strip the format hint; the
-/// underlying `type: "integer"` plus `minimum: 0` still conveys
-/// non-negative intent, and server-side serde deserialization enforces
-/// the actual bit-width.
-fn is_vertex_supported_integer_format(format: &str) -> bool {
+/// OpenAPI 3 standard integer `format` values. schemars emits `uint`,
+/// `uint8`, …, `uint64` for unsigned Rust types; those are non-standard
+/// and rejected by stricter OpenAPI validators (notably Vertex/Gemini's
+/// `FunctionDeclaration` checker). We strip the format hint when it
+/// falls outside this set; the underlying `type: "integer"` plus the
+/// `minimum: 0` schemars also emits still conveys non-negative intent,
+/// and serde enforces the actual bit-width at deserialization.
+fn is_openapi_standard_integer_format(format: &str) -> bool {
     matches!(format, "int32" | "int64")
 }
 
@@ -4233,9 +4232,6 @@ fn sanitize_schema_value(value: &mut Value) {
                 }
             }
 
-            // Drop non-OpenAPI integer formats (uint, uint8, …, uint64) so
-            // Vertex/Gemini's function-declaration validator accepts the
-            // schema. See issue #34-class reports.
             let drop_format = schema
                 .get("type")
                 .and_then(Value::as_str)
@@ -4243,7 +4239,7 @@ fn sanitize_schema_value(value: &mut Value) {
                 && schema
                     .get("format")
                     .and_then(Value::as_str)
-                    .is_some_and(|f| !is_vertex_supported_integer_format(f));
+                    .is_some_and(|f| !is_openapi_standard_integer_format(f));
             if drop_format {
                 schema.remove("format");
             }
@@ -4348,7 +4344,10 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
         if self.filter.is_active() && !self.filter.is_enabled(name) {
             return None;
         }
-        self.inner.get_tool(name).map(annotate_task_support)
+        self.inner.get_tool(name).map(|mut tool| {
+            sanitize_tool_input_schema(&mut tool);
+            annotate_task_support(tool)
+        })
     }
 
     async fn enqueue_task(
