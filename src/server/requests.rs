@@ -13,7 +13,9 @@ pub struct OpenIdbRequest {
     #[schemars(description = "Load external debug info (dSYM/DWARF) after open.")]
     #[serde(alias = "load_dsym")]
     pub load_debug_info: Option<bool>,
-    #[schemars(description = "Debug info path; defaults to sibling .dSYM.")]
+    #[schemars(
+        description = "Debug info path; defaults to sibling .dSYM. Empty strings are ignored."
+    )]
     #[serde(alias = "dsym_path")]
     pub debug_info_path: Option<String>,
     #[schemars(description = "Verbose debug-info loading.")]
@@ -21,7 +23,9 @@ pub struct OpenIdbRequest {
     #[schemars(description = "Clean up stale lock files from crashed sessions before opening.")]
     #[serde(alias = "recover")]
     pub force: Option<bool>,
-    #[schemars(description = "IDA file-type selector (-T). Raw binaries only.")]
+    #[schemars(
+        description = "IDA file-type selector (-T). Raw binaries only. Empty strings are ignored."
+    )]
     pub file_type: Option<String>,
     #[schemars(
         description = "Run full auto-analysis before returning (default: false). \
@@ -32,6 +36,27 @@ pub struct OpenIdbRequest {
     #[schemars(description = "Open timeout in seconds (default 300, max 600).")]
     #[schemars(range(min = 0, max = 600))]
     pub timeout_secs: Option<i64>,
+}
+
+impl OpenIdbRequest {
+    pub fn normalized_debug_info_path(&self) -> Option<String> {
+        non_empty_trimmed(self.debug_info_path.as_deref())
+    }
+
+    pub fn normalized_file_type(&self) -> Option<String> {
+        non_empty_trimmed(self.file_type.as_deref())
+    }
+}
+
+fn non_empty_trimmed(value: Option<&str>) -> Option<String> {
+    value.and_then(|text| {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
 }
 
 /// Schema for the elicitation prompt used by `open_idb` when the input binary
@@ -46,6 +71,41 @@ pub struct OpenIdbBackgroundChoice {
 }
 
 rmcp::elicit_safe!(OpenIdbBackgroundChoice);
+
+#[cfg(test)]
+mod tests {
+    use crate::server::requests::OpenIdbRequest;
+
+    fn open_request(debug_info_path: Option<&str>, file_type: Option<&str>) -> OpenIdbRequest {
+        OpenIdbRequest {
+            path: "/tmp/sample".to_string(),
+            load_debug_info: None,
+            debug_info_path: debug_info_path.map(str::to_string),
+            debug_info_verbose: None,
+            force: None,
+            file_type: file_type.map(str::to_string),
+            auto_analyse: None,
+            timeout_secs: None,
+        }
+    }
+
+    #[test]
+    fn open_idb_empty_optional_strings_are_ignored() {
+        let req = open_request(Some(" \t "), Some(""));
+        assert_eq!(req.normalized_debug_info_path(), None);
+        assert_eq!(req.normalized_file_type(), None);
+    }
+
+    #[test]
+    fn open_idb_optional_strings_are_trimmed() {
+        let req = open_request(Some(" C:\\symbols\\sample.pdb "), Some(" pe "));
+        assert_eq!(
+            req.normalized_debug_info_path(),
+            Some("C:\\symbols\\sample.pdb".to_string())
+        );
+        assert_eq!(req.normalized_file_type(), Some("pe".to_string()));
+    }
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CloseIdbRequest {

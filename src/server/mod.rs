@@ -940,6 +940,8 @@ impl IdaMcpServer {
             "timeout_secs"
         ));
 
+        let debug_info_path = req.normalized_debug_info_path();
+        let file_type = req.normalized_file_type();
         let user_auto_analyse = req.auto_analyse.unwrap_or(false);
         let large_input_size = if !matches!(self.mode, ServerMode::Worker)
             && user_auto_analyse
@@ -972,10 +974,10 @@ impl IdaMcpServer {
                     self.worker.open_observed(
                         &path,
                         req.load_debug_info.unwrap_or(false),
-                        req.debug_info_path.clone(),
+                        debug_info_path.clone(),
                         req.debug_info_verbose.unwrap_or(false),
                         req.force.unwrap_or(false),
-                        req.file_type.clone(),
+                        file_type.clone(),
                         effective_auto_analyse,
                         Vec::new(),
                         Some(progress_tx),

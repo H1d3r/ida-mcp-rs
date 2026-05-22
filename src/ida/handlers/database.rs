@@ -94,6 +94,10 @@ fn database_paths_match(current: &Path, requested: &Path) -> bool {
         || unpacked_id0_path(requested).as_deref() == Some(current)
 }
 
+fn non_empty_trimmed(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
 fn init_database_args(extra_args: &[String]) -> Vec<String> {
     let mut args = Vec::new();
 
@@ -122,6 +126,8 @@ pub fn handle_open(
     cancel: Option<CancellationToken>,
 ) -> Result<DbInfo, ToolError> {
     let expanded = expand_path(path);
+    let debug_info_path = non_empty_trimmed(debug_info_path);
+    let file_type = non_empty_trimmed(file_type);
     ensure_not_cancelled(cancel.as_ref())?;
 
     // Check if a database is already open
@@ -425,8 +431,16 @@ mod tests {
 
     use crate::ida::handlers::database::{
         base_input_path_for_database, database_paths_match, idb_path_for_raw_binary,
-        init_database_args,
+        init_database_args, non_empty_trimmed,
     };
+
+    #[test]
+    fn empty_optional_open_strings_are_ignored() {
+        assert_eq!(non_empty_trimmed(None), None);
+        assert_eq!(non_empty_trimmed(Some("")), None);
+        assert_eq!(non_empty_trimmed(Some("  \t  ")), None);
+        assert_eq!(non_empty_trimmed(Some(" pe ")), Some("pe"));
+    }
 
     #[test]
     fn init_database_args_preserves_user_args() {
