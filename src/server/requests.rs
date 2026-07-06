@@ -865,7 +865,7 @@ pub struct OpenDscRequest {
     #[schemars(range(min = 8, max = 9))]
     pub ida_version: Option<i64>,
     #[schemars(
-        description = "Path for idat's log file (-L). Useful for debugging DSC load failures."
+        description = "Path for idat's log file (-L). Used only by the legacy pre-IDA-9.4 DSC path."
     )]
     pub log_path: Option<String>,
 }

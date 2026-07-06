@@ -12,16 +12,22 @@ build:
 release:
     cargo build --release
 
+# Build release binary linked against a specific IDA version (local testing, no publish)
+release-against ida_version="9.4":
+    IDADIR="/Applications/IDA Professional {{ ida_version }}.app/Contents/MacOS" cargo build --release
+
 # Build and publish prerelease (macOS ARM64 only, for local testing)
 prerelease ida_version="9.4": && (update-beta-cask ida_version)
     #!/usr/bin/env bash
     set -euo pipefail
     VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+    TARGET=$(git rev-parse HEAD)
     IDADIR="/Applications/IDA Professional {{ ida_version }}.app/Contents/MacOS" cargo build --release
     mkdir -p dist
     rm -f "dist/ida-mcp_${VERSION}_Darwin_arm64.tar.gz"
     tar -czvf "dist/ida-mcp_${VERSION}_Darwin_arm64.tar.gz" -C target/release ida-mcp -C "{{ justfile_directory() }}" README.md LICENSE
     gh release create "v${VERSION}" \
+        --target "$TARGET" \
         --prerelease \
         --title "IDA Pro MCP Server v${VERSION}" \
         --notes "Prerelease for IDA Pro {{ ida_version }} beta. Requires IDA Pro {{ ida_version }} with valid license." \

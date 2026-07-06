@@ -916,6 +916,24 @@ impl PooledSessionState {
         remote::parse_value(result, tool)
     }
 
+    async fn call_json_field<T: DeserializeOwned>(
+        &self,
+        tool: &'static str,
+        args: Value,
+        field: &'static str,
+        timeout_secs: Option<u64>,
+    ) -> Result<T, ToolError> {
+        let value = self.call_value(tool, args, timeout_secs, None).await?;
+        let Some(field_value) = value.get(field).cloned() else {
+            return Err(ToolError::RemoteProtocol(format!(
+                "child tool {tool} response did not contain `{field}`"
+            )));
+        };
+        serde_json::from_value(field_value).map_err(|err| {
+            ToolError::RemoteProtocol(format!("invalid {tool}.{field} response: {err}"))
+        })
+    }
+
     async fn call_text(
         &self,
         tool: &'static str,
@@ -1034,6 +1052,34 @@ impl PooledSessionState {
     pub async fn analysis_status(&self) -> Result<AnalysisStatus, ToolError> {
         self.call_json("analysis_status", json!({}), None, None)
             .await
+    }
+
+    pub async fn dsc_load_image(
+        &self,
+        module: &str,
+        timeout_secs: Option<u64>,
+    ) -> Result<DscImageInfo, ToolError> {
+        self.call_json_field(
+            "dsc_add_dylib",
+            json!({ "module": module, "timeout_secs": timeout_secs }),
+            "image",
+            timeout_secs,
+        )
+        .await
+    }
+
+    pub async fn dsc_load_region(
+        &self,
+        addr: u64,
+        timeout_secs: Option<u64>,
+    ) -> Result<DscRegionInfo, ToolError> {
+        self.call_json_field(
+            "dsc_add_region",
+            json!({ "address": remote::hex_addr(addr), "timeout_secs": timeout_secs }),
+            "region",
+            timeout_secs,
+        )
+        .await
     }
 
     pub async fn list_functions(

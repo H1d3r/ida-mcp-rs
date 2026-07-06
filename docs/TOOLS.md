@@ -24,7 +24,7 @@ Database open/close and discovery tools
 |------|-------------|
 | `analysis_status` | Report auto-analysis status |
 | `close_idb` | Close the current database (release locks) |
-| `dsc_add_dylib` | Load an additional dylib into an open DSC database (light analysis only) |
+| `dsc_add_dylib` | Load an additional dylib into an open DSC database |
 | `dsc_add_region` | Load a DSC memory region by address (data/GOT/stubs) |
 | `idb_meta` | Get database metadata and summary |
 | `load_debug_info` | Load external debug info (e.g., dSYM/DWARF) |

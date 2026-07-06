@@ -837,27 +837,28 @@ impl IdaMcpServer {
         }
     }
 
-    /// Open an existing DSC .i64 synchronously and return db_info.
-    async fn open_dsc_i64(
+    /// Open a DSC database synchronously, load the requested images, and return db_info.
+    async fn open_dsc_direct(
         &self,
-        out_i64: &std::path::Path,
+        open_path: &std::path::Path,
+        file_type: Option<&str>,
         module: &str,
         frameworks: &[String],
     ) -> Result<CallToolResult, McpError> {
-        info!(out_i64 = %out_i64.display(), "Opening existing DSC .i64");
+        info!(path = %open_path.display(), file_type, "Opening DSC directly through idalib");
 
-        let i64_str = out_i64.display().to_string();
+        let open_path_str = open_path.display().to_string();
         let open_result = self
             .worker
             .open(
-                &i64_str,
+                &open_path_str,
                 false,
                 None,
                 false,
                 false,
                 false,
-                None,
-                true,
+                file_type.map(str::to_string),
+                false,
                 Vec::new(),
             )
             .await;
@@ -866,6 +867,41 @@ impl IdaMcpServer {
             Ok(info) => info,
             Err(e) => return Ok(e.to_tool_result()),
         };
+
+        let mut loaded_images = Vec::with_capacity(frameworks.len() + 1);
+        let mut dsc_warning = None;
+        match self.worker.dsc_load_image(module, Some(600)).await {
+            Ok(image) => loaded_images.push(image),
+            Err(ToolError::NotSupported(message)) if file_type.is_none() => {
+                dsc_warning = Some(format!(
+                    "Opened existing IDA database, but native DSC loading is unavailable: {message}"
+                ));
+            }
+            Err(e) => return Ok(e.to_tool_result()),
+        }
+        if dsc_warning.is_none() {
+            for framework in frameworks {
+                match self.worker.dsc_load_image(framework, Some(600)).await {
+                    Ok(image) => loaded_images.push(image),
+                    Err(e) => return Ok(e.to_tool_result()),
+                }
+            }
+        }
+
+        let analysis_status = match self.worker.analysis_status().await {
+            Ok(status) => Some(status),
+            Err(err) => {
+                warn!(module = %module, error = %err, "failed to fetch analysis_status after open_dsc");
+                None
+            }
+        };
+        let analysis_ready = analysis_status.as_ref().map(|s| s.auto_is_ok);
+        let next_step_hint = if dsc_warning.is_some() {
+            "Existing .i64 opened, but native DSC loading was unavailable; inspect loaded modules before xrefs/decompile/list_functions."
+        } else {
+            "Proceed with xrefs/decompile/list_functions for the loaded DSC module."
+        };
+        let next_steps = dsc_analysis_next_steps(analysis_ready, next_step_hint);
 
         let close_token = self.http_close_grant();
 
@@ -882,6 +918,22 @@ impl IdaMcpServer {
             if !frameworks.is_empty() {
                 map.insert("frameworks_loaded".to_string(), json!(frameworks));
             }
+            if let Some(module_info) = loaded_images.first() {
+                map.insert("module_info".to_string(), json!(module_info));
+            }
+            let dsc_backend = if dsc_warning.is_some() {
+                "unavailable"
+            } else {
+                "dscu"
+            };
+            map.insert("dsc_backend".to_string(), json!(dsc_backend));
+            map.insert("loaded_images".to_string(), json!(loaded_images));
+            if let Some(warning) = dsc_warning {
+                map.insert("dsc_warning".to_string(), json!(warning));
+            }
+            map.insert("analysis_status".to_string(), json!(analysis_status));
+            map.insert("analysis_ready".to_string(), json!(analysis_ready));
+            map.insert("next_steps".to_string(), json!(next_steps));
             if !matches!(self.mode, ServerMode::Worker) {
                 self.apply_close_metadata(map, close_token);
             }
@@ -3575,8 +3627,9 @@ impl IdaMcpServer {
     #[tool(
         description = "Open a dyld_shared_cache and load a single dylib (e.g. \
         '/usr/lib/libobjc.A.dylib'). Use instead of open_idb for Apple DSCs. \
-        If .i64 exists, opens immediately; otherwise returns task_id and creates \
-        it in the background — poll task_status(task_id). \
+        On IDA 9.4, opens the DSC header directly and loads modules through ida_dscu. \
+        On older IDA builds, if .i64 exists, opens immediately; otherwise returns \
+        task_id and creates it with idat in the background — poll task_status(task_id). \
         Use dsc_add_dylib to load more modules, dsc_add_region for raw regions. \
         Call tool_help('open_dsc') for full details."
     )]
@@ -3607,9 +3660,20 @@ impl IdaMcpServer {
         let dsc_path = std::path::Path::new(&req.path);
         let out_i64 = dsc_path.with_extension("i64");
 
-        // If .i64 already exists, open synchronously (fast path).
+        // If .i64 already exists, open synchronously (fast path) and make sure
+        // the requested module/frameworks are loaded.
         if out_i64.exists() {
-            return self.open_dsc_i64(&out_i64, &req.module, &frameworks).await;
+            return self
+                .open_dsc_direct(&out_i64, None, &req.module, &frameworks)
+                .await;
+        }
+
+        // IDA 9.4 exposes ida_dscu/dscu_svc_t: the loader can open the DSC
+        // header first, then load images on demand in the same idalib process.
+        if idalib::SDK_VERSION >= (9, 4) {
+            return self
+                .open_dsc_direct(dsc_path, Some(&file_type), &req.module, &frameworks)
+                .await;
         }
 
         // .i64 doesn't exist — need to run idat, which takes minutes.
@@ -3744,17 +3808,12 @@ impl IdaMcpServer {
         ))
         .unwrap_or(300)
         .min(MAX_TIMEOUT_SECS);
-        let timeout = Some(timeout_secs);
-        let script = crate::dsc::dsc_add_dylib_script(&module);
-
-        match self.worker.run_script(&script, timeout).await {
-            Ok(result) => {
-                if !run_script_succeeded(&result) {
-                    let message = run_script_failure_message(&result);
-                    warn!(module = %module, error = %message, "dsc_add_dylib failed");
-                    return Ok(ToolError::IdaError(message).to_tool_result());
-                }
-                let stdout = run_script_field(&result, "stdout").unwrap_or_default();
+        match self
+            .worker
+            .dsc_load_image(&module, Some(timeout_secs))
+            .await
+        {
+            Ok(image) => {
                 let analysis_status = match self.worker.analysis_status().await {
                     Ok(status) => Some(status),
                     Err(err) => {
@@ -3773,9 +3832,10 @@ impl IdaMcpServer {
                         "module": module,
                         "message": format!(
                             "Successfully loaded {module} into the database. \
-                             Lightweight ObjC analysis ran; full auto-analysis was not forced."
+                             Full auto-analysis was not forced."
                         ),
-                        "stdout": stdout,
+                        "dsc_backend": "dscu",
+                        "image": image,
                         "analysis_status": analysis_status,
                         "analysis_ready": analysis_ready,
                         "next_steps": next_steps,
@@ -3784,14 +3844,17 @@ impl IdaMcpServer {
                 )]))
             }
             Err(ToolError::Timeout(secs)) => {
-                let message = run_script_timeout_message(secs, &script);
+                let message =
+                    format!("dsc_add_dylib timed out after {secs} seconds while loading {module}");
                 warn!(module = %module, timeout_secs = secs, "dsc_add_dylib timed out");
                 Ok(ToolError::IdaError(message).to_tool_result())
             }
-            Err(ToolError::TimeoutDetailed(_)) => {
-                let message = run_script_timeout_message(timeout_secs, &script);
+            Err(ToolError::TimeoutDetailed(message)) => {
                 warn!(module = %module, timeout_secs, "dsc_add_dylib timed out");
-                Ok(ToolError::IdaError(message).to_tool_result())
+                Ok(ToolError::IdaError(format!(
+                    "dsc_add_dylib timed out while loading {module}: {message}"
+                ))
+                .to_tool_result())
             }
             Err(e) => Ok(e.to_tool_result()),
         }
@@ -3825,21 +3888,8 @@ impl IdaMcpServer {
         ))
         .unwrap_or(300)
         .min(MAX_TIMEOUT_SECS);
-        let timeout = Some(timeout_secs);
-        let script = crate::dsc::dsc_add_region_script(ea);
-
-        match self.worker.run_script(&script, timeout).await {
-            Ok(result) => {
-                if !run_script_succeeded(&result) {
-                    let message = run_script_failure_message(&result);
-                    warn!(
-                        address = %ea_hex,
-                        error = %message,
-                        "dsc_add_region failed"
-                    );
-                    return Ok(ToolError::IdaError(message).to_tool_result());
-                }
-                let stdout = run_script_field(&result, "stdout").unwrap_or_default();
+        match self.worker.dsc_load_region(ea, Some(timeout_secs)).await {
+            Ok(region) => {
                 let analysis_status = match self.worker.analysis_status().await {
                     Ok(status) => Some(status),
                     Err(err) => {
@@ -3865,7 +3915,8 @@ impl IdaMcpServer {
                             "Successfully loaded DSC region at 0x{ea:x}. \
                              Full auto-analysis was not forced."
                         ),
-                        "stdout": stdout,
+                        "dsc_backend": "dscu",
+                        "region": region,
                         "analysis_status": analysis_status,
                         "analysis_ready": analysis_ready,
                         "next_steps": next_steps,
@@ -3874,7 +3925,9 @@ impl IdaMcpServer {
                 )]))
             }
             Err(ToolError::Timeout(secs)) => {
-                let message = run_script_timeout_message(secs, &script);
+                let message = format!(
+                    "dsc_add_region timed out after {secs} seconds while loading region {ea_hex}"
+                );
                 warn!(
                     address = %ea_hex,
                     timeout_secs = secs,
@@ -3882,14 +3935,16 @@ impl IdaMcpServer {
                 );
                 Ok(ToolError::IdaError(message).to_tool_result())
             }
-            Err(ToolError::TimeoutDetailed(_)) => {
-                let message = run_script_timeout_message(timeout_secs, &script);
+            Err(ToolError::TimeoutDetailed(message)) => {
                 warn!(
                     address = %ea_hex,
                     timeout_secs,
                     "dsc_add_region timed out"
                 );
-                Ok(ToolError::IdaError(message).to_tool_result())
+                Ok(ToolError::IdaError(format!(
+                    "dsc_add_region timed out while loading region {ea_hex}: {message}"
+                ))
+                .to_tool_result())
             }
             Err(e) => Ok(e.to_tool_result()),
         }

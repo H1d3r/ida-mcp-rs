@@ -6,6 +6,7 @@ pub mod annotations;
 pub mod controlflow;
 pub mod database;
 pub mod disasm;
+pub mod dscu;
 pub mod functions;
 pub mod globals;
 pub mod imports;

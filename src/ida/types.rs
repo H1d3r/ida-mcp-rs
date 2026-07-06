@@ -31,6 +31,30 @@ pub struct AnalysisStatus {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DscImageInfo {
+    pub index: i32,
+    pub name: String,
+    pub file_name: String,
+    pub address: String,
+    pub address_value: u64,
+    pub total_size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_index: Option<u64>,
+    pub loaded: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DscRegionInfo {
+    pub start: String,
+    pub start_value: u64,
+    pub size: u64,
+    pub kind: String,
+    pub image_index: i32,
+    pub name: String,
+    pub loaded: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SymbolInfo {
     pub name: String,
     pub address: String,

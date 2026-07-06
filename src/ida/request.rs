@@ -34,6 +34,14 @@ pub enum IdaRequest {
     AnalysisStatus {
         resp: oneshot::Sender<Result<AnalysisStatus, ToolError>>,
     },
+    DscLoadImage {
+        module: String,
+        resp: oneshot::Sender<Result<DscImageInfo, ToolError>>,
+    },
+    DscLoadRegion {
+        addr: u64,
+        resp: oneshot::Sender<Result<DscRegionInfo, ToolError>>,
+    },
     ListFunctions {
         offset: usize,
         limit: usize,

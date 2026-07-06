@@ -1,6 +1,6 @@
 [package]
 name = "ida-mcp"
-version = "9.3.24"
+version = "9.4.0-beta.1"
 edition = "2021"
 description = "Headless IDA Pro MCP Server"
 license = "MIT"
@@ -11,7 +11,7 @@ categories = ["development-tools", "command-line-utilities"]
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
-idalib = { git = "https://github.com/blacktop/idalib.git", branch = "sdk-9.3.1" }
+idalib = { git = "https://github.com/blacktop/idalib.git", branch = "sdk-9.4.0" }
 rmcp = { version = "1.7", features = ["server", "client", "transport-io", "transport-child-process", "transport-streamable-http-server", "elicitation", "schemars"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "net", "signal", "process", "io-util"] }
 tokio-util = "0.7"
@@ -34,9 +34,4 @@ uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 cc = "1"
-idalib-build = { git = "https://github.com/blacktop/idalib.git", branch = "sdk-9.3.1", package = "idalib-build" }
-
-# [patch."https://github.com/blacktop/idalib.git"]
-# idalib = { path = "../idalib/idalib" }
-# idalib-build = { path = "../idalib/idalib-build" }
-# idalib-sys = { path = "../idalib/idalib-sys" }
+idalib-build = { git = "https://github.com/blacktop/idalib.git", branch = "sdk-9.4.0", package = "idalib-build" }

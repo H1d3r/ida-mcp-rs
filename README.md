@@ -25,6 +25,7 @@
 **macOS / Linux** (via [Homebrew](https://brew.sh))
 ```bash
 brew install blacktop/tap/ida-mcp        # Latest (IDA 9.3/9.3sp1)
+brew install blacktop/tap/ida-mcp@beta   # IDA 9.4 beta
 brew install blacktop/tap/ida-mcp@9.2    # IDA 9.2
 ```
 
@@ -215,14 +216,14 @@ their orphaned sessions are reclaimed by `--session-keep-alive-secs` (default
 
 #### `dyld_shared_cache` analysis
 
-`open_dsc` opens a single module from Apple's dyld_shared_cache. On first use it runs `idat` in the background to create the `.i64` (this can take minutes). Subsequent opens are instant.
+`open_dsc` opens a single module from Apple's dyld_shared_cache. With IDA 9.4, ida-mcp opens the DSC header directly and loads images through IDA's native `dscu` service. Older IDA builds fall back to the legacy `idat` background flow when a generated `.i64` is needed.
 
 ```
 # Open a module from the DSC
 open_dsc(path: "/path/to/dyld_shared_cache_arm64e", arch: "arm64e",
          module: "/usr/lib/libobjc.A.dylib")
 
-# If a background task was started, poll until done
+# If a legacy background task was started, poll until done
 task_status(task_id: "dsc-1")
 
 # Load additional frameworks for cross-module references
@@ -241,8 +242,8 @@ analysis_status()
 ```
 
 Requirements:
-- `idat` binary (from IDA installation) must be available via `$IDADIR` or standard install paths
-- The DSC loader and `dscu` plugin (bundled with IDA 9.x)
+- IDA 9.4+ for native `dscu` loading
+- For older IDA builds, `idat` must be available via `$IDADIR` or standard install paths
 
 #### IDAPython scripting
 

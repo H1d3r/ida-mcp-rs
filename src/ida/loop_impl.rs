@@ -10,8 +10,8 @@ use tracing::{debug, error, info, warn};
 use crate::error::ToolError;
 use crate::ida::handlers::resolve_address;
 use crate::ida::handlers::{
-    address, analysis, annotations, controlflow, database, disasm, functions, globals, imports,
-    memory, script, search, segments, strings, structs, types, xrefs,
+    address, analysis, annotations, controlflow, database, disasm, dscu, functions, globals,
+    imports, memory, script, search, segments, strings, structs, types, xrefs,
 };
 use crate::ida::lock::release_mcp_lock;
 use crate::ida::observability::{
@@ -299,6 +299,40 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                         "Analysis status reported"
                     ),
                     Err(e) => warn!(error = %e, "Failed to report analysis status"),
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::DscLoadImage { module, resp } => {
+                debug!(module = %module, "Loading DSC image");
+                let result = crate::crash_guard::crash_guarded("handle_dsc_load_image", || {
+                    dscu::handle_dsc_load_image(&idb, &module)
+                });
+                match &result {
+                    Ok(image) => debug!(
+                        module = %image.name,
+                        address = %image.address,
+                        loaded = image.loaded,
+                        "Loaded DSC image"
+                    ),
+                    Err(e) => warn!(module = %module, error = %e, "Failed to load DSC image"),
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::DscLoadRegion { addr, resp } => {
+                debug!(address = format!("{addr:#x}"), "Loading DSC region");
+                let result = crate::crash_guard::crash_guarded("handle_dsc_load_region", || {
+                    dscu::handle_dsc_load_region(&idb, addr)
+                });
+                match &result {
+                    Ok(region) => debug!(
+                        start = %region.start,
+                        kind = %region.kind,
+                        loaded = region.loaded,
+                        "Loaded DSC region"
+                    ),
+                    Err(e) => {
+                        warn!(address = format!("{addr:#x}"), error = %e, "Failed to load DSC region")
+                    }
                 }
                 let _ = resp.send(result);
             }
@@ -1405,6 +1439,8 @@ fn reject_with_error(req: IdaRequest, err: ToolError) {
         IdaRequest::Open { resp, .. } => reject!(resp, err),
         IdaRequest::LoadDebugInfo { resp, .. } => reject!(resp, err),
         IdaRequest::AnalysisStatus { resp, .. } => reject!(resp, err),
+        IdaRequest::DscLoadImage { resp, .. } => reject!(resp, err),
+        IdaRequest::DscLoadRegion { resp, .. } => reject!(resp, err),
         IdaRequest::ListFunctions { resp, .. } => reject!(resp, err),
         IdaRequest::ResolveFunction { resp, .. } => reject!(resp, err),
         IdaRequest::DisasmByName { resp, .. } => reject!(resp, err),

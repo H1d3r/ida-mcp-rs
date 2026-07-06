@@ -325,6 +325,31 @@ impl IdaWorker {
         rx.await?
     }
 
+    /// Load a DSC image into the current database via IDA's native dscu service.
+    pub async fn dsc_load_image(
+        &self,
+        module: &str,
+        timeout_secs: Option<u64>,
+    ) -> Result<DscImageInfo, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::DscLoadImage {
+            module: module.to_string(),
+            resp: tx,
+        })?;
+        Self::recv_with_timeout(rx, timeout_secs).await
+    }
+
+    /// Load a DSC region into the current database via IDA's native dscu service.
+    pub async fn dsc_load_region(
+        &self,
+        addr: u64,
+        timeout_secs: Option<u64>,
+    ) -> Result<DscRegionInfo, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::DscLoadRegion { addr, resp: tx })?;
+        Self::recv_with_timeout(rx, timeout_secs).await
+    }
+
     /// Shutdown the IDA worker loop.
     pub async fn shutdown(&self) -> Result<(), ToolError> {
         self.send_with_retry(IdaRequest::Shutdown, None).await
@@ -1396,6 +1421,28 @@ impl WorkerBackend {
         match self {
             Self::Local(worker) => worker.analysis_status().await,
             Self::Pooled(state) => state.analysis_status().await,
+        }
+    }
+
+    pub async fn dsc_load_image(
+        &self,
+        module: &str,
+        timeout_secs: Option<u64>,
+    ) -> Result<DscImageInfo, ToolError> {
+        match self {
+            Self::Local(worker) => worker.dsc_load_image(module, timeout_secs).await,
+            Self::Pooled(state) => state.dsc_load_image(module, timeout_secs).await,
+        }
+    }
+
+    pub async fn dsc_load_region(
+        &self,
+        addr: u64,
+        timeout_secs: Option<u64>,
+    ) -> Result<DscRegionInfo, ToolError> {
+        match self {
+            Self::Local(worker) => worker.dsc_load_region(addr, timeout_secs).await,
+            Self::Pooled(state) => state.dsc_load_region(addr, timeout_secs).await,
         }
     }
 

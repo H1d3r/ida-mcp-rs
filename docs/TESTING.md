@@ -42,7 +42,7 @@ All integration tests require IDA Pro with a valid license. Run `cargo build` fi
 
 **DSC test** (`just test-dsc <path>`)
 - Requires a real `dyld_shared_cache_arm64e` file
-- Tests both sync (pre-existing `.i64`) and async (background `idat`) paths
+- Tests the native IDA 9.4 `dscu` path and legacy generated-`.i64` fallback where available
 - Polls `task_status` until completion
 - Verifies the database is usable after loading (`list_functions`)
 
