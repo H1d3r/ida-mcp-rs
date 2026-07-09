@@ -8,8 +8,8 @@ use crate::ida::types::*;
 use crate::ida::worker::MAX_TIMEOUT_SECS;
 use futures_util::future::join_all;
 use rmcp::handler::client::ClientHandler;
-use rmcp::model::{CallToolResult, ClientInfo, JsonObject, LoggingMessageNotificationParam};
-use rmcp::service::{NotificationContext, Peer, RoleClient, RunningService};
+use rmcp::model::{CallToolResult, ClientInfo, JsonObject};
+use rmcp::service::{Peer, RoleClient, RunningService};
 use rmcp::transport::child_process::TokioChildProcess;
 use rmcp::ServiceExt;
 use serde::de::DeserializeOwned;
@@ -93,26 +93,9 @@ pub struct PooledWorkerHandle {
 }
 
 #[derive(Clone)]
-struct ParentClientHandler {
-    worker_id: usize,
-}
+struct ParentClientHandler;
 
 impl ClientHandler for ParentClientHandler {
-    async fn on_logging_message(
-        &self,
-        params: LoggingMessageNotificationParam,
-        _context: NotificationContext<RoleClient>,
-    ) {
-        debug!(
-            target: "ida_mcp::worker",
-            worker_id = self.worker_id,
-            level = ?params.level,
-            logger = ?params.logger,
-            data = ?params.data,
-            "child worker log"
-        );
-    }
-
     fn get_info(&self) -> ClientInfo {
         ClientInfo::default()
     }
@@ -443,7 +426,7 @@ impl WorkerPool {
             })?;
         let pid = transport.id();
         let stderr_task = spawn_stderr_relay(id, stderr);
-        let handler = ParentClientHandler { worker_id: id };
+        let handler = ParentClientHandler;
         let service = handler.serve(transport).await.map_err(|err| {
             ToolError::RemoteProtocol(format!("failed to initialize worker {id}: {err}"))
         })?;
@@ -957,6 +940,7 @@ impl PooledSessionState {
         file_type: Option<String>,
         auto_analyse: bool,
         extra_args: Vec<String>,
+        idb_out: Option<String>,
         timeout_secs: Option<u64>,
         _progress_tx: Option<ProgressSender>,
         cancel: Option<CancellationToken>,
@@ -976,6 +960,7 @@ impl PooledSessionState {
                     file_type,
                     auto_analyse,
                     extra_args,
+                    idb_out,
                     timeout_secs,
                 ))?,
                 timeout,
@@ -1021,6 +1006,7 @@ impl PooledSessionState {
             file_type,
             auto_analyse,
             extra_args,
+            None,
             None,
             None,
             None,
@@ -1932,6 +1918,7 @@ fn open_idb_child_args(
     file_type: Option<String>,
     auto_analyse: bool,
     extra_args: Vec<String>,
+    idb_out: Option<String>,
     timeout_secs: Option<u64>,
 ) -> Value {
     json!({
@@ -1944,6 +1931,7 @@ fn open_idb_child_args(
         "file_type": file_type,
         "auto_analyse": auto_analyse,
         "_worker_extra_args": extra_args,
+        "_worker_idb_out": idb_out,
         "timeout_secs": timeout_secs,
     })
 }
@@ -2157,10 +2145,12 @@ mod tests {
             Some("pe".to_string()),
             true,
             vec!["-A".to_string()],
+            Some("/tmp/a.out.i64".to_string()),
             Some(600),
         );
         assert_eq!(open_args["timeout_secs"], json!(600));
         assert_eq!(open_args["rebuild"], json!(false));
+        assert_eq!(open_args["_worker_idb_out"], json!("/tmp/a.out.i64"));
 
         let analyze_args = analyze_funcs_child_args(Some(600), false);
         assert_eq!(analyze_args["timeout_secs"], json!(600));

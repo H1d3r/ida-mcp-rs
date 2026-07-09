@@ -43,6 +43,9 @@ pub struct OpenIdbRequest {
     #[serde(default, rename = "_worker_extra_args")]
     #[schemars(skip)]
     pub worker_extra_args: Vec<String>,
+    #[serde(default, rename = "_worker_idb_out")]
+    #[schemars(skip)]
+    pub worker_idb_out: Option<String>,
 }
 
 impl OpenIdbRequest {
@@ -95,6 +98,7 @@ mod tests {
             auto_analyse: None,
             timeout_secs: None,
             worker_extra_args: Vec::new(),
+            worker_idb_out: None,
         }
     }
 

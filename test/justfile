@@ -699,14 +699,18 @@ test-dsc dsc_path=dsc_test_path:
 
             if [ "$status" = "completed" ]; then
                 echo "   Task completed"
-                # Verify db_info is present in the result
+                # Legacy idat/.i64 opens usually return functions immediately.
+                # IDA 9.4's native dscu path can complete the image load before
+                # function analysis has produced entries, so accept a loaded
+                # DSC image as the direct-path success signal.
                 fc=$(echo "$poll_text" | jq -r '.result.function_count // empty')
-                if [ -z "$fc" ] || [ "$fc" = "0" ]; then
-                    echo "❌ No function_count in completed task result"
+                dsc_loaded=$(echo "$poll_text" | jq -r '.result.loaded_images[0].loaded // false')
+                if { [ -z "$fc" ] || [ "$fc" = "0" ]; } && [ "$dsc_loaded" != "true" ]; then
+                    echo "❌ Completed DSC task had neither function_count nor loaded DSC image"
                     cat "$log"
                     exit 1
                 fi
-                echo "   function_count=$fc"
+                echo "   function_count=${fc:-0} loaded_image=$dsc_loaded"
                 break
             elif [ "$status" = "failed" ]; then
                 echo "❌ Task failed: $message"

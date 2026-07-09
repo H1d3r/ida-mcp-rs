@@ -232,6 +232,7 @@ impl IdaWorker {
         file_type: Option<String>,
         auto_analyse: bool,
         extra_args: Vec<String>,
+        idb_out: Option<String>,
     ) -> Result<DbInfo, ToolError> {
         self.open_observed(
             path,
@@ -243,6 +244,7 @@ impl IdaWorker {
             file_type,
             auto_analyse,
             extra_args,
+            idb_out,
             None,
             None,
             None,
@@ -263,6 +265,7 @@ impl IdaWorker {
         file_type: Option<String>,
         auto_analyse: bool,
         extra_args: Vec<String>,
+        idb_out: Option<String>,
         _timeout_secs: Option<u64>,
         progress_tx: Option<ProgressSender>,
         cancel: Option<CancellationToken>,
@@ -278,6 +281,7 @@ impl IdaWorker {
             file_type,
             auto_analyse,
             extra_args,
+            idb_out,
             progress_tx,
             cancel,
             resp: tx,
@@ -1308,6 +1312,7 @@ impl WorkerBackend {
                         file_type,
                         auto_analyse,
                         extra_args,
+                        None,
                     )
                     .await
             }
@@ -1341,6 +1346,7 @@ impl WorkerBackend {
         file_type: Option<String>,
         auto_analyse: bool,
         extra_args: Vec<String>,
+        idb_out: Option<String>,
         timeout_secs: Option<u64>,
         progress_tx: Option<ProgressSender>,
         cancel: Option<CancellationToken>,
@@ -1358,6 +1364,7 @@ impl WorkerBackend {
                         file_type,
                         auto_analyse,
                         extra_args,
+                        idb_out,
                         timeout_secs,
                         progress_tx,
                         cancel,
@@ -1376,6 +1383,7 @@ impl WorkerBackend {
                         file_type,
                         auto_analyse,
                         extra_args,
+                        idb_out,
                         timeout_secs,
                         progress_tx,
                         cancel,

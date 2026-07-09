@@ -19,6 +19,7 @@ pub enum IdaRequest {
         file_type: Option<String>,
         auto_analyse: bool,
         extra_args: Vec<String>,
+        idb_out: Option<String>,
         progress_tx: Option<ProgressSender>,
         cancel: Option<CancellationToken>,
         resp: oneshot::Sender<Result<DbInfo, ToolError>>,

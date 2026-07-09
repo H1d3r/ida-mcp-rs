@@ -1,8 +1,10 @@
 //! Main IDA worker loop.
 
-use std::fs::File;
-use std::path::PathBuf;
+use std::ffi::{OsStr, OsString};
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use idalib::IDB;
 use tracing::{debug, error, info, warn};
@@ -33,13 +35,37 @@ macro_rules! log_result {
 pub struct IdaInitState {
     pub library_initialized: bool,
     pub version_mismatch: Option<String>,
+    isolated_idausr: Option<IsolatedIdaUserDir>,
 }
 
 impl IdaInitState {
-    pub fn deferred() -> Self {
-        Self {
+    pub fn deferred() -> Result<Self, String> {
+        Ok(Self {
             library_initialized: false,
             version_mismatch: None,
+            isolated_idausr: prepare_isolated_idausr(idalib::SDK_VERSION)?,
+        })
+    }
+}
+
+struct IsolatedIdaUserDir {
+    path: PathBuf,
+    previous_idausr: Option<OsString>,
+}
+
+impl Drop for IsolatedIdaUserDir {
+    fn drop(&mut self) {
+        if let Err(err) = fs::remove_dir_all(&self.path) {
+            debug!(
+                path = %self.path.display(),
+                error = %err,
+                "Failed to remove temporary IDA user directory"
+            );
+        }
+        if let Some(previous_idausr) = self.previous_idausr.as_ref() {
+            std::env::set_var("IDAUSR", previous_idausr);
+        } else {
+            std::env::remove_var("IDAUSR");
         }
     }
 }
@@ -101,8 +127,233 @@ fn check_license_expiry() -> Result<(), String> {
     Ok(())
 }
 
+fn should_check_license_expiry(sdk_version: (i32, i32)) -> bool {
+    sdk_version < (9, 4)
+}
+
+fn should_isolate_idausr(sdk_version: (i32, i32)) -> bool {
+    sdk_version >= (9, 4)
+}
+
+fn ida_user_dir_source() -> Result<Option<PathBuf>, String> {
+    if let Some(raw) = std::env::var_os("IDAUSR") {
+        let paths: Vec<PathBuf> = std::env::split_paths(&raw).collect();
+        return match paths.as_slice() {
+            [] => Ok(None),
+            [path] => Ok(Some(path.clone())),
+            _ => {
+                warn!(
+                    "IDAUSR has multiple path components; leaving it unchanged instead of creating an isolated copy"
+                );
+                Ok(None)
+            }
+        };
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let Some(appdata) = std::env::var_os("APPDATA") else {
+            return Ok(None);
+        };
+        return Ok(Some(
+            PathBuf::from(appdata).join("Hex-Rays").join("IDA Pro"),
+        ));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let Some(home) = std::env::var_os("HOME") else {
+            return Ok(None);
+        };
+        Ok(Some(PathBuf::from(home).join(".idapro")))
+    }
+}
+
+fn unique_temp_idausr_dir() -> Result<PathBuf, String> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| format!("system clock is before UNIX_EPOCH: {err}"))?
+        .as_nanos();
+    let base = std::env::temp_dir();
+    let pid = std::process::id();
+
+    for attempt in 0..32 {
+        let candidate = base.join(format!("ida-mcp-idausr-{pid}-{now}-{attempt}"));
+        match fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(format!(
+                    "failed to create temporary IDA user directory {}: {err}",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+
+    Err("failed to create a unique temporary IDA user directory".to_string())
+}
+
+fn copy_file(src: &Path, dst: &Path) -> Result<(), String> {
+    // fs::copy already duplicates the source permission bits, so there is no
+    // need to stat + chmod the destination afterwards.
+    fs::copy(src, dst).map_err(|err| {
+        format!(
+            "failed to copy IDA user file {} to {}: {err}",
+            src.display(),
+            dst.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+    fs::create_dir(dst).map_err(|err| {
+        format!(
+            "failed to create IDA user directory copy {}: {err}",
+            dst.display()
+        )
+    })?;
+    copy_dir_contents(src, dst, None)
+}
+
+/// Copy the entries directly under `src` into `dst` (which must already exist).
+///
+/// `skip`, when set, is consulted only for entries at this level; nested
+/// directories are copied whole. A single entry that cannot be inspected or
+/// copied (unreadable file, dangling symlink) is logged and skipped rather
+/// than aborting the whole isolation.
+fn copy_dir_contents(
+    src: &Path,
+    dst: &Path,
+    skip: Option<&dyn Fn(&OsStr) -> bool>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(src)
+        .map_err(|err| format!("failed to read IDA user directory {}: {err}", src.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            format!(
+                "failed to read entry from IDA user directory {}: {err}",
+                src.display()
+            )
+        })?;
+        let name = entry.file_name();
+        if skip.is_some_and(|skip| skip(&name)) {
+            continue;
+        }
+        let source_path = entry.path();
+        let target_path = dst.join(&name);
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) => {
+                warn!(
+                    entry = %source_path.display(),
+                    error = %err,
+                    "Skipping IDA user entry that could not be inspected"
+                );
+                continue;
+            }
+        };
+        if let Err(err) = copy_ida_user_entry(&source_path, &target_path, file_type) {
+            warn!(
+                entry = %source_path.display(),
+                error = %err,
+                "Skipping IDA user entry that could not be copied"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn copy_ida_user_entry(src: &Path, dst: &Path, file_type: fs::FileType) -> Result<(), String> {
+    if file_type.is_file() {
+        copy_file(src, dst)
+    } else if file_type.is_dir() {
+        copy_dir_recursive(src, dst)
+    } else if file_type.is_symlink() {
+        copy_symlink_target(src, dst)
+    } else {
+        Ok(())
+    }
+}
+
+fn copy_symlink_target(src: &Path, dst: &Path) -> Result<(), String> {
+    let metadata = fs::metadata(src).map_err(|err| {
+        format!(
+            "failed to inspect IDA user symlink target {}: {err}",
+            src.display()
+        )
+    })?;
+
+    if metadata.is_file() {
+        copy_file(src, dst)
+    } else if metadata.is_dir() {
+        copy_dir_recursive(src, dst)
+    } else {
+        Ok(())
+    }
+}
+
+fn copy_ida_user_state(src: &Path, dst: &Path) -> Result<(), String> {
+    // Exclude the top-level `plugins/` directory from the isolated headless
+    // runtime. The live registry state caused the 9.4 `ida.reg` timeout; user
+    // plugins are separate process-local side effects that should not be loaded
+    // by the temporary runtime copy. Nested `plugins` directories are harmless
+    // and copied normally.
+    copy_dir_contents(src, dst, Some(&|name: &OsStr| name == "plugins"))
+}
+
+fn prepare_isolated_idausr(sdk_version: (i32, i32)) -> Result<Option<IsolatedIdaUserDir>, String> {
+    if !should_isolate_idausr(sdk_version) {
+        return Ok(None);
+    }
+
+    let Some(source) = ida_user_dir_source()? else {
+        warn!("Could not determine IDA user directory; IDAUSR isolation skipped");
+        return Ok(None);
+    };
+    if !source.exists() {
+        warn!(
+            path = %source.display(),
+            "IDA user directory does not exist; IDAUSR isolation skipped"
+        );
+        return Ok(None);
+    }
+
+    let path = unique_temp_idausr_dir()?;
+    if let Err(err) = copy_ida_user_state(&source, &path) {
+        let _ = fs::remove_dir_all(&path);
+        return Err(err);
+    }
+
+    let previous_idausr = std::env::var_os("IDAUSR");
+    std::env::set_var("IDAUSR", &path);
+    info!(
+        source = %source.display(),
+        isolated = %path.display(),
+        "Using isolated IDAUSR for IDA 9.4+ headless runtime"
+    );
+
+    Ok(Some(IsolatedIdaUserDir {
+        path,
+        previous_idausr,
+    }))
+}
+
 /// Initialize IDA on the main thread and record the version state.
 pub fn init_ida_library() -> Result<IdaInitState, String> {
+    init_ida_library_with_isolated_idausr(None)
+}
+
+fn init_ida_library_with_isolated_idausr(
+    isolated_idausr: Option<IsolatedIdaUserDir>,
+) -> Result<IdaInitState, String> {
+    let sdk_version = idalib::SDK_VERSION;
+    let isolated_idausr = match isolated_idausr {
+        Some(guard) => Some(guard),
+        None => prepare_isolated_idausr(sdk_version)?,
+    };
     info!("Initializing IDA library (main thread)");
     idalib::init_library().map_err(|e| format!("{e}"))?;
     idalib::enable_console_messages(false).map_err(|e| format!("{e}"))?;
@@ -110,13 +361,20 @@ pub fn init_ida_library() -> Result<IdaInitState, String> {
     let version_mismatch = check_ida_version();
     if let Some(ref msg) = version_mismatch {
         error!("{msg}");
-    } else {
+    } else if should_check_license_expiry(sdk_version) {
         check_license_expiry()?;
+    } else {
+        info!(
+            sdk_major = sdk_version.0,
+            sdk_minor = sdk_version.1,
+            "Skipping IDA license expiry preflight; IDA 9.4 validates the license during database open"
+        );
     }
 
     Ok(IdaInitState {
         library_initialized: true,
         version_mismatch,
+        isolated_idausr,
     })
 }
 
@@ -128,6 +386,7 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
     let mut lock_path: Option<PathBuf> = None;
     let mut lib_initialized = init_state.library_initialized;
     let mut version_mismatch = init_state.version_mismatch;
+    let mut isolated_idausr = init_state.isolated_idausr;
 
     while let Ok(req) = rx.recv() {
         // Lazily initialize the IDA library on first use when startup preflight
@@ -146,10 +405,11 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 Some(OPEN_IDB_PROGRESS_TOTAL),
                 "Initializing IDA runtime on the main thread",
             );
-            match init_ida_library() {
+            match init_ida_library_with_isolated_idausr(isolated_idausr.take()) {
                 Ok(init_state) => {
                     lib_initialized = init_state.library_initialized;
                     version_mismatch = init_state.version_mismatch;
+                    isolated_idausr = init_state.isolated_idausr;
                 }
                 Err(err) => {
                     reject_with_error(
@@ -189,6 +449,7 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 file_type,
                 auto_analyse,
                 extra_args,
+                idb_out,
                 progress_tx,
                 cancel,
                 resp,
@@ -218,6 +479,7 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     file_type.as_deref(),
                     auto_analyse,
                     &extra_args,
+                    idb_out.as_deref(),
                     progress_tx.clone(),
                     cancel.clone(),
                 );
@@ -1517,7 +1779,7 @@ fn check_version_mismatch(sdk_major: i32, runtime_major: i32) -> Option<String> 
 
 #[cfg(test)]
 mod tests {
-    use crate::ida::loop_impl::check_version_mismatch;
+    use crate::ida::loop_impl::{check_version_mismatch, should_check_license_expiry};
 
     #[test]
     fn matching_major_version_passes() {
@@ -1541,5 +1803,15 @@ mod tests {
         // (from get_library_version returning 9.0.260213).
         // The minor versions differ (3 vs 0) but we only compare major.
         assert!(check_version_mismatch(9, 9).is_none());
+    }
+
+    #[test]
+    fn license_expiry_preflight_kept_before_ida_94() {
+        assert!(should_check_license_expiry((9, 3)));
+    }
+
+    #[test]
+    fn license_expiry_preflight_skipped_for_ida_94() {
+        assert!(!should_check_license_expiry((9, 4)));
     }
 }

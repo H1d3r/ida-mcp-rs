@@ -284,7 +284,8 @@ fn init_stdio_ida_state() -> anyhow::Result<ida::IdaInitState> {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        Ok(ida::IdaInitState::deferred())
+        ida::IdaInitState::deferred()
+            .map_err(|e| anyhow::anyhow!("IDA startup preparation failed: {e}"))
     }
 }
 
@@ -490,7 +491,8 @@ fn run_server_http(
          Pass --max-workers N where N > 1 for concurrent multi-IDB analysis."
     );
 
-    let init_state = ida::IdaInitState::deferred();
+    let init_state = ida::IdaInitState::deferred()
+        .map_err(|e| anyhow::anyhow!("IDA startup preparation failed: {e}"))?;
     let (tx, rx) = mpsc::sync_channel(REQUEST_QUEUE_CAPACITY);
     let worker = Arc::new(IdaWorker::new(tx));
     let backend = WorkerBackend::local(worker.clone());
@@ -733,7 +735,7 @@ fn run_probe(args: ProbeArgs) -> anyhow::Result<()> {
         info!("IDADIR={}", idadir);
     }
     info!("Initializing IDA library on main thread");
-    idalib::init_library()
+    let _init_state = ida::init_ida_library()
         .map_err(|e| anyhow::anyhow!("IDA library initialization failed: {e}"))?;
     info!("IDA library initialized successfully");
     if let Ok(ver) = idalib::version() {

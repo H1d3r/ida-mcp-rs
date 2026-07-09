@@ -21,7 +21,10 @@ use crate::server::operation::{
 use crate::tool_registry::{self, ToolCategory};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
-    model::{CallToolResult, Content, ServerCapabilities, ServerInfo, Tool, ToolAnnotations},
+    model::{
+        CallToolResult, ContentBlock as Content, ServerCapabilities, ServerInfo, Tool,
+        ToolAnnotations,
+    },
     schemars::{schema_for, JsonSchema},
     tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler,
 };
@@ -29,7 +32,7 @@ use serde_json::{json, Map, Value};
 use std::pin::Pin;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, instrument, warn};
 
 struct SessionLifetime {
@@ -116,18 +119,75 @@ where
 
 /// Parameters for the background DSC loading task.
 struct DscBackgroundCtx {
-    idat: std::path::PathBuf,
-    idat_args: Vec<String>,
-    script_path: std::path::PathBuf,
-    log_path: Option<std::path::PathBuf>,
-    out_i64: std::path::PathBuf,
+    open: DscBackgroundOpen,
     module: String,
     frameworks: Vec<String>,
     owner_session_id: Option<String>,
 }
 
+enum DscBackgroundOpen {
+    DirectRawDsc {
+        open_path: std::path::PathBuf,
+        idb_out: std::path::PathBuf,
+    },
+    LegacyIdat {
+        idat: std::path::PathBuf,
+        idat_args: Vec<String>,
+        script_path: std::path::PathBuf,
+        log_path: Option<std::path::PathBuf>,
+        out_i64: std::path::PathBuf,
+    },
+}
+
 struct TemporaryFileCleanup {
     path: Option<std::path::PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DscOpenPlan {
+    DirectExistingI64,
+    BackgroundDirectRawDsc,
+    LegacyIdatBackground,
+}
+
+fn dsc_open_plan(sdk_version: (i32, i32), i64_exists: bool) -> DscOpenPlan {
+    if sdk_version >= (9, 4) {
+        DscOpenPlan::BackgroundDirectRawDsc
+    } else if i64_exists {
+        DscOpenPlan::DirectExistingI64
+    } else {
+        DscOpenPlan::LegacyIdatBackground
+    }
+}
+
+fn sanitize_temp_component(value: &str) -> String {
+    let mut sanitized = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_' {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('_');
+        }
+    }
+    if sanitized.is_empty() {
+        "dsc".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn direct_dsc_temp_i64_path(dsc_path: &std::path::Path) -> Result<std::path::PathBuf, ToolError> {
+    let name = dsc_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(sanitize_temp_component)
+        .unwrap_or_else(|| "dsc".to_string());
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| ToolError::InvalidParams(format!("system clock error: {err}")))?
+        .as_nanos();
+    let pid = std::process::id();
+    Ok(std::env::temp_dir().join(format!("ida-mcp-dsc-{pid}-{now}-{name}.i64")))
 }
 
 impl TemporaryFileCleanup {
@@ -837,6 +897,62 @@ impl IdaMcpServer {
         }
     }
 
+    fn start_dsc_background(
+        &self,
+        dedup_key: String,
+        initial_message: &str,
+        ctx: DscBackgroundCtx,
+    ) -> Result<CallToolResult, McpError> {
+        let task_id = match self
+            .task_registry
+            .create_keyed("dsc", &dedup_key, initial_message)
+        {
+            Ok(id) => id,
+            Err(existing_id) => {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&json!({
+                        "status": "already_running",
+                        "task_id": existing_id,
+                        "message": "A DSC loading task for this path is already in progress. Poll task_status(task_id) for progress.",
+                    }))
+                    .unwrap_or_default(),
+                )]));
+            }
+        };
+
+        let backend = match &ctx.open {
+            DscBackgroundOpen::DirectRawDsc { .. } => "dscu",
+            DscBackgroundOpen::LegacyIdat { .. } => "idat",
+        };
+        info!(
+            task_id = %task_id,
+            module = %ctx.module,
+            backend,
+            "Spawning background DSC loading"
+        );
+
+        let registry = self.task_registry.clone();
+        let worker = self.worker.clone();
+        let mode = self.mode;
+        let tid = task_id.clone();
+        let cancel_token = self.session_lifetime.child_token();
+        let task_cancel_token = cancel_token.clone();
+        let handle = tokio::spawn(async move {
+            Self::run_dsc_background(tid, registry, worker, mode, ctx, task_cancel_token).await;
+        });
+        self.task_registry
+            .set_handle_with_cancel_token(&task_id, handle, cancel_token);
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&json!({
+                "status": "started",
+                "task_id": task_id,
+                "message": "DSC loading started in background. Poll task_status(task_id) for progress.",
+            }))
+            .unwrap_or_default(),
+        )]))
+    }
+
     /// Open a DSC database synchronously, load the requested images, and return db_info.
     async fn open_dsc_direct(
         &self,
@@ -944,7 +1060,23 @@ impl IdaMcpServer {
         )]))
     }
 
-    /// Background task: run idat, then open the resulting .i64 with idalib.
+    async fn fail_dsc_background_after_open(
+        task_id: &str,
+        registry: &task::TaskRegistry,
+        worker: &WorkerBackend,
+        message: String,
+    ) {
+        if let Err(close_err) = worker.close().await {
+            warn!(
+                task_id,
+                error = %close_err,
+                "failed to close database after background DSC task failure"
+            );
+        }
+        registry.fail(task_id, &message);
+    }
+
+    /// Background task: open a DSC through the selected backend, then load images.
     async fn run_dsc_background(
         task_id: String,
         registry: task::TaskRegistry,
@@ -954,114 +1086,132 @@ impl IdaMcpServer {
         cancel_token: tokio_util::sync::CancellationToken,
     ) {
         let DscBackgroundCtx {
-            idat,
-            idat_args,
-            script_path,
-            log_path,
-            out_i64,
+            open,
             module,
             frameworks,
             owner_session_id,
         } = ctx;
-
-        let mut script_cleanup = TemporaryFileCleanup::new(script_path);
 
         if cancel_token.is_cancelled() {
             registry.finish_cancelled(&task_id, "Cancelled by session shutdown");
             return;
         }
 
-        // Phase 1: run idat subprocess
-        info!(task_id = %task_id, "Background: running idat");
-        registry.update_message(&task_id, "Running idat to create .i64...");
-
-        let idat_bin = idat;
-        let module_env = module.clone();
-        let out_i64_clone = out_i64.clone();
-        let log_path_clone = log_path.clone();
-
-        let spawn_task = tokio::task::spawn_blocking(move || {
-            let mut cmd = std::process::Command::new(&idat_bin);
-            cmd.args(&idat_args);
-            // Remove env vars that cause license conflicts when our
-            // process links idalib and also spawns idat.
-            cmd.env_remove("IDADIR");
-            cmd.env_remove("DYLD_LIBRARY_PATH");
-            cmd.env("IDA_DYLD_CACHE_MODULE", &module_env);
-            cmd.stdout(std::process::Stdio::piped());
-            cmd.stderr(std::process::Stdio::piped());
-
-            let output = cmd.output();
-
-            match output {
-                Ok(out) => {
-                    let code = out.status.code().unwrap_or(-1);
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    (code, stderr.to_string(), out_i64_clone, log_path_clone)
-                }
-                Err(e) => (
-                    -1,
-                    format!("Failed to spawn idat: {e}"),
-                    out_i64_clone,
-                    log_path_clone,
-                ),
+        let (open_path, idb_out, auto_analyse, load_images_with_dscu) = match open {
+            DscBackgroundOpen::DirectRawDsc { open_path, idb_out } => {
+                info!(
+                    task_id = %task_id,
+                    path = %open_path.display(),
+                    idb_out = %idb_out.display(),
+                    "Background: opening raw DSC through idalib"
+                );
+                registry.update_message(&task_id, "Opening DSC directly with idalib...");
+                (open_path, Some(idb_out), false, true)
             }
-        });
+            DscBackgroundOpen::LegacyIdat {
+                idat,
+                idat_args,
+                script_path,
+                log_path,
+                out_i64,
+            } => {
+                let mut script_cleanup = TemporaryFileCleanup::new(script_path);
 
-        let spawn_result = tokio::select! {
-            result = spawn_task => result,
-            _ = cancel_token.cancelled() => {
-                registry.finish_cancelled(&task_id, "Cancelled by session shutdown");
-                return;
-            }
-        };
+                // Phase 1: run idat subprocess
+                info!(task_id = %task_id, "Background: running idat");
+                registry.update_message(&task_id, "Running idat to create .i64...");
 
-        let (exit_code, stderr, out_path, log_out) = match spawn_result {
-            Ok(tuple) => tuple,
-            Err(e) => {
-                registry.fail(&task_id, &format!("idat task panicked: {e}"));
-                return;
-            }
-        };
+                let idat_bin = idat;
+                let module_env = module.clone();
+                let out_i64_clone = out_i64.clone();
+                let log_path_clone = log_path.clone();
 
-        // Clean up the temporary load script now; the guard still covers early returns above.
-        script_cleanup.cleanup_now();
+                let spawn_task = tokio::task::spawn_blocking(move || {
+                    let mut cmd = std::process::Command::new(&idat_bin);
+                    cmd.args(&idat_args);
+                    // Remove env vars that cause license conflicts when our
+                    // process links idalib and also spawns idat.
+                    cmd.env_remove("IDADIR");
+                    cmd.env_remove("DYLD_LIBRARY_PATH");
+                    cmd.env("IDA_DYLD_CACHE_MODULE", &module_env);
+                    cmd.stdout(std::process::Stdio::piped());
+                    cmd.stderr(std::process::Stdio::piped());
 
-        if exit_code != 0 || !out_path.exists() {
-            let log_tail = log_out
-                .as_ref()
-                .and_then(|p| std::fs::read_to_string(p).ok())
-                .map(|s| {
-                    let lines: Vec<&str> = s.lines().collect();
-                    let start = lines.len().saturating_sub(20);
-                    lines[start..].join("\n")
+                    let output = cmd.output();
+
+                    match output {
+                        Ok(out) => {
+                            let code = out.status.code().unwrap_or(-1);
+                            let stderr = String::from_utf8_lossy(&out.stderr);
+                            (code, stderr.to_string(), out_i64_clone, log_path_clone)
+                        }
+                        Err(e) => (
+                            -1,
+                            format!("Failed to spawn idat: {e}"),
+                            out_i64_clone,
+                            log_path_clone,
+                        ),
+                    }
                 });
 
-            let mut msg = format!("idat exited with code {exit_code}.\nstderr: {stderr}");
-            if let Some(tail) = log_tail {
-                msg.push_str(&format!("\nlog (last 20 lines):\n{tail}"));
+                let spawn_result = tokio::select! {
+                    result = spawn_task => result,
+                    _ = cancel_token.cancelled() => {
+                        registry.finish_cancelled(&task_id, "Cancelled by session shutdown");
+                        return;
+                    }
+                };
+
+                let (exit_code, stderr, out_path, log_out) = match spawn_result {
+                    Ok(tuple) => tuple,
+                    Err(e) => {
+                        registry.fail(&task_id, &format!("idat task panicked: {e}"));
+                        return;
+                    }
+                };
+
+                // Clean up the temporary load script now; the guard still covers early returns above.
+                script_cleanup.cleanup_now();
+
+                if exit_code != 0 || !out_path.exists() {
+                    let log_tail = log_out
+                        .as_ref()
+                        .and_then(|p| std::fs::read_to_string(p).ok())
+                        .map(|s| {
+                            let lines: Vec<&str> = s.lines().collect();
+                            let start = lines.len().saturating_sub(20);
+                            lines[start..].join("\n")
+                        });
+
+                    let mut msg = format!("idat exited with code {exit_code}.\nstderr: {stderr}");
+                    if let Some(tail) = log_tail {
+                        msg.push_str(&format!("\nlog (last 20 lines):\n{tail}"));
+                    }
+                    warn!(exit_code, task_id = %task_id, "idat failed");
+                    registry.fail(&task_id, &msg);
+                    return;
+                }
+
+                info!(task_id = %task_id, "idat completed, opening .i64");
+                registry.update_message(&task_id, "Opening database with idalib...");
+                (out_i64, None, true, false)
             }
-            warn!(exit_code, task_id = %task_id, "idat failed");
-            registry.fail(&task_id, &msg);
-            return;
-        }
+        };
 
-        info!(task_id = %task_id, "idat completed, opening .i64");
-        registry.update_message(&task_id, "Opening database with idalib...");
-
-        // Phase 2: open the .i64 with idalib
-        let i64_str = out_i64.display().to_string();
+        // Phase 2: open the database with idalib.
+        let open_path_str = open_path.display().to_string();
         let open_result = worker
             .open_observed(
-                &i64_str,
+                &open_path_str,
                 false,
                 None,
                 false,
                 false,
                 false,
                 None,
-                true,
+                auto_analyse,
                 Vec::new(),
+                idb_out.as_ref().map(|path| path.display().to_string()),
                 None,
                 None,
                 Some(cancel_token.clone()),
@@ -1076,6 +1226,61 @@ impl IdaMcpServer {
             }
         };
 
+        let mut loaded_images = Vec::new();
+        let mut analysis_status = None;
+        let mut analysis_ready = None;
+        let mut next_steps = None;
+        if load_images_with_dscu {
+            registry.update_message(&task_id, "Loading DSC module through ida_dscu...");
+            match worker.dsc_load_image(&module, Some(600)).await {
+                Ok(image) => loaded_images.push(image),
+                Err(e) => {
+                    Self::fail_dsc_background_after_open(
+                        &task_id,
+                        &registry,
+                        &worker,
+                        format!("Failed to load DSC module {module}: {e}"),
+                    )
+                    .await;
+                    return;
+                }
+            }
+
+            for framework in &frameworks {
+                if cancel_token.is_cancelled() {
+                    registry.finish_cancelled(&task_id, "Cancelled by session shutdown");
+                    return;
+                }
+                registry.update_message(&task_id, &format!("Loading DSC framework {framework}..."));
+                match worker.dsc_load_image(framework, Some(600)).await {
+                    Ok(image) => loaded_images.push(image),
+                    Err(e) => {
+                        Self::fail_dsc_background_after_open(
+                            &task_id,
+                            &registry,
+                            &worker,
+                            format!("Failed to load DSC framework {framework}: {e}"),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+
+            analysis_status = match worker.analysis_status().await {
+                Ok(status) => Some(status),
+                Err(err) => {
+                    warn!(module = %module, error = %err, "failed to fetch analysis_status after background open_dsc");
+                    None
+                }
+            };
+            analysis_ready = analysis_status.as_ref().map(|s| s.auto_is_ok);
+            next_steps = Some(dsc_analysis_next_steps(
+                analysis_ready,
+                "Proceed with xrefs/decompile/list_functions for the loaded DSC module.",
+            ));
+        }
+
         let close_token = match (mode, owner_session_id.as_deref()) {
             (ServerMode::Http, Some(owner_session_id)) => {
                 worker.issue_close_token_for_session(owner_session_id)
@@ -1089,6 +1294,16 @@ impl IdaMcpServer {
             map.insert("module".to_string(), json!(module));
             if !frameworks.is_empty() {
                 map.insert("frameworks_loaded".to_string(), json!(frameworks));
+            }
+            if load_images_with_dscu {
+                if let Some(module_info) = loaded_images.first() {
+                    map.insert("module_info".to_string(), json!(module_info));
+                }
+                map.insert("dsc_backend".to_string(), json!("dscu"));
+                map.insert("loaded_images".to_string(), json!(loaded_images));
+                map.insert("analysis_status".to_string(), json!(analysis_status));
+                map.insert("analysis_ready".to_string(), json!(analysis_ready));
+                map.insert("next_steps".to_string(), json!(next_steps));
             }
             apply_close_metadata(map, close_token, close_hint_for(mode, worker.is_pooled()));
         }
@@ -1223,6 +1438,11 @@ impl IdaMcpServer {
         } else {
             Vec::new()
         };
+        let worker_idb_out = if matches!(self.mode, ServerMode::Worker) {
+            req.worker_idb_out.clone()
+        } else {
+            None
+        };
         let open_timeout_secs = timeout_secs.unwrap_or(300).min(MAX_TIMEOUT_SECS);
         let foreground_timeout_secs = self.foreground_timeout_secs(timeout_secs, 300);
         let user_auto_analyse = req.auto_analyse.unwrap_or(false);
@@ -1264,6 +1484,7 @@ impl IdaMcpServer {
                         file_type.clone(),
                         effective_auto_analyse,
                         worker_extra_args.clone(),
+                        worker_idb_out.clone(),
                         Some(open_timeout_secs),
                         Some(progress_tx),
                         Some(cancel),
@@ -3627,9 +3848,9 @@ impl IdaMcpServer {
     #[tool(
         description = "Open a dyld_shared_cache and load a single dylib (e.g. \
         '/usr/lib/libobjc.A.dylib'). Use instead of open_idb for Apple DSCs. \
-        On IDA 9.4, opens the DSC header directly and loads modules through ida_dscu. \
+        On IDA 9.4, opens the DSC header directly in a background task and loads modules through ida_dscu. \
         On older IDA builds, if .i64 exists, opens immediately; otherwise returns \
-        task_id and creates it with idat in the background — poll task_status(task_id). \
+        task_id and creates it with idat in the background. Poll task_status(task_id). \
         Use dsc_add_dylib to load more modules, dsc_add_region for raw regions. \
         Call tool_help('open_dsc') for full details."
     )]
@@ -3660,23 +3881,46 @@ impl IdaMcpServer {
         let dsc_path = std::path::Path::new(&req.path);
         let out_i64 = dsc_path.with_extension("i64");
 
-        // If .i64 already exists, open synchronously (fast path) and make sure
-        // the requested module/frameworks are loaded.
-        if out_i64.exists() {
-            return self
-                .open_dsc_direct(&out_i64, None, &req.module, &frameworks)
-                .await;
+        match dsc_open_plan(idalib::SDK_VERSION, out_i64.exists()) {
+            // Existing .i64 databases are already in IDA's database format.
+            DscOpenPlan::DirectExistingI64 => {
+                return self
+                    .open_dsc_direct(&out_i64, None, &req.module, &frameworks)
+                    .await;
+            }
+            // IDA 9.4 exposes ida_dscu/dscu_svc_t: the loader can open the DSC
+            // header first, then load images on demand in the same idalib process.
+            //
+            // Do not pass the legacy -T file-type selector here. IDA 9.4's
+            // direct idalib open path rejects it with "Unknown switch '-T'".
+            DscOpenPlan::BackgroundDirectRawDsc => {
+                let idb_out = match direct_dsc_temp_i64_path(dsc_path) {
+                    Ok(path) => path,
+                    Err(err) => return Ok(err.to_tool_result()),
+                };
+                let ctx = DscBackgroundCtx {
+                    open: DscBackgroundOpen::DirectRawDsc {
+                        open_path: dsc_path.to_path_buf(),
+                        idb_out: idb_out.clone(),
+                    },
+                    module: req.module.clone(),
+                    frameworks: frameworks.clone(),
+                    owner_session_id: matches!(self.mode, ServerMode::Http)
+                        .then(|| self.session_id.clone()),
+                };
+                return self.start_dsc_background(
+                    dsc_path.display().to_string(),
+                    &format!(
+                        "Opening DSC directly with idalib (idb_out={})...",
+                        idb_out.display()
+                    ),
+                    ctx,
+                );
+            }
+            DscOpenPlan::LegacyIdatBackground => {}
         }
 
-        // IDA 9.4 exposes ida_dscu/dscu_svc_t: the loader can open the DSC
-        // header first, then load images on demand in the same idalib process.
-        if idalib::SDK_VERSION >= (9, 4) {
-            return self
-                .open_dsc_direct(dsc_path, Some(&file_type), &req.module, &frameworks)
-                .await;
-        }
-
-        // .i64 doesn't exist — need to run idat, which takes minutes.
+        // Legacy path: create the .i64 with idat, which takes minutes.
         // Validate idat exists and write the load script before spawning.
         let idat = match crate::dsc::find_idat() {
             Ok(path) => path,
@@ -3709,70 +3953,22 @@ impl IdaMcpServer {
             &file_type,
             log_path.as_deref(),
         );
-
-        // Create a background task and return immediately.
-        // Use the .i64 path as dedup key to prevent concurrent idat
-        // processes writing the same output file.
         let dedup_key = out_i64.display().to_string();
-        let task_id = match self.task_registry.create_keyed(
-            "dsc",
-            &dedup_key,
-            "Running idat to create .i64 from DSC...",
-        ) {
-            Ok(id) => id,
-            Err(existing_id) => {
-                return Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&json!({
-                        "status": "already_running",
-                        "task_id": existing_id,
-                        "message": "A DSC loading task for this path is already in progress. Poll task_status(task_id) for progress.",
-                    }))
-                    .unwrap_or_default(),
-                )]));
-            }
-        };
-
-        info!(
-            task_id = %task_id,
-            idat = %idat.display(),
-            module = %req.module,
-            "Spawning background idat for DSC loading"
-        );
-
-        let registry = self.task_registry.clone();
-        let worker = self.worker.clone();
-        let mode = self.mode;
-        let module = req.module.clone();
-        let tid = task_id.clone();
 
         let ctx = DscBackgroundCtx {
-            idat,
-            idat_args,
-            script_path,
-            log_path,
-            out_i64,
-            module,
+            open: DscBackgroundOpen::LegacyIdat {
+                idat,
+                idat_args,
+                script_path,
+                log_path,
+                out_i64,
+            },
+            module: req.module.clone(),
             frameworks,
             owner_session_id: matches!(self.mode, ServerMode::Http)
                 .then(|| self.session_id.clone()),
         };
-
-        let cancel_token = self.session_lifetime.child_token();
-        let task_cancel_token = cancel_token.clone();
-        let handle = tokio::spawn(async move {
-            Self::run_dsc_background(tid, registry, worker, mode, ctx, task_cancel_token).await;
-        });
-        self.task_registry
-            .set_handle_with_cancel_token(&task_id, handle, cancel_token);
-
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&json!({
-                "status": "started",
-                "task_id": task_id,
-                "message": "DSC loading started in background. Poll task_status(task_id) for progress.",
-            }))
-            .unwrap_or_default(),
-        )]))
+        self.start_dsc_background(dedup_key, "Running idat to create .i64 from DSC...", ctx)
     }
 
     #[tool(description = "Load an additional dylib into an open DSC database \
@@ -4527,7 +4723,7 @@ impl ServerHandler for IdaMcpServer {
 
     async fn get_task_info(
         &self,
-        request: GetTaskInfoParams,
+        request: GetTaskParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<GetTaskResult, McpError> {
         let state = self.task_registry.get(&request.task_id).ok_or_else(|| {
@@ -4536,15 +4732,12 @@ impl ServerHandler for IdaMcpServer {
                 Some(json!({ "task_id": request.task_id })),
             )
         })?;
-        Ok(GetTaskResult {
-            meta: None,
-            task: task_state_to_mcp(&state),
-        })
+        Ok(GetTaskResult::new(task_state_to_mcp(&state)))
     }
 
     async fn get_task_result(
         &self,
-        request: GetTaskResultParams,
+        request: GetTaskPayloadParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<GetTaskPayloadResult, McpError> {
         let state = self.task_registry.get(&request.task_id);
@@ -4581,10 +4774,7 @@ impl ServerHandler for IdaMcpServer {
                     None,
                 )
             })?;
-            Ok(CancelTaskResult {
-                meta: None,
-                task: task_state_to_mcp(&state),
-            })
+            Ok(CancelTaskResult::new(task_state_to_mcp(&state)))
         } else {
             Err(McpError::invalid_params(
                 "Task not found or not running",
@@ -4896,7 +5086,7 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
 
     async fn get_task_info(
         &self,
-        request: GetTaskInfoParams,
+        request: GetTaskParams,
         ctx: RequestContext<RoleServer>,
     ) -> Result<GetTaskResult, McpError> {
         self.inner.get_task_info(request, ctx).await
@@ -4904,7 +5094,7 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
 
     async fn get_task_result(
         &self,
-        request: GetTaskResultParams,
+        request: GetTaskPayloadParams,
         ctx: RequestContext<RoleServer>,
     ) -> Result<GetTaskPayloadResult, McpError> {
         self.inner.get_task_result(request, ctx).await
@@ -4924,11 +5114,11 @@ mod tests {
     use crate::error::ToolError;
     use crate::ida::worker::CloseTokenGrant;
     use crate::server::{
-        apply_close_metadata, close_hint_for, normalize_schema_value,
+        apply_close_metadata, close_hint_for, dsc_open_plan, normalize_schema_value,
         operation::{OperationSnapshot, OperationStatus},
         run_script_failure_message, run_script_succeeded, run_script_timeout_message,
         run_script_truncate_chars, task_payload_result_value, timeout_with_child_grace,
-        tool_params_schema, IdaMcpServer, RecentOperationsRequest, ToolCatalogRequest,
+        tool_params_schema, DscOpenPlan, IdaMcpServer, RecentOperationsRequest, ToolCatalogRequest,
         ToolHelpRequest, XrefsRequest,
     };
     use rmcp::handler::server::wrapper::Parameters;
@@ -4980,6 +5170,39 @@ mod tests {
     fn xrefs_paging_rejects_negative_values() {
         assert!(IdaMcpServer::parse_xrefs_paging(&xrefs_request(Some(-1), None)).is_err());
         assert!(IdaMcpServer::parse_xrefs_paging(&xrefs_request(None, Some(-1))).is_err());
+    }
+
+    #[test]
+    fn dsc_open_plan_backgrounds_ida_94_raw_dsc() {
+        assert_eq!(
+            dsc_open_plan((9, 4), false),
+            DscOpenPlan::BackgroundDirectRawDsc
+        );
+        assert_eq!(
+            dsc_open_plan((10, 0), false),
+            DscOpenPlan::BackgroundDirectRawDsc
+        );
+    }
+
+    #[test]
+    fn dsc_open_plan_keeps_legacy_idat_for_pre_94_raw_dsc() {
+        assert_eq!(
+            dsc_open_plan((9, 3), false),
+            DscOpenPlan::LegacyIdatBackground
+        );
+        assert_eq!(
+            dsc_open_plan((8, 4), false),
+            DscOpenPlan::LegacyIdatBackground
+        );
+    }
+
+    #[test]
+    fn dsc_open_plan_prefers_existing_i64_before_ida_94() {
+        assert_eq!(dsc_open_plan((9, 3), true), DscOpenPlan::DirectExistingI64);
+        assert_eq!(
+            dsc_open_plan((9, 4), true),
+            DscOpenPlan::BackgroundDirectRawDsc
+        );
     }
 
     fn tool_result_text(result: CallToolResult) -> String {
@@ -5329,7 +5552,7 @@ mod tests {
 
     #[test]
     fn task_payload_preserves_valid_call_tool_result() {
-        let result = CallToolResult::success(vec![rmcp::model::Content::text("ok")]);
+        let result = CallToolResult::success(vec![rmcp::model::ContentBlock::text("ok")]);
         let as_value = serde_json::to_value(&result).expect("serialize CallToolResult");
         assert_eq!(task_payload_result_value(Some(as_value.clone())), as_value);
     }
