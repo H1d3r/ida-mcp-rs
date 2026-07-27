@@ -761,6 +761,29 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         keywords: &["entry", "start", "main", "entrypoint"],
     },
     ToolInfo {
+        name: "lumina_lookup",
+        category: ToolCategory::Metadata,
+        short_desc: "Look up Lumina metadata for a function",
+        full_desc: "Query the configured Lumina server for a function signature and metadata \
+                    without changing the database. Requires explicit server startup with \
+                    --allow-lumina or IDA_MCP_ALLOW_LUMINA=true.",
+        example: r#"{"target_name": "sub_1000"}"#,
+        default: false,
+        keywords: &["lumina", "signature", "metadata", "lookup", "match"],
+    },
+    ToolInfo {
+        name: "lumina_apply",
+        category: ToolCategory::Editing,
+        short_desc: "Apply Lumina metadata to a function",
+        full_desc: "Pull metadata from the configured Lumina server and apply it to one function. \
+                    Uses IDA's upgrade policy by default; force=true may replace existing names, \
+                    types, or comments. Requires explicit server startup with --allow-lumina or \
+                    IDA_MCP_ALLOW_LUMINA=true.",
+        example: r#"{"address": "0x1000", "force": false}"#,
+        default: false,
+        keywords: &["lumina", "signature", "metadata", "apply", "rename", "type"],
+    },
+    ToolInfo {
         name: "list_globals",
         category: ToolCategory::Metadata,
         short_desc: "List global variables",

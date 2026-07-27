@@ -349,9 +349,9 @@ impl IdaMcpServer {
                  \n- control_flow: CFG, callgraph, paths \
                  \n- memory: read bytes, strings, values \
                  \n- search: find patterns, strings \
-                 \n- metadata: segments, imports, exports \
+                 \n- metadata: segments, imports, exports, Lumina lookup \
                  \n- types: declare_type, apply_types (addr/stack), infer_types, local_types, stack_frame, declare_stack, delete_stack, structs (list/info/read) \
-                \n- editing: comments/rename/patch/patch_asm \
+                \n- editing: comments/rename/patch/patch_asm/Lumina apply \
                  \n- scripting: run_script (execute IDAPython code) \
                  \n\nTip: Use tool_catalog(query='what you want to do') to find the right tool. \
                  \nTip: If xrefs/decompile look incomplete, call analysis_status to check auto-analysis. \
@@ -3260,6 +3260,63 @@ impl IdaMcpServer {
         }
     }
 
+    #[tool(description = "Look up Lumina metadata for a function without applying it")]
+    #[instrument(skip(self), fields(target_name = ?req.target_name))]
+    async fn lumina_lookup(
+        &self,
+        Parameters(req): Parameters<LuminaLookupRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let offset = req.offset.unwrap_or(0);
+        let timeout_secs = try_param!(parse_optional_unsigned::<u64>(
+            req.timeout_secs,
+            "timeout_secs"
+        ));
+        let addr = try_param!(req
+            .address
+            .as_ref()
+            .map(Self::value_to_single_address)
+            .transpose());
+        match self
+            .worker
+            .lumina_lookup(addr, req.target_name.clone(), offset, timeout_secs)
+            .await
+        {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}")),
+            )])),
+            Err(err) => Ok(err.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Pull and apply Lumina metadata to a function")]
+    #[instrument(skip(self), fields(target_name = ?req.target_name, force = req.force))]
+    async fn lumina_apply(
+        &self,
+        Parameters(req): Parameters<LuminaApplyRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let offset = req.offset.unwrap_or(0);
+        let force = req.force.unwrap_or(false);
+        let timeout_secs = try_param!(parse_optional_unsigned::<u64>(
+            req.timeout_secs,
+            "timeout_secs"
+        ));
+        let addr = try_param!(req
+            .address
+            .as_ref()
+            .map(Self::value_to_single_address)
+            .transpose());
+        match self
+            .worker
+            .lumina_apply(addr, req.target_name.clone(), offset, force, timeout_secs)
+            .await
+        {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}")),
+            )])),
+            Err(err) => Ok(err.to_tool_result()),
+        }
+    }
+
     #[tool(description = "Set comments at an address")]
     async fn set_comments(
         &self,
@@ -4580,6 +4637,8 @@ fn tool_params_schema(name: &str) -> Option<Value> {
         "imports" | "exports" => Some(schema::<PaginatedRequest>()),
         "export_funcs" => Some(schema::<ExportFuncsRequest>()),
         "entrypoints" => Some(schema::<EmptyParams>()),
+        "lumina_lookup" => Some(schema::<LuminaLookupRequest>()),
+        "lumina_apply" => Some(schema::<LuminaApplyRequest>()),
         "list_globals" => Some(schema::<ListGlobalsRequest>()),
         "int_convert" => Some(schema::<IntConvertRequest>()),
 
@@ -4828,6 +4887,15 @@ const TASK_CAPABLE_TOOLS: &[&str] = &["open_dsc"];
 
 fn tool_annotations_for(name: &str) -> ToolAnnotations {
     match name {
+        "lumina_lookup" => ToolAnnotations::new()
+            .read_only(true)
+            .destructive(false)
+            .idempotent(true)
+            .open_world(true),
+        "lumina_apply" => ToolAnnotations::new()
+            .read_only(false)
+            .destructive(true)
+            .open_world(true),
         "run_script" => ToolAnnotations::new()
             .read_only(false)
             .destructive(true)

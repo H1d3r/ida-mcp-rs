@@ -47,6 +47,8 @@ const DEFAULT_HTTP_SESSION_KEEP_ALIVE_SECS: u64 = 1800;
 struct Cli {
     #[command(flatten)]
     filter: ToolFilterArgs,
+    #[command(flatten)]
+    ida_network: IdaNetworkArgs,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -113,25 +115,28 @@ impl ToolFilterArgs {
         )
         .map_err(|e| e.to_string())
     }
+}
 
-    fn child_args(&self) -> Vec<OsString> {
-        let mut args = Vec::new();
-        if !self.toolsets.is_empty() {
-            args.push(OsString::from("--toolsets"));
-            args.push(OsString::from(self.toolsets.join(",")));
+#[derive(Args, Debug, Clone, Default)]
+#[command(next_help_heading = "IDA network")]
+struct IdaNetworkArgs {
+    /// Allow IDA to contact configured Lumina servers.
+    #[arg(
+        long,
+        env = "IDA_MCP_ALLOW_LUMINA",
+        global = true,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    allow_lumina: bool,
+}
+
+impl IdaNetworkArgs {
+    fn worker_args(&self) -> Vec<OsString> {
+        if self.allow_lumina {
+            vec![OsString::from("--allow-lumina")]
+        } else {
+            Vec::new()
         }
-        if !self.tools.is_empty() {
-            args.push(OsString::from("--tools"));
-            args.push(OsString::from(self.tools.join(",")));
-        }
-        if !self.exclude_tools.is_empty() {
-            args.push(OsString::from("--exclude-tools"));
-            args.push(OsString::from(self.exclude_tools.join(",")));
-        }
-        if self.read_only {
-            args.push(OsString::from("--read-only"));
-        }
-        args
     }
 }
 
@@ -239,12 +244,17 @@ fn main() -> anyhow::Result<()> {
             .map(Arc::new)
             .map_err(|e| anyhow::anyhow!("invalid tool filter: {e}"))
     };
-    let child_filter_args = cli.filter.child_args();
+    let allow_lumina = cli.ida_network.allow_lumina;
+    let worker_args = cli.ida_network.worker_args();
     match cli.command.unwrap_or(Command::Serve) {
-        Command::Serve => run_server(build_filter()?),
-        Command::ServeHttp(args) => run_server_http(args, build_filter()?, child_filter_args),
-        Command::Worker(_args) => run_server_with_mode(build_filter()?, ServerMode::Worker),
-        Command::Probe(args) => run_probe(args),
+        Command::Serve => run_server(build_filter()?, allow_lumina),
+        Command::ServeHttp(args) => {
+            run_server_http(args, build_filter()?, worker_args, allow_lumina)
+        }
+        Command::Worker(_args) => {
+            run_server_with_mode(build_filter()?, ServerMode::Worker, allow_lumina)
+        }
+        Command::Probe(args) => run_probe(args, allow_lumina),
     }
 }
 
@@ -272,28 +282,21 @@ async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn init_stdio_ida_state() -> anyhow::Result<ida::IdaInitState> {
+fn init_stdio_ida_state(allow_lumina: bool) -> anyhow::Result<ida::IdaInitState> {
     // On Windows, IDA's init_library() probes console handles during
     // startup. In stdio mode the MCP transport captures stdin/stdout
     // for JSON-RPC framing, so init must run *before* the transport
     // starts — otherwise init_library() deadlocks on the owned handle.
     #[cfg(target_os = "windows")]
     {
-        ida::init_ida_library()
+        ida::init_ida_library(allow_lumina)
             .map_err(|e| anyhow::anyhow!("IDA library initialization failed: {e}"))
     }
     #[cfg(not(target_os = "windows"))]
     {
-        ida::IdaInitState::deferred()
+        ida::IdaInitState::deferred(allow_lumina)
             .map_err(|e| anyhow::anyhow!("IDA startup preparation failed: {e}"))
     }
-}
-
-fn pooled_child_filter_args(_parent_filter_args: &[OsString]) -> Vec<OsString> {
-    // Public tool filtering is enforced by the parent HTTP server. Child workers
-    // are private implementation details and must keep lifecycle/internal tools
-    // such as close_idb and analyze_funcs available for the parent.
-    Vec::new()
 }
 
 fn cancel_background_tasks(registry: &TaskRegistry, message: &str) {
@@ -306,13 +309,17 @@ fn cancel_background_tasks(registry: &TaskRegistry, message: &str) {
     }
 }
 
-fn run_server(filter: Arc<ToolFilter>) -> anyhow::Result<()> {
-    run_server_with_mode(filter, ServerMode::Stdio)
+fn run_server(filter: Arc<ToolFilter>, allow_lumina: bool) -> anyhow::Result<()> {
+    run_server_with_mode(filter, ServerMode::Stdio, allow_lumina)
 }
 
-fn run_server_with_mode(filter: Arc<ToolFilter>, mode: ServerMode) -> anyhow::Result<()> {
+fn run_server_with_mode(
+    filter: Arc<ToolFilter>,
+    mode: ServerMode,
+    allow_lumina: bool,
+) -> anyhow::Result<()> {
     info!(?mode, "Starting IDA MCP Server (stdio transport)");
-    let init_state = init_stdio_ida_state()?;
+    let init_state = init_stdio_ida_state(allow_lumina)?;
 
     // Create channel for IDA requests
     let (tx, rx) = mpsc::sync_channel(REQUEST_QUEUE_CAPACITY);
@@ -442,7 +449,8 @@ fn run_server_with_mode(filter: Arc<ToolFilter>, mode: ServerMode) -> anyhow::Re
 fn run_server_http(
     args: ServeHttpArgs,
     filter: Arc<ToolFilter>,
-    child_filter_args: Vec<OsString>,
+    worker_args: Vec<OsString>,
+    allow_lumina: bool,
 ) -> anyhow::Result<()> {
     info!("Starting IDA MCP Server (streamable HTTP mode)");
     if args.json_response && !args.stateless {
@@ -479,7 +487,7 @@ fn run_server_http(
         return run_server_http_pooled(
             args,
             filter,
-            child_filter_args,
+            worker_args,
             bind_addr,
             session_keep_alive_secs,
         );
@@ -490,7 +498,7 @@ fn run_server_http(
          Pass --max-workers N where N > 1 for concurrent multi-IDB analysis."
     );
 
-    let init_state = ida::IdaInitState::deferred()
+    let init_state = ida::IdaInitState::deferred(allow_lumina)
         .map_err(|e| anyhow::anyhow!("IDA startup preparation failed: {e}"))?;
     let (tx, rx) = mpsc::sync_channel(REQUEST_QUEUE_CAPACITY);
     let worker = Arc::new(IdaWorker::new(tx));
@@ -598,7 +606,7 @@ fn run_server_http(
 fn run_server_http_pooled(
     args: ServeHttpArgs,
     filter: Arc<ToolFilter>,
-    child_filter_args: Vec<OsString>,
+    worker_args: Vec<OsString>,
     bind_addr: SocketAddr,
     session_keep_alive_secs: u64,
 ) -> anyhow::Result<()> {
@@ -642,7 +650,9 @@ fn run_server_http_pooled(
                 worker_idle_timeout: Duration::from_secs(args.worker_idle_timeout_secs),
                 worker_op_timeout: Duration::from_secs(args.worker_op_timeout_secs),
                 exe_path,
-                filter_args: pooled_child_filter_args(&child_filter_args),
+                // Public tool filtering stays in the parent so private workers
+                // retain lifecycle tools. Process-wide options still propagate.
+                worker_args,
             });
             pool.warm_min()
                 .await
@@ -728,13 +738,13 @@ fn run_server_http_pooled(
     Ok(())
 }
 
-fn run_probe(args: ProbeArgs) -> anyhow::Result<()> {
+fn run_probe(args: ProbeArgs, allow_lumina: bool) -> anyhow::Result<()> {
     info!("Starting IDA MCP Server (probe mode)");
     if let Ok(idadir) = std::env::var("IDADIR") {
         info!("IDADIR={}", idadir);
     }
     info!("Initializing IDA library on main thread");
-    let _init_state = ida::init_ida_library()
+    let _init_state = ida::init_ida_library(allow_lumina)
         .map_err(|e| anyhow::anyhow!("IDA library initialization failed: {e}"))?;
     info!("IDA library initialized successfully");
     if let Ok(ver) = idalib::version() {
@@ -988,7 +998,7 @@ fn disasm_at(db: &IDB, addr: Address, count: usize) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{pooled_child_filter_args, Cli, DEFAULT_HTTP_SESSION_KEEP_ALIVE_SECS};
+    use crate::{Cli, DEFAULT_HTTP_SESSION_KEEP_ALIVE_SECS};
     use clap::Parser;
     use std::ffi::OsString;
 
@@ -1006,16 +1016,21 @@ mod tests {
     }
 
     #[test]
-    fn pooled_child_workers_ignore_public_tool_filters() {
-        let parent_args = vec![
-            OsString::from("--read-only"),
-            OsString::from("--tools"),
-            OsString::from("open_idb,list_functions"),
-        ];
+    fn lumina_access_is_disabled_by_default() {
+        let cli = Cli::parse_from(["ida-mcp", "serve"]);
 
-        assert!(
-            pooled_child_filter_args(&parent_args).is_empty(),
-            "pooled child workers must keep private lifecycle tools available"
-        );
+        assert!(!cli.ida_network.allow_lumina);
+        assert!(cli.ida_network.worker_args().is_empty());
+    }
+
+    #[test]
+    fn lumina_access_can_be_enabled_globally() {
+        let before_subcommand = Cli::parse_from(["ida-mcp", "--allow-lumina", "worker"]);
+        let after_subcommand = Cli::parse_from(["ida-mcp", "worker", "--allow-lumina"]);
+
+        assert!(before_subcommand.ida_network.allow_lumina);
+        assert!(after_subcommand.ida_network.allow_lumina);
+        let worker_args = vec![OsString::from("--allow-lumina")];
+        assert_eq!(before_subcommand.ida_network.worker_args(), worker_args);
     }
 }

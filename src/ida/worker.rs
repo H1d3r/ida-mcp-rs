@@ -765,6 +765,44 @@ impl IdaWorker {
         rx.await?
     }
 
+    pub async fn lumina_lookup(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: i64,
+        timeout_secs: Option<u64>,
+    ) -> Result<Value, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::LuminaLookup {
+            addr,
+            name,
+            offset,
+            resp: tx,
+        })?;
+        Self::recv_with_timeout(rx, timeout_secs).await
+    }
+
+    pub async fn lumina_apply(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: i64,
+        force: bool,
+    ) -> Result<Value, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::LuminaApply {
+            addr,
+            name,
+            offset,
+            force,
+            resp: tx,
+        })?;
+        // IDA's Lumina apply call is mutating and cannot be cancelled. Wait
+        // for its truthful result instead of returning while it is still
+        // changing the database on the IDA thread.
+        Self::recv(rx).await
+    }
+
     /// Read bytes from an address.
     pub async fn get_bytes(
         &self,
@@ -1800,6 +1838,37 @@ impl WorkerBackend {
         }
     }
 
+    pub async fn lumina_lookup(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: i64,
+        timeout_secs: Option<u64>,
+    ) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.lumina_lookup(addr, name, offset, timeout_secs).await,
+            Self::Pooled(state) => state.lumina_lookup(addr, name, offset, timeout_secs).await,
+        }
+    }
+
+    pub async fn lumina_apply(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: i64,
+        force: bool,
+        timeout_secs: Option<u64>,
+    ) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.lumina_apply(addr, name, offset, force).await,
+            Self::Pooled(state) => {
+                state
+                    .lumina_apply(addr, name, offset, force, timeout_secs)
+                    .await
+            }
+        }
+    }
+
     pub async fn get_bytes(
         &self,
         addr: Option<u64>,
@@ -2233,7 +2302,14 @@ impl WorkerBackend {
 
 #[cfg(test)]
 mod tests {
-    use crate::ida::worker::{CloseAuthorization, IdaWorker};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    use serde_json::json;
+
+    use crate::ida::request::IdaRequest;
+    use crate::ida::worker::{CloseAuthorization, IdaWorker, WorkerBackend};
     use std::sync::mpsc;
 
     fn test_worker() -> IdaWorker {
@@ -2317,5 +2393,27 @@ mod tests {
             worker.authorize_close("session-x", None, false),
             CloseAuthorization::Granted
         );
+    }
+
+    #[tokio::test]
+    async fn local_lumina_apply_waits_for_truthful_result() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let worker = WorkerBackend::local(Arc::new(IdaWorker::new(tx)));
+        let responder = thread::spawn(move || {
+            let request = rx.recv().expect("Lumina apply request should arrive");
+            let IdaRequest::LuminaApply { resp, .. } = request else {
+                panic!("expected Lumina apply request");
+            };
+            thread::sleep(Duration::from_millis(25));
+            let _ = resp.send(Ok(json!({ "applied": true })));
+        });
+
+        let result = worker
+            .lumina_apply(Some(0x401000), None, 0, false, Some(0))
+            .await
+            .expect("non-cancellable apply should wait past a zero-second caller timeout");
+
+        assert_eq!(result, json!({ "applied": true }));
+        responder.join().expect("responder should finish");
     }
 }

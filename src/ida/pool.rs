@@ -37,8 +37,20 @@ pub struct WorkerPoolConfig {
     pub worker_idle_timeout: Duration,
     pub worker_op_timeout: Duration,
     pub exe_path: PathBuf,
-    pub filter_args: Vec<OsString>,
+    /// Process-wide CLI arguments forwarded to worker processes.
+    pub worker_args: Vec<OsString>,
 }
+
+/// Public tool-filter environment variables. Filtering is enforced by the
+/// parent HTTP server; private child workers must keep lifecycle/internal
+/// tools such as `close_idb` and `analyze_funcs` available for the parent,
+/// so these are stripped from the child environment.
+const CHILD_FILTER_ENV_VARS: &[&str] = &[
+    "IDA_MCP_TOOLSETS",
+    "IDA_MCP_TOOLS",
+    "IDA_MCP_EXCLUDE_TOOLS",
+    "IDA_MCP_READ_ONLY",
+];
 
 #[derive(Clone)]
 pub struct WorkerPool {
@@ -408,15 +420,23 @@ impl WorkerPool {
         }
     }
 
+    fn worker_command(&self) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new(&self.config.exe_path);
+        cmd.args(&self.config.worker_args);
+        cmd.arg("worker");
+        for var in CHILD_FILTER_ENV_VARS {
+            cmd.env_remove(var);
+        }
+        cmd.kill_on_drop(true);
+        cmd
+    }
+
     async fn spawn_slot(
         &self,
         id: usize,
         initial_state: ChildState,
     ) -> Result<Arc<ChildSlot>, ToolError> {
-        let mut cmd = tokio::process::Command::new(&self.config.exe_path);
-        cmd.args(&self.config.filter_args);
-        cmd.arg("worker");
-        cmd.kill_on_drop(true);
+        let cmd = self.worker_command();
 
         let (transport, stderr) = TokioChildProcess::builder(cmd)
             .stderr(Stdio::piped())
@@ -1438,6 +1458,44 @@ impl PooledSessionState {
         self.call_json("entrypoints", json!({}), None, None).await
     }
 
+    pub async fn lumina_lookup(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: i64,
+        timeout_secs: Option<u64>,
+    ) -> Result<Value, ToolError> {
+        self.call_value(
+            "lumina_lookup",
+            json!({
+                "address": remote::opt_hex_addr(addr),
+                "target_name": name,
+                "offset": offset,
+                "timeout_secs": timeout_secs,
+            }),
+            timeout_secs,
+            None,
+        )
+        .await
+    }
+
+    pub async fn lumina_apply(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: i64,
+        force: bool,
+        timeout_secs: Option<u64>,
+    ) -> Result<Value, ToolError> {
+        self.call_value(
+            "lumina_apply",
+            lumina_apply_child_args(addr, name, offset, force),
+            timeout_secs,
+            None,
+        )
+        .await
+    }
+
     pub async fn get_bytes(
         &self,
         addr: Option<u64>,
@@ -1948,6 +2006,24 @@ fn run_script_child_args(code: &str, timeout_secs: Option<u64>) -> Value {
     json!({ "code": code, "timeout_secs": timeout_secs })
 }
 
+fn lumina_apply_child_args(
+    addr: Option<u64>,
+    name: Option<String>,
+    offset: i64,
+    force: bool,
+) -> Value {
+    json!({
+        "address": remote::opt_hex_addr(addr),
+        "target_name": name,
+        "offset": offset,
+        "force": force,
+        // The child must not report a timeout while IDA is still mutating its
+        // database. The parent watchdog owns timeout enforcement and kills the
+        // child before returning a timeout to the caller.
+        "timeout_secs": null,
+    })
+}
+
 fn find_bytes_child_args(pattern: String, max_results: usize, timeout_secs: Option<u64>) -> Value {
     json!({
         "patterns": [pattern],
@@ -2094,9 +2170,9 @@ mod tests {
     use crate::error::ToolError;
     use crate::ida::pool::{
         analyze_funcs_child_args, child_tool_error_retires_worker, extract_first_matches,
-        find_bytes_child_args, open_error_releases_lease, open_idb_child_args,
-        release_error_retires_worker, run_script_child_args, search_child_args, WorkerPool,
-        WorkerPoolConfig,
+        find_bytes_child_args, lumina_apply_child_args, open_error_releases_lease,
+        open_idb_child_args, release_error_retires_worker, run_script_child_args,
+        search_child_args, WorkerPool, WorkerPoolConfig,
     };
     use serde_json::json;
     use std::path::PathBuf;
@@ -2109,8 +2185,27 @@ mod tests {
             worker_idle_timeout: Duration::from_secs(300),
             worker_op_timeout: Duration::from_secs(600),
             exe_path: PathBuf::from("/does/not/spawn/in/this/test"),
-            filter_args: Vec::new(),
+            worker_args: Vec::new(),
         })
+    }
+
+    #[test]
+    fn pooled_child_workers_ignore_public_tool_filters() {
+        let pool = test_pool(1);
+        let cmd = pool.worker_command();
+        let cleared: Vec<&str> = cmd
+            .as_std()
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .filter_map(|(key, _)| key.to_str())
+            .collect();
+
+        for var in crate::ida::pool::CHILD_FILTER_ENV_VARS {
+            assert!(
+                cleared.contains(var),
+                "pooled child workers must not inherit {var}; they need lifecycle tools"
+            );
+        }
     }
 
     #[test]
@@ -2121,7 +2216,7 @@ mod tests {
             worker_idle_timeout: Duration::from_secs(300),
             worker_op_timeout: Duration::from_secs(1800),
             exe_path: PathBuf::from("/does/not/spawn/in/this/test"),
-            filter_args: Vec::new(),
+            worker_args: Vec::new(),
         });
 
         assert_eq!(pool.worker_op_timeout(Some(120)), Duration::from_secs(130));
@@ -2162,6 +2257,17 @@ mod tests {
 
         let script_args = run_script_child_args("print(1)", Some(30));
         assert_eq!(script_args["timeout_secs"], json!(30));
+    }
+
+    #[test]
+    fn pooled_lumina_apply_leaves_timeout_to_parent_watchdog() {
+        let args = lumina_apply_child_args(Some(0x401000), Some("target".to_string()), 4, true);
+
+        assert!(args["timeout_secs"].is_null());
+        assert_eq!(args["address"], json!("0x401000"));
+        assert_eq!(args["target_name"], json!("target"));
+        assert_eq!(args["offset"], json!(4));
+        assert_eq!(args["force"], json!(true));
     }
 
     #[test]

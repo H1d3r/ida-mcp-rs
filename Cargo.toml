@@ -33,6 +33,14 @@ http-body-util = "0.1"
 tower-service = "0.3"
 uuid = { version = "1", features = ["v4"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+] }
+
 [build-dependencies]
 cc = "1"
 idalib-build = { git = "https://github.com/blacktop/idalib.git", branch = "sdk-9.4.0", package = "idalib-build" }

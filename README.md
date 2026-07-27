@@ -268,18 +268,48 @@ All `ida_*` modules, `idc`, and `idautils` are available. See the [IDAPython API
 
 ---
 
+## Lumina
+
+`ida-mcp` disables IDA's automatic Lumina lookup by default, so starting the
+server or opening a database does not automatically contact
+`lumina.hex-rays.com`. The setting is applied only inside ida-mcp's isolated
+IDA user profile and does not change the normal IDA GUI profile. On Windows,
+ida-mcp also uses a process-local registry mapping because IDA stores its
+settings in the Windows registry instead of under `IDAUSR`. Startup fails
+closed if the private profile cannot be established.
+
+To allow IDA to use the configured Lumina servers, opt in for that process:
+
+```bash
+ida-mcp --allow-lumina
+```
+
+The equivalent environment setting is `IDA_MCP_ALLOW_LUMINA=true`.
+
+With that opt-in enabled, two metadata tools are available:
+
+- `lumina_lookup` queries one function and reports the available metadata
+  without changing the database.
+- `lumina_apply` pulls and applies metadata using IDA's upgrade policy.
+  `force: true` may replace existing names, types, or comments.
+
+`lumina_apply` is excluded by `--read-only`; `lumina_lookup` remains available
+because it does not modify the database.
+
+---
+
 ## Context Optimization
 
-`ida-mcp` exposes 71 tools (~10k tokens of `tools/list` payload). Clients with dynamic tool discovery defer that cost; clients that preload schemas include it in every session. Filter the surface to only what you need:
+`ida-mcp` exposes 73 tools (~11k tokens of `tools/list` payload). Clients with dynamic tool discovery defer that cost; clients that preload schemas include it in every session. Filter the surface to only what you need:
 
 | Flag | Env var | Effect |
 |---|---|---|
 | `--toolsets=cat1,cat2` | `IDA_MCP_TOOLSETS` | Replaces "all tools" with the union of selected categories |
 | `--tools=t1,t2`        | `IDA_MCP_TOOLS`         | Adds individual tools (additive to `--toolsets`) |
 | `--exclude-tools=t1,t2`| `IDA_MCP_EXCLUDE_TOOLS` | Subtracts from the include set; always wins |
-| `--read-only`          | `IDA_MCP_READ_ONLY`     | Strips mutating/arbitrary-code tools (`run_script`, `patch*`, `rename`, `set_comments`, type/stack edits, `dsc_add_*`, `analyze_funcs`); keeps lifecycle/discovery |
+| `--read-only`          | `IDA_MCP_READ_ONLY`     | Strips mutating/arbitrary-code tools (`run_script`, `patch*`, `rename`, `set_comments`, `lumina_apply`, type/stack edits, `dsc_add_*`, `analyze_funcs`); keeps lifecycle/discovery |
 
-No flags = all 71 tools (default). Categories: `core`, `functions`, `disassembly`, `decompile`, `xrefs`, `control_flow`, `memory`, `search`, `metadata`, `types`, `editing`, `scripting` (run `tool_catalog` to enumerate). Flags override env vars; unknown names rejected at startup.
+No flags = all 73 tools (default). Categories: `core`, `functions`, `disassembly`, `decompile`, `xrefs`, `control_flow`, `memory`, `search`, `metadata`, `types`, `editing`, `scripting` (run `tool_catalog` to enumerate). Flags override env vars; unknown names rejected at startup.
 
 ### Recommendations by client
 
@@ -288,7 +318,7 @@ No flags = all 71 tools (default). Categories: `core`, `functions`, `disassembly
   ```bash
   ida-mcp --toolsets=core,functions,disassembly,decompile,xrefs
   ```
-- **Clients without lazy tool loading:** each session receives the full ~10k-token schema payload. Pick a focused subset as shown above.
+- **Clients without lazy tool loading:** each session receives the full ~11k-token schema payload. Pick a focused subset as shown above.
 - **Gemini CLI:** filtering is optional, but a smaller surface can reduce tool-selection noise when several MCP servers are enabled:
   ```bash
   ida-mcp --toolsets=core,functions,disassembly,decompile --read-only

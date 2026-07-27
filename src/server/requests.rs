@@ -477,6 +477,42 @@ pub struct AddressRequest {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct LuminaLookupRequest {
+    #[schemars(description = "Function address (string/number)")]
+    #[serde(alias = "ea", alias = "addr", alias = "addresses")]
+    pub address: Option<Value>,
+    #[schemars(description = "Function name (alternative to address)")]
+    #[serde(alias = "function", alias = "name", alias = "symbol")]
+    pub target_name: Option<String>,
+    #[schemars(description = "Offset added before resolving the containing function (default: 0)")]
+    pub offset: Option<i64>,
+    #[schemars(description = "Timeout in seconds (default: 120, max: 600)")]
+    #[schemars(range(min = 0, max = 600))]
+    pub timeout_secs: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct LuminaApplyRequest {
+    #[schemars(description = "Function address (string/number)")]
+    #[serde(alias = "ea", alias = "addr", alias = "addresses")]
+    pub address: Option<Value>,
+    #[schemars(description = "Function name (alternative to address)")]
+    #[serde(alias = "function", alias = "name", alias = "symbol")]
+    pub target_name: Option<String>,
+    #[schemars(description = "Offset added before resolving the containing function (default: 0)")]
+    pub offset: Option<i64>,
+    #[schemars(
+        description = "Force all returned metadata, potentially replacing existing names or types (default: false)"
+    )]
+    pub force: Option<bool>,
+    #[schemars(
+        description = "Timeout in seconds. Pooled mode kills and retires the child on timeout; single-worker mode waits for this non-cancellable mutation to finish."
+    )]
+    #[schemars(range(min = 0, max = 600))]
+    pub timeout_secs: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct XrefsRequest {
     #[schemars(description = "Address(es) (string/number or array)")]
     #[serde(alias = "addrs", alias = "addr", alias = "addresses")]

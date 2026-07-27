@@ -197,6 +197,19 @@ pub enum IdaRequest {
     Entrypoints {
         resp: oneshot::Sender<Result<Vec<String>, ToolError>>,
     },
+    LuminaLookup {
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: i64,
+        resp: oneshot::Sender<Result<Value, ToolError>>,
+    },
+    LuminaApply {
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: i64,
+        force: bool,
+        resp: oneshot::Sender<Result<Value, ToolError>>,
+    },
     GetBytes {
         addr: Option<u64>,
         name: Option<String>,

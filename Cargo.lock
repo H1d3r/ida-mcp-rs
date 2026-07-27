@@ -996,12 +996,13 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "idalib"
 version = "0.7.5+9.4.260713"
-source = "git+https://github.com/blacktop/idalib.git?branch=sdk-9.4.0#6dc3496d31080d442cc8592e119236ca6324b836"
+source = "git+https://github.com/blacktop/idalib.git?branch=sdk-9.4.0#e559cd891d116f268d640557d24386716a6063b3"
 dependencies = [
  "anyhow",
  "autocxx",
@@ -1015,7 +1016,7 @@ dependencies = [
 [[package]]
 name = "idalib-build"
 version = "0.7.5+9.4.260713"
-source = "git+https://github.com/blacktop/idalib.git?branch=sdk-9.4.0#6dc3496d31080d442cc8592e119236ca6324b836"
+source = "git+https://github.com/blacktop/idalib.git?branch=sdk-9.4.0#e559cd891d116f268d640557d24386716a6063b3"
 dependencies = [
  "anyhow",
  "idalib-sys",
@@ -1024,7 +1025,7 @@ dependencies = [
 [[package]]
 name = "idalib-sys"
 version = "0.7.5+9.4.260713"
-source = "git+https://github.com/blacktop/idalib.git?branch=sdk-9.4.0#6dc3496d31080d442cc8592e119236ca6324b836"
+source = "git+https://github.com/blacktop/idalib.git?branch=sdk-9.4.0#e559cd891d116f268d640557d24386716a6063b3"
 dependencies = [
  "anyhow",
  "autocxx",
@@ -1312,7 +1313,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1572,7 +1573,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1794,7 +1795,7 @@ dependencies = [
  "getrandom",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

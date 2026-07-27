@@ -13,14 +13,18 @@ use crate::error::ToolError;
 use crate::ida::handlers::resolve_address;
 use crate::ida::handlers::{
     address, analysis, annotations, controlflow, database, disasm, dscu, functions, globals,
-    imports, memory, script, search, segments, strings, structs, types, xrefs,
+    imports, lumina, memory, script, search, segments, strings, structs, types, xrefs,
 };
 use crate::ida::lock::release_mcp_lock;
 use crate::ida::observability::{
     emit_progress, ensure_not_cancelled, ProgressHeartbeat, OPEN_IDB_PROGRESS_TOTAL,
     SINGLE_PHASE_PROGRESS_TOTAL,
 };
+#[cfg(target_os = "windows")]
+use crate::ida::registry_isolation::IsolatedWindowsRegistry;
 use crate::ida::request::IdaRequest;
+
+const AUTO_USE_LUMINA_REGISTRY_VALUE: &str = "AutoUseLumina";
 
 unsafe extern "C" {
     fn qsetenv(varname: *const c_char, value: *const c_char) -> bool;
@@ -39,15 +43,21 @@ macro_rules! log_result {
 pub struct IdaInitState {
     pub library_initialized: bool,
     pub version_mismatch: Option<String>,
+    allow_lumina: bool,
     isolated_idausr: Option<IsolatedIdaUserDir>,
+    #[cfg(target_os = "windows")]
+    isolated_registry: Option<IsolatedWindowsRegistry>,
 }
 
 impl IdaInitState {
-    pub fn deferred() -> Result<Self, String> {
+    pub fn deferred(allow_lumina: bool) -> Result<Self, String> {
         Ok(Self {
             library_initialized: false,
             version_mismatch: None,
+            allow_lumina,
             isolated_idausr: prepare_isolated_idausr(idalib::SDK_VERSION)?,
+            #[cfg(target_os = "windows")]
+            isolated_registry: None,
         })
     }
 }
@@ -169,19 +179,36 @@ fn should_isolate_idausr(sdk_version: (i32, i32)) -> bool {
     sdk_version >= (9, 4)
 }
 
+fn first_ida_user_dir(raw: &OsStr) -> (Option<PathBuf>, bool) {
+    let mut first = None;
+    let mut has_additional = false;
+    for path in std::env::split_paths(raw) {
+        if path.as_os_str().is_empty() {
+            continue;
+        }
+        if first.is_none() {
+            first = Some(path);
+        } else {
+            has_additional = true;
+        }
+    }
+    (first, has_additional)
+}
+
 fn ida_user_dir_source() -> Result<Option<PathBuf>, String> {
     if let Some(raw) = std::env::var_os("IDAUSR") {
-        let paths: Vec<PathBuf> = std::env::split_paths(&raw).collect();
-        return match paths.as_slice() {
-            [] => Ok(None),
-            [path] => Ok(Some(path.clone())),
-            _ => {
-                warn!(
-                    "IDAUSR has multiple path components; leaving it unchanged instead of creating an isolated copy"
-                );
-                Ok(None)
-            }
+        let (path, has_additional) = first_ida_user_dir(&raw);
+        let Some(path) = path else {
+            return Ok(None);
         };
+        if has_additional {
+            warn!(
+                source = %path.display(),
+                "IDAUSR has multiple path components; isolating the first user directory and \
+                 omitting additional resource paths from the headless runtime"
+            );
+        }
+        return Ok(Some(path));
     }
 
     #[cfg(target_os = "windows")]
@@ -265,12 +292,17 @@ fn copy_dir_contents(
     let entries = fs::read_dir(src)
         .map_err(|err| format!("failed to read IDA user directory {}: {err}", src.display()))?;
     for entry in entries {
-        let entry = entry.map_err(|err| {
-            format!(
-                "failed to read entry from IDA user directory {}: {err}",
-                src.display()
-            )
-        })?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                warn!(
+                    directory = %src.display(),
+                    error = %err,
+                    "Skipping unreadable IDA user directory entry"
+                );
+                continue;
+            }
+        };
         let name = entry.file_name();
         if skip.is_some_and(|skip| skip(&name)) {
             continue;
@@ -343,22 +375,22 @@ fn prepare_isolated_idausr(sdk_version: (i32, i32)) -> Result<Option<IsolatedIda
         return Ok(None);
     }
 
-    let Some(source) = ida_user_dir_source()? else {
-        warn!("Could not determine IDA user directory; IDAUSR isolation skipped");
-        return Ok(None);
-    };
-    if !source.exists() {
-        warn!(
-            path = %source.display(),
-            "IDA user directory does not exist; IDAUSR isolation skipped"
-        );
-        return Ok(None);
-    }
-
     let path = unique_temp_idausr_dir()?;
-    if let Err(err) = copy_ida_user_state(&source, &path) {
-        let _ = fs::remove_dir_all(&path);
-        return Err(err);
+    let source = ida_user_dir_source()?;
+    if let Some(source) = source.as_ref() {
+        if source.exists() {
+            if let Err(err) = copy_ida_user_state(source, &path) {
+                let _ = fs::remove_dir_all(&path);
+                return Err(err);
+            }
+        } else {
+            warn!(
+                path = %source.display(),
+                "IDA user directory does not exist; using a fresh isolated profile"
+            );
+        }
+    } else {
+        warn!("Could not determine IDA user directory; using a fresh isolated profile");
     }
 
     let previous_idausr = std::env::var_os("IDAUSR");
@@ -366,11 +398,18 @@ fn prepare_isolated_idausr(sdk_version: (i32, i32)) -> Result<Option<IsolatedIda
         let _ = fs::remove_dir_all(&path);
         return Err(err);
     }
-    info!(
-        source = %source.display(),
-        isolated = %path.display(),
-        "Using isolated IDAUSR for IDA 9.4+ headless runtime"
-    );
+    if let Some(source) = source {
+        info!(
+            source = %source.display(),
+            isolated = %path.display(),
+            "Using isolated IDAUSR for IDA 9.4+ headless runtime"
+        );
+    } else {
+        info!(
+            isolated = %path.display(),
+            "Using fresh isolated IDAUSR for IDA 9.4+ headless runtime"
+        );
+    }
 
     Ok(Some(IsolatedIdaUserDir {
         path,
@@ -378,18 +417,54 @@ fn prepare_isolated_idausr(sdk_version: (i32, i32)) -> Result<Option<IsolatedIda
     }))
 }
 
+fn configure_lumina(allow_lumina: bool, isolated_profile: bool) -> Result<(), String> {
+    if allow_lumina {
+        info!("Lumina access explicitly enabled");
+        return Ok(());
+    }
+
+    if !isolated_profile {
+        return Err(
+            "refusing to disable automatic Lumina in a shared IDA profile; profile isolation \
+             is unavailable. Pass --allow-lumina only if network access is acceptable."
+                .to_string(),
+        );
+    }
+
+    idalib::registry::set_bool(AUTO_USE_LUMINA_REGISTRY_VALUE, false)
+        .map_err(|err| format!("failed to disable automatic Lumina access: {err}"))?;
+    let auto_use_lumina = idalib::registry::get_bool(AUTO_USE_LUMINA_REGISTRY_VALUE, true)
+        .map_err(|err| format!("failed to verify automatic Lumina setting: {err}"))?;
+    if auto_use_lumina {
+        return Err("IDA did not retain the disabled automatic Lumina setting".to_string());
+    }
+
+    info!("Automatic Lumina access disabled; pass --allow-lumina to opt in");
+    Ok(())
+}
+
 /// Initialize IDA on the main thread and record the version state.
-pub fn init_ida_library() -> Result<IdaInitState, String> {
-    init_ida_library_with_isolated_idausr(None)
+///
+/// `allow_lumina` controls whether IDA keeps its automatic Lumina lookups
+/// enabled; when false they are disabled before any database is opened.
+pub fn init_ida_library(allow_lumina: bool) -> Result<IdaInitState, String> {
+    init_ida_library_with_isolated_idausr(None, allow_lumina)
 }
 
 fn init_ida_library_with_isolated_idausr(
     isolated_idausr: Option<IsolatedIdaUserDir>,
+    allow_lumina: bool,
 ) -> Result<IdaInitState, String> {
     let sdk_version = idalib::SDK_VERSION;
     let isolated_idausr = match isolated_idausr {
         Some(guard) => Some(guard),
         None => prepare_isolated_idausr(sdk_version)?,
+    };
+    #[cfg(target_os = "windows")]
+    let isolated_registry = if allow_lumina {
+        None
+    } else {
+        Some(IsolatedWindowsRegistry::prepare()?)
     };
     info!("Initializing IDA library (main thread)");
     idalib::init_library().map_err(|e| format!("{e}"))?;
@@ -398,20 +473,30 @@ fn init_ida_library_with_isolated_idausr(
     let version_mismatch = check_ida_version();
     if let Some(ref msg) = version_mismatch {
         error!("{msg}");
-    } else if should_check_license_expiry(sdk_version) {
-        check_license_expiry()?;
     } else {
-        info!(
-            sdk_major = sdk_version.0,
-            sdk_minor = sdk_version.1,
-            "Skipping IDA license expiry preflight; IDA 9.4 validates the license during database open"
-        );
+        #[cfg(target_os = "windows")]
+        let lumina_profile_isolated = isolated_registry.is_some();
+        #[cfg(not(target_os = "windows"))]
+        let lumina_profile_isolated = isolated_idausr.is_some();
+        configure_lumina(allow_lumina, lumina_profile_isolated)?;
+        if should_check_license_expiry(sdk_version) {
+            check_license_expiry()?;
+        } else {
+            info!(
+                sdk_major = sdk_version.0,
+                sdk_minor = sdk_version.1,
+                "Skipping IDA license expiry preflight; IDA 9.4 validates the license during database open"
+            );
+        }
     }
 
     Ok(IdaInitState {
         library_initialized: true,
         version_mismatch,
+        allow_lumina,
         isolated_idausr,
+        #[cfg(target_os = "windows")]
+        isolated_registry,
     })
 }
 
@@ -423,7 +508,10 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
     let mut lock_path: Option<PathBuf> = None;
     let mut lib_initialized = init_state.library_initialized;
     let mut version_mismatch = init_state.version_mismatch;
+    let allow_lumina = init_state.allow_lumina;
     let mut isolated_idausr = init_state.isolated_idausr;
+    #[cfg(target_os = "windows")]
+    let mut _isolated_registry = init_state.isolated_registry;
 
     while let Ok(req) = rx.recv() {
         // Lazily initialize the IDA library on first use when startup preflight
@@ -442,11 +530,15 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 Some(OPEN_IDB_PROGRESS_TOTAL),
                 "Initializing IDA runtime on the main thread",
             );
-            match init_ida_library_with_isolated_idausr(isolated_idausr.take()) {
+            match init_ida_library_with_isolated_idausr(isolated_idausr.take(), allow_lumina) {
                 Ok(init_state) => {
                     lib_initialized = init_state.library_initialized;
                     version_mismatch = init_state.version_mismatch;
                     isolated_idausr = init_state.isolated_idausr;
+                    #[cfg(target_os = "windows")]
+                    {
+                        _isolated_registry = init_state.isolated_registry;
+                    }
                 }
                 Err(err) => {
                     reject_with_error(
@@ -1111,6 +1203,57 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 }
                 let _ = resp.send(result);
             }
+            IdaRequest::LuminaLookup {
+                addr,
+                name,
+                offset,
+                resp,
+            } => {
+                debug!(address = ?addr, name = ?name, offset, "Looking up Lumina metadata");
+                let result = crate::crash_guard::crash_guarded("handle_lumina_lookup", || {
+                    lumina::handle_pull(
+                        &idb,
+                        allow_lumina,
+                        addr,
+                        name.as_deref(),
+                        offset,
+                        false,
+                        false,
+                    )
+                });
+                log_result!(
+                    result,
+                    "Lumina metadata lookup completed",
+                    "Lumina metadata lookup failed"
+                );
+                let _ = resp.send(result);
+            }
+            IdaRequest::LuminaApply {
+                addr,
+                name,
+                offset,
+                force,
+                resp,
+            } => {
+                debug!(address = ?addr, name = ?name, offset, force, "Applying Lumina metadata");
+                let result = crate::crash_guard::crash_guarded("handle_lumina_apply", || {
+                    lumina::handle_pull(
+                        &idb,
+                        allow_lumina,
+                        addr,
+                        name.as_deref(),
+                        offset,
+                        true,
+                        force,
+                    )
+                });
+                log_result!(
+                    result,
+                    "Lumina metadata application completed",
+                    "Lumina metadata application failed"
+                );
+                let _ = resp.send(result);
+            }
             IdaRequest::GetBytes {
                 addr,
                 name,
@@ -1766,6 +1909,8 @@ fn reject_with_error(req: IdaRequest, err: ToolError) {
         IdaRequest::Imports { resp, .. } => reject!(resp, err),
         IdaRequest::Exports { resp, .. } => reject!(resp, err),
         IdaRequest::Entrypoints { resp, .. } => reject!(resp, err),
+        IdaRequest::LuminaLookup { resp, .. } => reject!(resp, err),
+        IdaRequest::LuminaApply { resp, .. } => reject!(resp, err),
         IdaRequest::GetBytes { resp, .. } => reject!(resp, err),
         IdaRequest::SetComments { resp, .. } => reject!(resp, err),
         IdaRequest::Rename { resp, .. } => reject!(resp, err),
@@ -1820,7 +1965,12 @@ fn check_version_mismatch(sdk_version: (i32, i32), runtime_version: (i32, i32)) 
 
 #[cfg(test)]
 mod tests {
-    use crate::ida::loop_impl::{check_version_mismatch, should_check_license_expiry};
+    use std::ffi::OsStr;
+    use std::path::{Path, PathBuf};
+
+    use crate::ida::loop_impl::{
+        check_version_mismatch, configure_lumina, first_ida_user_dir, should_check_license_expiry,
+    };
 
     #[test]
     fn matching_ida_94_version_passes() {
@@ -1860,5 +2010,27 @@ mod tests {
     #[test]
     fn license_expiry_preflight_skipped_for_ida_94() {
         assert!(!should_check_license_expiry((9, 4)));
+    }
+
+    #[test]
+    fn empty_idausr_does_not_select_the_current_directory() {
+        assert_eq!(first_ida_user_dir(OsStr::new("")), (None, false));
+    }
+
+    #[test]
+    fn multi_path_idausr_selects_only_the_first_directory() {
+        let raw = std::env::join_paths([Path::new("/first"), Path::new("/second")])
+            .expect("test paths should form a valid IDAUSR");
+        assert_eq!(
+            first_ida_user_dir(&raw),
+            (Some(PathBuf::from("/first")), true)
+        );
+    }
+
+    #[test]
+    fn lumina_configuration_refuses_a_shared_profile() {
+        let err = configure_lumina(false, false)
+            .expect_err("default Lumina configuration must fail closed without isolation");
+        assert!(err.contains("shared IDA profile"));
     }
 }

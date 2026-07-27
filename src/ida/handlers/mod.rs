@@ -10,6 +10,7 @@ pub mod dscu;
 pub mod functions;
 pub mod globals;
 pub mod imports;
+pub mod lumina;
 pub mod memory;
 pub mod script;
 pub mod search;
