@@ -28,9 +28,26 @@ pub struct OpenIdbRequest {
     )]
     pub rebuild: Option<bool>,
     #[schemars(
+        description = "Output .i64/.idb path for a raw binary. The parent directory must exist. Existing databases are reused only when their recorded input SHA-256 matches; rebuild=true may overwrite only a database already tied to this input."
+    )]
+    pub idb_out: Option<String>,
+    #[schemars(
         description = "IDA file-type selector (-T). Raw binaries only. Empty strings are ignored."
     )]
     pub file_type: Option<String>,
+    #[schemars(
+        description = "IDA processor selector for a raw blob, including an explicit variant for multi-mode families (for example arm:ARMv7-M or metapc:80386p)."
+    )]
+    pub processor: Option<String>,
+    #[schemars(description = "Raw blob application bitness: 16, 32, or 64.")]
+    #[schemars(range(min = 16, max = 64))]
+    pub bitness: Option<i64>,
+    #[schemars(
+        description = "Raw blob byte load address as a string or number. Must be 16-byte aligned."
+    )]
+    pub base_address: Option<Value>,
+    #[schemars(description = "Optional raw blob entry-point address as a string or number.")]
+    pub entry_point: Option<Value>,
     #[schemars(
         description = "Run full auto-analysis before returning (default: false). \
         For raw binaries, false returns fast with analysis incomplete; .i64/.idb ignore this. \
@@ -55,6 +72,22 @@ impl OpenIdbRequest {
 
     pub fn normalized_file_type(&self) -> Option<String> {
         non_empty_trimmed(self.file_type.as_deref())
+    }
+
+    pub fn normalized_processor(&self) -> Option<String> {
+        non_empty_trimmed(self.processor.as_deref())
+    }
+
+    pub fn normalized_idb_out(&self) -> Option<String> {
+        non_empty_trimmed(self.idb_out.as_deref())
+    }
+
+    pub fn effective_idb_out(&self, worker_mode: bool) -> Option<String> {
+        if worker_mode {
+            non_empty_trimmed(self.worker_idb_out.as_deref()).or_else(|| self.normalized_idb_out())
+        } else {
+            self.normalized_idb_out()
+        }
     }
 }
 
@@ -94,7 +127,12 @@ mod tests {
             debug_info_verbose: None,
             force: None,
             rebuild: None,
+            idb_out: None,
             file_type: file_type.map(str::to_string),
+            processor: None,
+            bitness: None,
+            base_address: None,
+            entry_point: None,
             auto_analyse: None,
             timeout_secs: None,
             worker_extra_args: Vec::new(),
@@ -111,12 +149,43 @@ mod tests {
 
     #[test]
     fn open_idb_optional_strings_are_trimmed() {
-        let req = open_request(Some(" C:\\symbols\\sample.pdb "), Some(" pe "));
+        let mut req = open_request(Some(" C:\\symbols\\sample.pdb "), Some(" pe "));
+        req.processor = Some(" arm:ARMv7-M ".to_string());
         assert_eq!(
             req.normalized_debug_info_path(),
             Some("C:\\symbols\\sample.pdb".to_string())
         );
         assert_eq!(req.normalized_file_type(), Some("pe".to_string()));
+        assert_eq!(req.normalized_processor(), Some("arm:ARMv7-M".to_string()));
+    }
+
+    #[test]
+    fn open_idb_output_path_is_trimmed_and_empty_is_ignored() {
+        let mut req = open_request(None, None);
+        req.idb_out = Some("  /tmp/output.i64  ".to_string());
+        assert_eq!(
+            req.normalized_idb_out(),
+            Some("/tmp/output.i64".to_string())
+        );
+
+        req.idb_out = Some("  ".to_string());
+        assert_eq!(req.normalized_idb_out(), None);
+    }
+
+    #[test]
+    fn worker_output_path_drives_the_effective_raw_target() {
+        let mut req = open_request(None, None);
+        req.idb_out = Some("/tmp/public.i64".to_string());
+        req.worker_idb_out = Some("  /tmp/worker.i64  ".to_string());
+
+        assert_eq!(
+            req.effective_idb_out(true),
+            Some("/tmp/worker.i64".to_string())
+        );
+        assert_eq!(
+            req.effective_idb_out(false),
+            Some("/tmp/public.i64".to_string())
+        );
     }
 }
 
@@ -142,6 +211,63 @@ pub struct LoadDebugInfoRequest {
     pub path: Option<String>,
     #[schemars(description = "Whether to emit verbose load status (default: false)")]
     pub verbose: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DebugLaunchRequest {
+    #[schemars(description = "Absolute path to the executable to launch. No shell is used.")]
+    pub path: String,
+    #[schemars(description = "Optional debugger command-line string passed directly to IDA.")]
+    pub arguments: Option<String>,
+    #[schemars(description = "Optional absolute working directory for the debuggee.")]
+    pub start_directory: Option<String>,
+    #[schemars(
+        description = "Seconds to wait for the initial suspended event (default: 30, max: 120)."
+    )]
+    #[schemars(range(min = 1, max = 120))]
+    pub timeout_secs: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DebugAttachRequest {
+    #[schemars(description = "Positive operating-system process ID to attach.")]
+    #[schemars(range(min = 1, max = 4294967295_i64))]
+    pub pid: i64,
+    #[schemars(
+        description = "Seconds to wait for the initial suspended event (default: 30, max: 120)."
+    )]
+    #[schemars(range(min = 1, max = 120))]
+    pub timeout_secs: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DebugStopRequest {
+    #[schemars(
+        description = "Stop policy: auto, detach, or terminate. auto terminates launched targets and detaches attached targets."
+    )]
+    pub action: Option<String>,
+    #[schemars(description = "Seconds to wait for the stop event (default: 10, max: 120).")]
+    #[schemars(range(min = 1, max = 120))]
+    pub timeout_secs: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DebugOpenModuleRequest {
+    #[schemars(
+        description = "Exact runtime module path, or an unambiguous module basename returned by debug_modules."
+    )]
+    pub module: String,
+    #[schemars(
+        description = "Required output .i64/.idb path. Runtime modules commonly live in read-only system directories, so no implicit sibling output is allowed."
+    )]
+    pub idb_out: String,
+    #[schemars(
+        description = "Rebuild a provenance-matched existing output database (default: false)."
+    )]
+    pub rebuild: Option<bool>,
+    #[schemars(description = "Open timeout in seconds (default: 300, max: 600).")]
+    #[schemars(range(min = 1, max = 600))]
+    pub timeout_secs: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -234,6 +360,19 @@ pub struct DisasmRequest {
     #[schemars(description = "Number of instructions (1-1000, default: 10)")]
     #[schemars(range(min = 1, max = 5000))]
     pub count: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RenderRangeRequest {
+    #[schemars(description = "Inclusive start address (string/number)")]
+    pub start: Value,
+    #[schemars(
+        description = "Exclusive end address (string/number); ranges are limited to 65536 bytes"
+    )]
+    pub end: Value,
+    #[schemars(description = "Maximum rendered lines (1-4096, default: 512)")]
+    #[schemars(range(min = 1, max = 4096))]
+    pub max_lines: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -548,6 +687,21 @@ pub struct GetBytesRequest {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListPatchesRequest {
+    #[schemars(description = "Optional inclusive start address (string/number)")]
+    pub start: Option<Value>,
+    #[schemars(description = "Optional exclusive end address (string/number)")]
+    pub end: Option<Value>,
+    #[schemars(description = "Coalesced patch-range offset (default: 0)")]
+    #[schemars(range(min = 0))]
+    pub offset: Option<i64>,
+    #[schemars(description = "Maximum coalesced ranges (1-10000, default: 100)")]
+    #[serde(alias = "count")]
+    #[schemars(range(min = 1, max = 10000))]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct SetCommentsRequest {
     #[schemars(description = "Address to comment (string/number)")]
     #[serde(alias = "ea", alias = "addr", alias = "addresses")]
@@ -777,6 +931,8 @@ pub struct CallGraphRequest {
         alias = "addrs"
     )]
     pub roots: Value,
+    #[schemars(description = "Traversal direction: callees (default), callers, or both")]
+    pub direction: Option<String>,
     #[schemars(description = "Maximum depth (default: 2)")]
     #[schemars(range(min = 1, max = 256))]
     pub max_depth: Option<i64>,
@@ -787,7 +943,9 @@ pub struct CallGraphRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct XrefMatrixRequest {
-    #[schemars(description = "Addresses to include in matrix (string/number or array)")]
+    #[schemars(
+        description = "Addresses to include in matrix (string/number or array; maximum 512)"
+    )]
     #[serde(alias = "addr", alias = "address", alias = "addresses")]
     pub addrs: Value,
 }

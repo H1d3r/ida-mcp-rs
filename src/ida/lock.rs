@@ -33,7 +33,7 @@ impl McpLock {
 
 impl Drop for McpLock {
     fn drop(&mut self) {
-        if !self.transferred {
+        if !self.transferred && lock_path_names_file(&self.file, &self.path) {
             // Lock was not transferred to caller (e.g., panic occurred) - clean up
             let _ = std::fs::remove_file(&self.path);
         }
@@ -90,18 +90,73 @@ pub(crate) fn acquire_mcp_lock(db_path: &Path) -> Result<McpLock, ToolError> {
     })
 }
 
+/// Reclaim the unlocked MCP lock file left by a worker the pool killed.
+///
+/// Cleanup callers must hold this lock while removing partial database
+/// artifacts. Requiring the recorded worker PID prevents a delayed cleanup
+/// from deleting files after another process has claimed the output.
+pub(crate) fn reclaim_killed_worker_mcp_lock(
+    db_path: &Path,
+    worker_pid: Option<u32>,
+) -> Option<McpLock> {
+    let worker_pid = worker_pid?;
+    let mut lock_path = db_path.to_path_buf();
+    lock_path.set_extension("imcp");
+
+    reclaim_mcp_lock_path(&lock_path, Some(worker_pid))
+}
+
+fn reclaim_mcp_lock_path(lock_path: &Path, expected_pid: Option<u32>) -> Option<McpLock> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .ok()?;
+    if try_lock_file(&file).is_err() {
+        return None;
+    }
+    let recorded_pid = read_lock_file_pid_from_file(&file);
+    if recorded_pid != expected_pid || !lock_path_names_file(&file, lock_path) {
+        return None;
+    }
+
+    Some(McpLock {
+        file,
+        path: lock_path.to_path_buf(),
+        transferred: false,
+    })
+}
+
 /// Release an MCP lock using mutable references to the file and path options.
 pub(crate) fn release_mcp_lock(lock_file: &mut Option<File>, lock_path: &mut Option<PathBuf>) {
-    if let Some(path) = lock_path.take() {
+    let file = lock_file.take();
+    let path = lock_path.take();
+    if let (Some(file), Some(path)) = (file, path)
+        && lock_path_names_file(&file, &path)
+    {
         let _ = std::fs::remove_file(path);
     }
-    *lock_file = None;
 }
 
 /// Release an MCP lock file directly.
 pub(crate) fn release_mcp_lock_file(lock: McpLock) {
+    let _ = remove_mcp_lock_file(lock);
+}
+
+fn remove_mcp_lock_file(lock: McpLock) -> Result<PathBuf, (PathBuf, std::io::Error)> {
+    let path_is_owned = lock_path_names_file(&lock.file, &lock.path);
     let (_file, path) = lock.into_parts();
-    let _ = std::fs::remove_file(path);
+    if !path_is_owned {
+        let error = std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "MCP lock path no longer names the locked file",
+        );
+        return Err((path, error));
+    }
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(path),
+        Err(error) => Err((path, error)),
+    }
 }
 
 /// Remove a lock file that still belongs to a worker process the pool killed.
@@ -110,25 +165,23 @@ pub(crate) fn remove_mcp_lock_for_pid(db_path: &Path, pid: Option<u32>) {
         return;
     };
 
-    let mut lock_path = db_path.to_path_buf();
-    lock_path.set_extension("imcp");
-    if read_lock_file_pid(&lock_path) != Some(pid) {
+    let Some(lock) = reclaim_killed_worker_mcp_lock(db_path, Some(pid)) else {
         return;
-    }
+    };
+    let lock_path = lock.path.clone();
 
-    if let Err(err) = std::fs::remove_file(&lock_path) {
-        warn!(
-            path = %lock_path.display(),
-            pid,
-            error = %err,
-            "failed to remove killed worker MCP lock file"
-        );
-    } else {
-        info!(
+    match remove_mcp_lock_file(lock) {
+        Ok(_) => info!(
             path = %lock_path.display(),
             pid,
             "removed killed worker MCP lock file"
-        );
+        ),
+        Err((_, error)) => warn!(
+            path = %lock_path.display(),
+            pid,
+            %error,
+            "failed to remove killed worker MCP lock file"
+        ),
     }
 }
 
@@ -155,19 +208,21 @@ pub(crate) fn clean_stale_mcp_lock(db_path: &Path) -> Option<StaleLockInfo> {
         Some(pid) => pid,
         None => {
             // Can't read PID, but file exists - try to acquire lock to check if stale
-            if let Ok(file) = OpenOptions::new().read(true).write(true).open(&lock_path)
-                && try_lock_file(&file).is_ok()
-            {
-                // We got the lock - file was stale (no process holding fcntl lock)
-                drop(file);
-                if std::fs::remove_file(&lock_path).is_ok() {
-                    info!(path = %lock_path.display(), "Removed stale lock file (no valid PID, no fcntl lock)");
-                    return Some(StaleLockInfo {
-                        path: lock_path,
-                        pid: 0,
-                        reason: "no valid PID and no fcntl lock held".to_string(),
-                    });
-                }
+            if let Some(lock) = reclaim_mcp_lock_path(&lock_path, None) {
+                return match remove_mcp_lock_file(lock) {
+                    Ok(_) => {
+                        info!(path = %lock_path.display(), "Removed stale lock file (no valid PID, no fcntl lock)");
+                        Some(StaleLockInfo {
+                            path: lock_path,
+                            pid: 0,
+                            reason: "no valid PID and no fcntl lock held".to_string(),
+                        })
+                    }
+                    Err((_, error)) => {
+                        warn!(path = %lock_path.display(), %error, "Failed to remove stale lock file");
+                        None
+                    }
+                };
             }
             return None;
         }
@@ -186,13 +241,12 @@ pub(crate) fn clean_stale_mcp_lock(db_path: &Path) -> Option<StaleLockInfo> {
         "Found stale lock file from dead process"
     );
 
-    // Remove the stale lock file
-    if let Err(e) = std::fs::remove_file(&lock_path) {
-        warn!(
-            path = %lock_path.display(),
-            error = %e,
-            "Failed to remove stale lock file"
-        );
+    // Re-check the recorded owner while holding the advisory lock, then keep
+    // that lock held through unlink so another worker cannot claim this path
+    // between ownership validation and removal.
+    let lock = reclaim_mcp_lock_path(&lock_path, Some(pid))?;
+    if let Err((_, error)) = remove_mcp_lock_file(lock) {
+        warn!(path = %lock_path.display(), %error, "Failed to remove stale lock file");
         return None;
     }
 
@@ -207,7 +261,16 @@ pub(crate) fn clean_stale_mcp_lock(db_path: &Path) -> Option<StaleLockInfo> {
 /// Read the PID from a lock file.
 fn read_lock_file_pid(lock_path: &Path) -> Option<u32> {
     let file = File::open(lock_path).ok()?;
-    let reader = BufReader::new(file);
+    read_lock_file_pid_from_file(&file)
+}
+
+fn read_lock_file_pid_from_file(file: &File) -> Option<u32> {
+    // POSIX process locks are released when *any* descriptor for the same
+    // inode is closed. Read through the descriptor that owns the lock: a
+    // cloned or freshly-opened descriptor would silently unlock cleanup when
+    // it went out of scope.
+    let mut reader = BufReader::new(file);
+    reader.seek(std::io::SeekFrom::Start(0)).ok()?;
 
     for line in reader.lines().map_while(Result::ok) {
         if let Some(pid_str) = line.strip_prefix("pid=") {
@@ -215,6 +278,56 @@ fn read_lock_file_pid(lock_path: &Path) -> Option<u32> {
         }
     }
     None
+}
+
+#[cfg(unix)]
+fn lock_path_names_file(file: &File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(file_metadata) = file.metadata() else {
+        return false;
+    };
+    let Ok(path_metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    file_metadata.dev() == path_metadata.dev() && file_metadata.ino() == path_metadata.ino()
+}
+
+#[cfg(windows)]
+fn lock_path_names_file(file: &File, path: &Path) -> bool {
+    let Ok(path_file) = File::open(path) else {
+        return false;
+    };
+    windows_file_identity(file)
+        .zip(windows_file_identity(&path_file))
+        .is_some_and(|(locked_identity, path_identity)| locked_identity == path_identity)
+}
+
+#[cfg(windows)]
+fn windows_file_identity(file: &File) -> Option<(u32, u64)> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let mut info = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    // SAFETY: `file` keeps the OS handle valid for this call, and
+    // GetFileInformationByHandle initializes the output structure on success.
+    let succeeded =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) != 0 };
+    if !succeeded {
+        return None;
+    }
+    // SAFETY: the successful call above initialized the entire structure.
+    let info = unsafe { info.assume_init() };
+    let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    Some((info.dwVolumeSerialNumber, index))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn lock_path_names_file(_file: &File, _path: &Path) -> bool {
+    false
 }
 
 /// Check if a process with the given PID is still running.
@@ -394,5 +507,137 @@ fn locked_by_pid_from_fd(file: &File) -> Option<u32> {
         None
     } else {
         Some(fl.l_pid as u32)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use crate::ida::lock::{reclaim_mcp_lock_path, try_lock_file};
+    use std::fs::{self, OpenOptions};
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const LOCK_PROBE_PATH: &str = "IDA_MCP_LOCK_PROBE_PATH";
+
+    #[test]
+    fn mcp_lock_probe_subprocess() {
+        let Some(path) = std::env::var_os(LOCK_PROBE_PATH) else {
+            return;
+        };
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("probe should open the parent's lock file");
+        assert!(
+            try_lock_file(&file).is_err(),
+            "another process acquired the reclaimed lock"
+        );
+    }
+
+    #[test]
+    fn reclaimed_lock_remains_held_after_owner_validation() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock should follow the Unix epoch")
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("ida-mcp-lock-{}-{unique}.imcp", std::process::id()));
+        let recorded_pid = 424_242;
+        fs::write(&path, format!("pid={recorded_pid}\n"))
+            .expect("test should create its lock file");
+
+        let lock = reclaim_mcp_lock_path(&path, Some(recorded_pid))
+            .expect("test should reclaim the unlocked file");
+        let output = Command::new(std::env::current_exe().expect("test binary should be known"))
+            .arg("mcp_lock_probe_subprocess")
+            .arg("--nocapture")
+            .env(LOCK_PROBE_PATH, &path)
+            .output()
+            .expect("lock probe subprocess should run");
+
+        assert!(
+            output.status.success(),
+            "lock probe failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        drop(lock);
+        assert!(
+            !path.exists(),
+            "dropping the reclaimed lock should unlink it"
+        );
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod identity_cleanup_tests {
+    use crate::ida::lock::{lock_path_names_file, release_mcp_lock, remove_mcp_lock_file, McpLock};
+    use std::fs::{self, File, OpenOptions};
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn replaced_lock(name: &str) -> (File, PathBuf, PathBuf) {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock should follow the Unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "ida-mcp-lock-replacement-{}-{name}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir).expect("create test directory");
+        let path = dir.join("database.imcp");
+        let moved = dir.join("previous.imcp");
+        fs::write(&path, b"pid=1\n").expect("create original lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open original lock");
+        assert!(lock_path_names_file(&file, &path));
+        fs::rename(&path, &moved).expect("move original lock while its handle is open");
+        fs::write(&path, b"pid=2\n").expect("create replacement lock");
+        assert!(!lock_path_names_file(&file, &path));
+        (file, path, moved)
+    }
+
+    fn assert_replacement_survived(path: &Path, moved: &Path) {
+        assert_eq!(
+            fs::read(path).expect("replacement lock should remain"),
+            b"pid=2\n"
+        );
+        let dir = path.parent().expect("test lock should have a parent");
+        fs::remove_file(moved).expect("remove moved original lock");
+        fs::remove_file(path).expect("remove replacement lock");
+        fs::remove_dir(dir).expect("remove test directory");
+    }
+
+    #[test]
+    fn every_lock_release_path_preserves_a_replacement_owner() {
+        let (file, path, moved) = replaced_lock("drop");
+        drop(McpLock {
+            file,
+            path: path.clone(),
+            transferred: false,
+        });
+        assert_replacement_survived(&path, &moved);
+
+        let (file, path, moved) = replaced_lock("remove");
+        let result = remove_mcp_lock_file(McpLock {
+            file,
+            path: path.clone(),
+            transferred: false,
+        });
+        assert!(result.is_err(), "replacement identity must fail closed");
+        assert_replacement_survived(&path, &moved);
+
+        let (file, path, moved) = replaced_lock("release");
+        let mut file = Some(file);
+        let mut lock_path = Some(path.clone());
+        release_mcp_lock(&mut file, &mut lock_path);
+        assert!(file.is_none());
+        assert!(lock_path.is_none());
+        assert_replacement_survived(&path, &moved);
     }
 }

@@ -1,11 +1,16 @@
 //! Multi-process worker pool for HTTP sessions.
 
 use crate::error::ToolError;
+use crate::ida::handlers::database::{database_path_for_open_request, RawOpenArtifactCleanup};
+use crate::ida::handlers::debugger::DEBUGGER_TEARDOWN_TIMEOUT_SECS;
 use crate::ida::lock::remove_mcp_lock_for_pid;
 use crate::ida::observability::ProgressSender;
 use crate::ida::remote;
 use crate::ida::types::*;
-use crate::ida::worker::MAX_TIMEOUT_SECS;
+use crate::ida::worker::{
+    debugger_response_timeout_secs, CLOSE_SEND_TIMEOUT_SECS, DEBUG_MODULES_TIMEOUT_SECS,
+    MAX_TIMEOUT_SECS,
+};
 use futures_util::future::join_all;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{CallToolResult, ClientInfo, JsonObject};
@@ -14,12 +19,12 @@ use rmcp::transport::child_process::TokioChildProcess;
 use rmcp::ServiceExt;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, Weak};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::runtime::Handle;
@@ -28,8 +33,13 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-const CHILD_CLOSE_TIMEOUT_SECS: u64 = 5;
+const CHILD_SERVICE_CLOSE_TIMEOUT_SECS: u64 = 5;
 pub(crate) const CHILD_TIMEOUT_GRACE_SECS: u64 = 10;
+// A close_idb RPC can spend its enqueue and debugger teardown budgets before
+// packing the database and sending its response. Its parent watchdog must
+// leave the same post-child grace as every other pooled operation.
+const MIN_CHILD_CLOSE_RPC_TIMEOUT_SECS: u64 =
+    CLOSE_SEND_TIMEOUT_SECS + DEBUGGER_TEARDOWN_TIMEOUT_SECS as u64 + CHILD_TIMEOUT_GRACE_SECS;
 
 #[derive(Debug, Clone)]
 pub struct WorkerPoolConfig {
@@ -80,6 +90,17 @@ struct PooledChild {
     spawned_at: Instant,
     last_used: Instant,
     idb_path: Option<PathBuf>,
+    pending_open_artifacts: Option<RawOpenArtifactCleanup>,
+}
+
+impl PooledChild {
+    /// Whether this child's MCP transport is gone. A missing service is
+    /// treated as closed: the child can no longer serve any call.
+    fn transport_closed(&self) -> bool {
+        self.service
+            .as_ref()
+            .is_none_or(|service| service.is_transport_closed())
+    }
 }
 
 struct DeadWorker {
@@ -87,6 +108,21 @@ struct DeadWorker {
     pid: Option<u32>,
     age_secs: u64,
     idb_path: Option<PathBuf>,
+    pending_open_artifacts: Option<RawOpenArtifactCleanup>,
+}
+
+struct OpenDispatch {
+    database_path: PathBuf,
+    artifacts: Option<RawOpenArtifactCleanup>,
+}
+
+impl OpenDispatch {
+    fn for_request(path: &str, idb_out: Option<&str>, rebuild: bool) -> Self {
+        Self {
+            database_path: database_path_for_open_request(path, idb_out),
+            artifacts: RawOpenArtifactCleanup::for_request(path, idb_out, rebuild),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -463,6 +499,7 @@ impl WorkerPool {
                 spawned_at: Instant::now(),
                 last_used: Instant::now(),
                 idb_path: None,
+                pending_open_artifacts: None,
             }),
             call_lock: Mutex::new(()),
         }))
@@ -496,17 +533,15 @@ impl WorkerPool {
         };
 
         let args = remote::json_object(json!({}))?;
-        let close = tokio::time::timeout(
-            Duration::from_secs(CHILD_CLOSE_TIMEOUT_SECS),
-            remote::call_tool(&peer, "close_idb", args),
-        )
-        .await;
+        let close_timeout = self.close_rpc_timeout();
+        let close =
+            tokio::time::timeout(close_timeout, remote::call_tool(&peer, "close_idb", args)).await;
 
         let close_error = match close {
             Ok(Ok(result)) if result.is_error != Some(true) => None,
             Ok(Ok(result)) => remote::result_error(&result, "close_idb"),
             Ok(Err(err)) => Some(err),
-            Err(_) => Some(ToolError::Timeout(CHILD_CLOSE_TIMEOUT_SECS)),
+            Err(_) => Some(ToolError::Timeout(close_timeout.as_secs())),
         };
 
         let close_error = match close_error {
@@ -535,6 +570,7 @@ impl WorkerPool {
         child.state = ChildState::Idle;
         child.last_used = Instant::now();
         child.idb_path = None;
+        child.pending_open_artifacts = None;
         release_guard.disarm();
         info!(
             worker_id = handle.worker_id,
@@ -638,6 +674,7 @@ impl WorkerPool {
     fn take_dead_worker_locked(child: &mut PooledChild) -> DeadWorker {
         child.state = ChildState::Dead;
         let idb_path = child.idb_path.take();
+        let pending_open_artifacts = child.pending_open_artifacts.take();
         let pid = child.pid;
         let age_secs = child.spawned_at.elapsed().as_secs();
         let service = child.service.take();
@@ -647,14 +684,18 @@ impl WorkerPool {
             pid,
             age_secs,
             idb_path,
+            pending_open_artifacts,
         }
     }
 
     async fn finish_dead_worker(worker_id: usize, mut dead: DeadWorker) {
         if let Some(mut service) = dead.service.take() {
             let _ = service
-                .close_with_timeout(Duration::from_secs(CHILD_CLOSE_TIMEOUT_SECS))
+                .close_with_timeout(Duration::from_secs(CHILD_SERVICE_CLOSE_TIMEOUT_SECS))
                 .await;
+        }
+        if let Some(artifacts) = dead.pending_open_artifacts.take() {
+            artifacts.cleanup_after_worker_loss(dead.pid).await;
         }
         if let Some(idb_path) = dead.idb_path.as_ref() {
             remove_mcp_lock_for_pid(idb_path, dead.pid);
@@ -721,6 +762,8 @@ impl WorkerPool {
         count
     }
 
+    /// Add parent response/retirement grace to a child-side deadline, then
+    /// honor the operator's process-safety hard cap.
     fn worker_op_timeout(&self, requested: Option<u64>) -> Duration {
         let configured = self.config.worker_op_timeout;
         requested
@@ -732,6 +775,16 @@ impl WorkerPool {
             .map(Duration::from_secs)
             .map(|requested| requested.min(configured))
             .unwrap_or(configured)
+    }
+
+    /// Closing owns process and database cleanup, so its watchdog cannot be
+    /// configured below the child's bounded enqueue and debugger-teardown
+    /// phases. Longer configured operation timeouts remain available for
+    /// packing large databases.
+    fn close_rpc_timeout(&self) -> Duration {
+        self.config
+            .worker_op_timeout
+            .max(Duration::from_secs(MIN_CHILD_CLOSE_RPC_TIMEOUT_SECS))
     }
 }
 
@@ -746,12 +799,19 @@ impl PooledWorkerHandle {
         args: JsonObject,
         timeout: Duration,
         cancel: Option<CancellationToken>,
+        mut open_dispatch: Option<OpenDispatch>,
     ) -> Result<CallToolResult, ToolError> {
         let _call_guard = self.slot.call_lock.lock().await;
+        let tracks_open = open_dispatch.is_some();
+        let mut previous_idb_path = None;
         let peer = {
-            let child = self.slot.child.lock().await;
+            let mut child = self.slot.child.lock().await;
             match &child.state {
                 ChildState::Leased { session_id } if session_id == &self.session_id => {
+                    if let Some(open_dispatch) = open_dispatch.take() {
+                        previous_idb_path = child.idb_path.replace(open_dispatch.database_path);
+                        child.pending_open_artifacts = open_dispatch.artifacts;
+                    }
                     child.peer.clone()
                 }
                 ChildState::Dead => {
@@ -792,6 +852,25 @@ impl PooledWorkerHandle {
 
         match result {
             Ok(Ok(result)) => {
+                if tracks_open
+                    && let Some(err) = remote::result_error(&result, tool)
+                    && unsettled_open_error_retires_worker(&err)
+                {
+                    // A timeout/cancellation response bounds the caller's
+                    // wait, not the native IDA open. Keep the pre-dispatch
+                    // artifact snapshot attached while retirement settles
+                    // the child and cleans only this generation's output.
+                    self.pool.mark_dead(&self.slot).await;
+                    retire_guard.disarm();
+                    return Err(err);
+                }
+                if tracks_open {
+                    let mut child = self.slot.child.lock().await;
+                    child.pending_open_artifacts = None;
+                    if result.is_error == Some(true) {
+                        child.idb_path = previous_idb_path;
+                    }
+                }
                 retire_guard.disarm();
                 Ok(result)
             }
@@ -816,7 +895,7 @@ impl PooledWorkerHandle {
     }
 }
 
-pub struct PooledSessionState {
+pub struct WorkspaceDatabase {
     pool: WorkerPool,
     session_id: String,
     handle: Arc<Mutex<Option<PooledDatabaseLease>>>,
@@ -824,13 +903,610 @@ pub struct PooledSessionState {
     runtime: Option<Handle>,
 }
 
+/// Routes opaque database IDs to pooled worker leases.
+///
+/// # Lifecycle invariants
+///
+/// The workspace registry, the worker pool, and the debugger runtime are
+/// three interacting state machines. Every transition one of them makes must
+/// preserve these invariants; a change that adds a transition (a new
+/// retirement path, pin, or lease state) must say which invariant covers it
+/// or add one — with a test — rather than rely on review to notice the gap.
+///
+/// - **I1 — pin is lease state:** the debug pin is a field of
+///   [`PooledDatabaseLease`], so it structurally cannot outlive the worker or
+///   database generation that produced it, and it is applied only by
+///   `WorkspaceDatabase::set_debug_pin_for_lease`, which re-checks the
+///   dispatching (worker, generation) pair under the lease mutex — a stale
+///   start completion pins nothing and its success-shaped result is replaced
+///   with [`crate::error::ToolError::DebuggerSessionLost`], never reported as
+///   a live session. The reaper reads pins via `try_lock`
+///   (`lease_reap_decision`), treating contention as busy — no
+///   cross-atomic memory-ordering contract. A healthy pin clears only through
+///   successful `debug_stop` or database close; a pinned lease whose worker
+///   transport closed out of band is terminal loss, so the reaper clears the
+///   lease and retires the slot. External target exit without another
+///   debugger call remains a documented limitation; tests
+///   `debug_pin_cannot_exist_without_its_lease` and
+///   `debug_start_pins_whenever_worker_retains_ownership`.
+/// - **I2 — pins block reaping:** an entry with active calls, task pins, or a
+///   debug pin is never idle-reaped. Enforced by the [`workspace_reaper`]
+///   filter; test `workspace_idle_reaper_respects_every_lifetime_guard`.
+///   Guard release publishes the refreshed idle timestamp *before*
+///   decrementing its counter ([`WorkspaceLease`]/[`WorkspacePin`] `Drop`),
+///   so a call outliving the TTL can never expose a zero guard count beside
+///   a stale timestamp to a reaper pass in progress; test
+///   `guard_release_refreshes_idle_time_before_dropping_its_count`.
+/// - **I3 — close removes exactly the closable:** `close_idb` removes an
+///   entry unless a keyed background open for it is still running, so a
+///   pending open is protected while a terminal lease-less entry stays
+///   removable. Enforced by `workspace_close_should_remove_entry` +
+///   `TaskRegistry::has_running_workspace_open`; test
+///   `workspace_close_retains_entry_while_background_open_is_running`.
+/// - **I4 — retained session pins:** every debugger start that leaves the
+///   child owning a live process pins the entry, including error and
+///   `user_action_required` results. Enforced by `debug_start` over the
+///   explicit `session_retained` /
+///   [`crate::error::ToolError::DebuggerStartRetained`] signals.
+/// - **I5 — stop unpins:** a debug stop that ends ownership (including the
+///   already-exited `NoProcess` escape) clears the session and the pin.
+/// - **I6 — retirement is cancellation-safe:** worker retirement completes
+///   even if the awaiting future is dropped. Enforced by
+///   [`WorkerRetireGuard`].
+/// - **I7 — retirement is operation-scoped:** only hard transport failures
+///   retire a worker, plus debugger-op timeouts, which permanently wedge the
+///   child's serial loop. Enforced by `child_tool_error_retires_worker`; test
+///   `child_tool_error_retire_decision_is_operation_specific`.
+/// - **I8 — generations gate stale calls:** a call bound to a database
+///   generation can never reach a reopened database. Enforced by
+///   [`WorkspaceDatabase::required_handle_for_generation`], atomically with
+///   handle acquisition.
+/// - **I9 — health is not retention:** worker transport liveness is probed
+///   independently of the workspace idle timeout. A zero timeout disables
+///   only healthy idle eviction; it never disables dead-worker retirement or
+///   terminal handle removal. Enforced by [`workspace_reaper`]; the strict
+///   debugger oracle kills a pooled worker under a zero-TTL registry, and
+///   `workspace_zero_ttl_still_reaps_terminal_no_lease_handles` covers the
+///   lease-less terminal state while preserving active and pinned handles.
+/// - **I10 — watchdogs enclose child deadlines:** debugger response waits add
+///   worker-local grace after the SDK event timeout, and the pooled watchdog
+///   adds parent grace after that. `close_idb` likewise adds parent grace after
+///   its bounded enqueue and debugger teardown phases. The configured
+///   operation watchdog is an explicit operator hard cap. Enforced by
+///   `debugger_timeout_layers_are_strictly_nested`.
+/// - **I11 — open intent is transactional:** an open publishes its effective
+///   output and owned-artifact snapshot before child dispatch. Success commits
+///   the path, an application error restores the previous path, and forced
+///   retirement cleans only artifacts protected by the killed worker's exact
+///   output lock. Enforced by `open_dispatch_tracks_the_effective_output_before_child_dispatch`,
+///   the database artifact-cleanup tests, and `test-pool-second-open`.
+///   Timeout, cancellation, and closed-worker error responses do not prove
+///   the native open settled: they retire the child with its artifact
+///   snapshot intact. Enforced by `unsettled_open_errors_require_retirement`
+///   and `test-pool-open-timeout`.
+#[derive(Clone)]
+pub struct WorkspaceRegistry {
+    inner: Arc<WorkspaceRegistryInner>,
+}
+
+struct WorkspaceRegistryInner {
+    pool: WorkerPool,
+    entries: StdMutex<HashMap<String, Arc<WorkspaceRegistryEntry>>>,
+    idle_timeout: Duration,
+}
+
+struct WorkspaceRegistryEntry {
+    database: Arc<WorkspaceDatabase>,
+    last_used: StdMutex<Instant>,
+    active_calls: AtomicUsize,
+    pins: AtomicUsize,
+    legacy: bool,
+}
+
+pub struct WorkspaceLease {
+    database_id: String,
+    entry: Arc<WorkspaceRegistryEntry>,
+}
+
+pub struct WorkspacePin {
+    entry: Arc<WorkspaceRegistryEntry>,
+}
+
+pub struct LegacySessionBinding {
+    registry: WorkspaceRegistry,
+    database_id: String,
+    database: Arc<WorkspaceDatabase>,
+}
+
+#[derive(Clone)]
+pub enum PooledDatabaseBinding {
+    Legacy(Arc<LegacySessionBinding>),
+    Workspace(Arc<WorkspaceDatabase>),
+}
+
 #[derive(Clone)]
 struct PooledDatabaseLease {
     handle: PooledWorkerHandle,
     generation: DatabaseGeneration,
+    /// Invariant I1: the debug pin lives inside the lease it protects, so it
+    /// structurally cannot outlive the worker or database generation that
+    /// produced it — releasing or replacing the lease erases the pin with it.
+    /// It is applied only through [`WorkspaceDatabase::set_debug_pin_for_lease`],
+    /// which re-checks the dispatching (worker, generation) pair under this
+    /// same mutex.
+    debug_pinned: bool,
 }
 
-impl PooledSessionState {
+/// A child-tool outcome plus the lease that served it, kept even for failed
+/// calls so debugger completions can bind pin decisions to their ownership.
+struct DispatchedCall {
+    result: Result<CallToolResult, ToolError>,
+    lease: Option<(usize, DatabaseGeneration)>,
+}
+
+/// Worker binding of one workspace database, as seen by `list_databases`.
+enum LeaseSnapshot {
+    /// A worker is bound to a completed database open.
+    Bound { path: PathBuf, debug_pinned: bool },
+    /// No worker is bound: the database is allocated but not yet open, or
+    /// its worker was lost.
+    NoWorker,
+    /// The lease is locked by an in-flight operation.
+    Busy,
+}
+
+/// One row of `list_databases`: enough to re-address a handle after a lost
+/// response or a stateless HTTP reconnect, and nothing internal.
+pub struct WorkspaceDatabaseSummary {
+    pub database_id: String,
+    pub path: Option<String>,
+    pub state: &'static str,
+    pub idle_seconds: u64,
+    pub active_calls: usize,
+    pub pinned: bool,
+    pub debug_pinned: bool,
+}
+
+/// Outcome of the reaper's lease-health probe for one workspace entry.
+enum LeaseReapDecision {
+    /// No worker lease is installed.
+    NoLease,
+    /// The worker transport is healthy and no debugger pin blocks eviction.
+    HealthyUnpinned,
+    /// The worker transport is healthy and a debugger pin blocks idle
+    /// eviction.
+    HealthyPinned,
+    /// A lease or slot mutex was contended: the database is mid-operation.
+    Busy,
+    /// A lease whose worker transport closed out of band. The lease has been
+    /// cleared; the caller retires the returned slot.
+    DeadWorker(Arc<ChildSlot>),
+}
+
+#[derive(Clone, Copy)]
+enum WorkspaceReapReason {
+    Idle,
+    Terminal,
+}
+
+/// Report the loss of a worker that was hosting a live debugger session.
+///
+/// Any server-initiated retirement of a debug-pinned lease — a timed-out
+/// lifecycle operation, a crashed child, a dropped transport — ends ida-mcp's
+/// control of that session without ending the debuggee: the worker never runs
+/// `DebuggerRuntime::drop`, so its debug-server helper is reparented rather
+/// than terminated. A start timeout can create the same orphan before the
+/// lease is pinned. A bare timeout or transport error would hide either case,
+/// so the error names it. Non-debugger losses keep their original error.
+fn debugger_worker_loss_error(tool: &str, error: ToolError, debug_pinned: bool) -> ToolError {
+    let uncertain_start = matches!(tool, "debug_launch" | "debug_attach")
+        && matches!(
+            &error,
+            ToolError::Timeout(_) | ToolError::TimeoutDetailed(_)
+        );
+    if !debug_pinned && !uncertain_start {
+        return error;
+    }
+    if uncertain_start && !debug_pinned {
+        return ToolError::DebuggerSessionLost(format!(
+            "{tool} timed out and its worker was retired ({error}); ida-mcp cannot determine \
+             whether the debugger started before the timeout, and the target process may still \
+             be running — check for a stray debuggee before retrying {tool}"
+        ));
+    }
+    ToolError::DebuggerSessionLost(format!(
+        "{tool} lost the worker hosting this database's debugger session ({error}); ida-mcp no \
+         longer controls that session and the target process may still be running — check for a \
+         stray debuggee, then reopen the database to start a new session"
+    ))
+}
+
+/// Whether a debugger start left the child owning a live process: a `ready`
+/// result, a `user_action_required` result whose process survived, or the
+/// dedicated retained-start error all report it explicitly.
+fn debug_start_retains_session(result: &Result<Value, ToolError>) -> bool {
+    match result {
+        Ok(value) => value
+            .get("session_retained")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        Err(ToolError::DebuggerStartRetained(_)) => true,
+        Err(_) => false,
+    }
+}
+
+impl WorkspaceRegistry {
+    fn with_inner(pool: WorkerPool, idle_timeout: Duration) -> Self {
+        Self {
+            inner: Arc::new(WorkspaceRegistryInner {
+                pool,
+                entries: StdMutex::new(HashMap::new()),
+                idle_timeout,
+            }),
+        }
+    }
+
+    pub fn new(pool: WorkerPool, idle_timeout: Duration) -> Self {
+        let registry = Self::with_inner(pool, idle_timeout);
+        registry.spawn_reaper();
+        registry
+    }
+
+    /// Registry for legacy pooled HTTP sessions. Every entry is a legacy
+    /// binding, and the reaper considers only non-legacy leases, so spawning
+    /// one would tick every second for the life of the server and never find
+    /// a candidate.
+    pub fn new_legacy(pool: WorkerPool) -> Self {
+        Self::with_inner(pool, Duration::ZERO)
+    }
+
+    fn entries(&self) -> StdMutexGuard<'_, HashMap<String, Arc<WorkspaceRegistryEntry>>> {
+        match self.inner.entries.lock() {
+            Ok(entries) => entries,
+            Err(poisoned) => {
+                warn!("workspace registry mutex was poisoned; recovering its entries");
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    fn new_entry(&self, owner_id: String, legacy: bool) -> Arc<WorkspaceRegistryEntry> {
+        Arc::new(WorkspaceRegistryEntry {
+            database: Arc::new(WorkspaceDatabase::new(self.inner.pool.clone(), owner_id)),
+            last_used: StdMutex::new(Instant::now()),
+            active_calls: AtomicUsize::new(0),
+            pins: AtomicUsize::new(0),
+            legacy,
+        })
+    }
+
+    pub fn allocate_database(&self) -> WorkspaceLease {
+        let database_id = uuid::Uuid::new_v4().to_string();
+        let entry = self.new_entry(format!("workspace:{database_id}"), false);
+        entry.active_calls.store(1, Ordering::Relaxed);
+        self.entries().insert(database_id.clone(), entry.clone());
+        WorkspaceLease { database_id, entry }
+    }
+
+    pub fn runtime_database(&self) -> Arc<WorkspaceDatabase> {
+        Arc::new(WorkspaceDatabase::new(
+            self.inner.pool.clone(),
+            "workspace-runtime".to_string(),
+        ))
+    }
+
+    pub fn acquire(&self, database_id: &str) -> Option<WorkspaceLease> {
+        let entry = {
+            let entries = self.entries();
+            let entry = entries.get(database_id).cloned()?;
+            // Protect the entry before releasing the registry lock so the
+            // idle reaper cannot remove it between lookup and acquisition.
+            entry.active_calls.fetch_add(1, Ordering::Relaxed);
+            entry
+        };
+        entry.touch();
+        Some(WorkspaceLease {
+            database_id: database_id.to_string(),
+            entry,
+        })
+    }
+
+    pub fn bind_legacy(&self, session_id: String) -> LegacySessionBinding {
+        let database_id = format!("legacy:{}", uuid::Uuid::new_v4());
+        let entry = self.new_entry(session_id, true);
+        let database = entry.database.clone();
+        self.entries().insert(database_id.clone(), entry);
+        LegacySessionBinding {
+            registry: self.clone(),
+            database_id,
+            database,
+        }
+    }
+
+    pub fn remove(&self, database_id: &str) -> Option<Arc<WorkspaceDatabase>> {
+        self.entries()
+            .remove(database_id)
+            .map(|entry| entry.database.clone())
+    }
+
+    pub fn pin(&self, database_id: &str) -> Option<WorkspacePin> {
+        let entry = {
+            let entries = self.entries();
+            let entry = entries.get(database_id).cloned()?;
+            // See `acquire`: pinning and lookup are one reaper-visible state
+            // transition, not two independently scheduled operations.
+            entry.pins.fetch_add(1, Ordering::Relaxed);
+            entry
+        };
+        entry.touch();
+        Some(WorkspacePin { entry })
+    }
+
+    /// Snapshot every workspace database handle for discovery. Legacy
+    /// session bindings are internal routing state and never listed. The
+    /// registry lock is released before probing worker state so one busy
+    /// database cannot stall the listing.
+    pub fn list_databases(&self) -> Vec<WorkspaceDatabaseSummary> {
+        let entries = {
+            let entries = self.entries();
+            let mut collected = Vec::with_capacity(entries.len());
+            for (database_id, entry) in entries.iter() {
+                if !entry.legacy {
+                    collected.push((database_id.clone(), entry.clone()));
+                }
+            }
+            collected
+        };
+        let mut summaries = Vec::with_capacity(entries.len());
+        for (database_id, entry) in entries {
+            let active_calls = entry.active_calls.load(Ordering::Relaxed);
+            let (path, state, debug_pinned) = match entry.database.lease_snapshot() {
+                LeaseSnapshot::Bound { path, debug_pinned } => (
+                    Some(path.display().to_string()),
+                    if active_calls > 0 { "busy" } else { "open" },
+                    debug_pinned,
+                ),
+                LeaseSnapshot::NoWorker => (None, "no_worker", false),
+                LeaseSnapshot::Busy => (None, "busy", false),
+            };
+            summaries.push(WorkspaceDatabaseSummary {
+                database_id,
+                path,
+                state,
+                idle_seconds: entry.idle_for().as_secs(),
+                active_calls,
+                pinned: entry.pins.load(Ordering::Relaxed) > 0,
+                debug_pinned,
+            });
+        }
+        summaries.sort_by(|left, right| left.database_id.cmp(&right.database_id));
+        summaries
+    }
+
+    pub async fn close_database(&self, database_id: &str) -> Result<(), ToolError> {
+        let database = self.remove(database_id).ok_or_else(|| {
+            ToolError::InvalidParams(format!("unknown database_id: {database_id}"))
+        })?;
+        database.close().await
+    }
+
+    pub async fn shutdown(&self) {
+        let databases = {
+            let mut entries = self.entries();
+            entries
+                .drain()
+                .map(|(_, entry)| entry.database.clone())
+                .collect::<Vec<_>>()
+        };
+        // Each close is a child RPC with a teardown-timeout floor; closing
+        // them sequentially would make shutdown scale with database count.
+        join_all(databases.into_iter().map(|database| async move {
+            let _ = database.close().await;
+        }))
+        .await;
+    }
+
+    fn spawn_reaper(&self) {
+        let Ok(runtime) = Handle::try_current() else {
+            return;
+        };
+        let weak = Arc::downgrade(&self.inner);
+        let interval = if self.inner.idle_timeout.is_zero() {
+            Duration::from_secs(1)
+        } else {
+            self.inner
+                .idle_timeout
+                .checked_div(2)
+                .unwrap_or(Duration::from_secs(1))
+                .clamp(Duration::from_secs(1), Duration::from_secs(30))
+        };
+        runtime.spawn(async move {
+            workspace_reaper(weak, interval).await;
+        });
+    }
+}
+
+/// Unguarded workspace leases, which are the reaper's health candidates.
+/// Healthy idle eviction is a later policy decision; transport liveness must
+/// still run when idle eviction is disabled (I9).
+fn collect_reap_candidates(
+    inner: &WorkspaceRegistryInner,
+) -> Vec<(String, Arc<WorkspaceRegistryEntry>)> {
+    let entries = match inner.entries.lock() {
+        Ok(entries) => entries,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let mut candidates = Vec::new();
+    for (id, entry) in entries.iter() {
+        if !entry.legacy
+            && entry.active_calls.load(Ordering::Relaxed) == 0
+            && entry.pins.load(Ordering::Relaxed) == 0
+        {
+            candidates.push((id.clone(), entry.clone()));
+        }
+    }
+    candidates
+}
+
+/// Probe transport health outside the registry lock. Dead workers and
+/// lease-less handles are terminal regardless of TTL; healthy unpinned
+/// entries are eligible only under the idle policy.
+async fn probe_reap_candidates(
+    inner: &WorkspaceRegistryInner,
+    candidates: Vec<(String, Arc<WorkspaceRegistryEntry>)>,
+) -> Vec<(String, WorkspaceReapReason)> {
+    let mut reapable = Vec::new();
+    for (database_id, entry) in candidates {
+        match entry.database.lease_reap_decision().await {
+            LeaseReapDecision::NoLease => {
+                reapable.push((database_id, WorkspaceReapReason::Terminal));
+            }
+            LeaseReapDecision::HealthyUnpinned => {
+                if !inner.idle_timeout.is_zero() && entry.idle_for() >= inner.idle_timeout {
+                    reapable.push((database_id, WorkspaceReapReason::Idle));
+                }
+            }
+            LeaseReapDecision::HealthyPinned | LeaseReapDecision::Busy => {}
+            LeaseReapDecision::DeadWorker(slot) => {
+                warn!(
+                    database_id,
+                    "workspace worker exited out of band; clearing its lease"
+                );
+                inner.pool.mark_dead(&slot).await;
+                reapable.push((database_id, WorkspaceReapReason::Terminal));
+            }
+        }
+    }
+    reapable
+}
+
+/// Re-verify under the registry lock before removal: a call that arrived
+/// while probing raised `active_calls` or refreshed idle time, and any
+/// freshly-set pin implies such a call.
+fn take_expired_entries(
+    inner: &WorkspaceRegistryInner,
+    reapable: Vec<(String, WorkspaceReapReason)>,
+) -> Vec<(String, Arc<WorkspaceDatabase>, WorkspaceReapReason)> {
+    let mut entries = match inner.entries.lock() {
+        Ok(entries) => entries,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let mut expired = Vec::new();
+    for (database_id, reason) in reapable {
+        let still_reapable = entries.get(&database_id).is_some_and(|entry| {
+            !entry.legacy
+                && entry.active_calls.load(Ordering::Relaxed) == 0
+                && entry.pins.load(Ordering::Relaxed) == 0
+                && match reason {
+                    WorkspaceReapReason::Idle => {
+                        !inner.idle_timeout.is_zero() && entry.idle_for() >= inner.idle_timeout
+                    }
+                    WorkspaceReapReason::Terminal => entry.database.lease_is_absent(),
+                }
+        });
+        if still_reapable && let Some(entry) = entries.remove(&database_id) {
+            expired.push((database_id, entry.database.clone(), reason));
+        }
+    }
+    expired
+}
+
+async fn workspace_reaper(inner: Weak<WorkspaceRegistryInner>, interval: Duration) {
+    loop {
+        tokio::time::sleep(interval).await;
+        let Some(inner) = Weak::upgrade(&inner) else {
+            break;
+        };
+        let candidates = collect_reap_candidates(&inner);
+        let reapable = probe_reap_candidates(&inner, candidates).await;
+        for (database_id, database, reason) in take_expired_entries(&inner, reapable) {
+            match reason {
+                WorkspaceReapReason::Idle => {
+                    info!(database_id, "reaping idle workspace database");
+                }
+                WorkspaceReapReason::Terminal => {
+                    info!(database_id, "removing terminal workspace database");
+                }
+            }
+            let _ = database.close().await;
+        }
+    }
+}
+
+impl WorkspaceRegistryEntry {
+    fn touch(&self) {
+        let mut last_used = match self.last_used.lock() {
+            Ok(last_used) => last_used,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *last_used = Instant::now();
+    }
+
+    fn idle_for(&self) -> Duration {
+        let last_used = match self.last_used.lock() {
+            Ok(last_used) => last_used,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        last_used.elapsed()
+    }
+}
+
+impl WorkspaceLease {
+    pub fn database_id(&self) -> &str {
+        &self.database_id
+    }
+
+    pub fn database(&self) -> Arc<WorkspaceDatabase> {
+        self.entry.database.clone()
+    }
+}
+
+impl Drop for WorkspaceLease {
+    fn drop(&mut self) {
+        // Publish the fresh idle timestamp before releasing the guard
+        // (invariant I2). A call outliving the TTL would otherwise expose a
+        // zero guard count alongside its stale timestamp, and a reaper pass
+        // landing in that window would reap a database that was in use one
+        // instant earlier.
+        self.entry.touch();
+        self.entry.active_calls.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl Drop for WorkspacePin {
+    fn drop(&mut self) {
+        // Same ordering rule as WorkspaceLease: timestamp first, then guard.
+        self.entry.touch();
+        self.entry.pins.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl std::ops::Deref for LegacySessionBinding {
+    type Target = WorkspaceDatabase;
+
+    fn deref(&self) -> &Self::Target {
+        &self.database
+    }
+}
+
+impl std::ops::Deref for PooledDatabaseBinding {
+    type Target = WorkspaceDatabase;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Legacy(binding) => binding,
+            Self::Workspace(database) => database,
+        }
+    }
+}
+
+impl Drop for LegacySessionBinding {
+    fn drop(&mut self) {
+        let _ = self.registry.remove(&self.database_id);
+    }
+}
+
+impl WorkspaceDatabase {
     pub fn new(pool: WorkerPool, session_id: String) -> Self {
         Self {
             pool,
@@ -839,6 +1515,114 @@ impl PooledSessionState {
             next_database_generation: AtomicU64::new(0),
             runtime: Handle::try_current().ok(),
         }
+    }
+
+    /// Apply a debug-pin decision produced by a debugger call dispatched on
+    /// `lease` (worker id, database generation). The pin mutates only while
+    /// that exact lease is still installed, so a completion whose worker was
+    /// lost or whose database was replaced applies nothing (invariant I1).
+    async fn set_debug_pin_for_lease(
+        &self,
+        lease: (usize, DatabaseGeneration),
+        pinned: bool,
+    ) -> bool {
+        let mut guard = self.handle.lock().await;
+        let Some(current) = guard.as_mut() else {
+            return false;
+        };
+        if current.handle.worker_id != lease.0 || current.generation != lease.1 {
+            return false;
+        }
+        current.debug_pinned = pinned;
+        true
+    }
+
+    /// Read-only snapshot of this database's worker binding for
+    /// `list_databases`. Uses `try_lock` throughout: a database mid-call
+    /// reports `busy` rather than blocking a discovery request behind a
+    /// long-running analysis.
+    fn lease_snapshot(&self) -> LeaseSnapshot {
+        let Ok(guard) = self.handle.try_lock() else {
+            return LeaseSnapshot::Busy;
+        };
+        let Some(lease) = guard.as_ref() else {
+            return LeaseSnapshot::NoWorker;
+        };
+        // `call_lock` covers the complete remote operation, including
+        // background opens whose registry-level active-call guard has already
+        // been released. Holding it also prevents a call from starting while
+        // the child state below is being classified.
+        let Ok(_call_guard) = lease.handle.slot.call_lock.try_lock() else {
+            return LeaseSnapshot::Busy;
+        };
+        // Contention is reported as busy rather than as a bound worker with
+        // an unknown path: `open` with `path: null` would misdescribe a
+        // database that is simply mid-call.
+        let Ok(child) = lease.handle.slot.child.try_lock() else {
+            return LeaseSnapshot::Busy;
+        };
+        // A closed transport means the worker is gone even though the lease
+        // survives until a dispatch or the reaper clears it. Reporting it as
+        // `open` would advertise a handle no call can serve.
+        if child.transport_closed() {
+            return LeaseSnapshot::NoWorker;
+        }
+        // The worker lease is installed before open_idb starts, while the
+        // path is published only after that call succeeds. The narrow
+        // post-call handoff must remain busy rather than claiming an open
+        // database without an addressable path.
+        let Some(path) = child.idb_path.clone() else {
+            return LeaseSnapshot::Busy;
+        };
+        LeaseSnapshot::Bound {
+            path,
+            debug_pinned: lease.debug_pinned,
+        }
+    }
+
+    /// Reaper-side lease-health and debug-pin gate. Contended state reads as busy so the
+    /// reaper never blocks behind an in-flight call, and no cross-atomic
+    /// ordering contract is needed. A pinned lease whose worker transport
+    /// already closed is reported as terminal worker loss: without this probe
+    /// an out-of-band child exit would leave the pinned lease installed
+    /// forever, because only dispatch paths clear handles (invariants I1/I2).
+    ///
+    /// Worker liveness is the only signal available here. IDA's
+    /// `debugger_process_state` is a cached getter, so a target killed
+    /// outside ida-mcp keeps reporting its last state until some call drains
+    /// the pending debug event; asking for it from the reaper cannot prove
+    /// the target exited. A session whose target dies externally therefore
+    /// stays pinned until `debug_stop`, `close_idb`, or worker loss — a
+    /// documented limitation, not silent cleanup.
+    async fn lease_reap_decision(&self) -> LeaseReapDecision {
+        let Ok(mut guard) = self.handle.try_lock() else {
+            return LeaseReapDecision::Busy;
+        };
+        let Some(lease) = guard.as_ref() else {
+            return LeaseReapDecision::NoLease;
+        };
+        let Ok(child) = lease.handle.slot.child.try_lock() else {
+            return LeaseReapDecision::Busy;
+        };
+        let worker_unavailable = child.state == ChildState::Dead || child.transport_closed();
+        drop(child);
+        if !worker_unavailable {
+            return if lease.debug_pinned {
+                LeaseReapDecision::HealthyPinned
+            } else {
+                LeaseReapDecision::HealthyUnpinned
+            };
+        }
+        let Some(lease) = guard.take() else {
+            return LeaseReapDecision::NoLease;
+        };
+        LeaseReapDecision::DeadWorker(lease.handle.slot)
+    }
+
+    /// Re-verify that terminal worker loss did not race a new open that
+    /// installed a replacement lease.
+    fn lease_is_absent(&self) -> bool {
+        self.handle.try_lock().is_ok_and(|lease| lease.is_none())
     }
 
     fn next_database_generation(&self) -> Result<DatabaseGeneration, ToolError> {
@@ -868,6 +1652,7 @@ impl PooledSessionState {
         *guard = Some(PooledDatabaseLease {
             handle: handle.clone(),
             generation,
+            debug_pinned: false,
         });
         Ok((handle, generation, true))
     }
@@ -882,11 +1667,11 @@ impl PooledSessionState {
     async fn required_handle_for_generation(
         &self,
         expected_generation: Option<DatabaseGeneration>,
-    ) -> Result<PooledWorkerHandle, ToolError> {
+    ) -> Result<(PooledWorkerHandle, DatabaseGeneration), ToolError> {
         let guard = self.handle.lock().await;
         let lease = guard.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
         require_lease_generation(lease.generation, expected_generation)?;
-        Ok(lease.handle.clone())
+        Ok((lease.handle.clone(), lease.generation))
     }
 
     async fn take_handle(&self) -> Option<PooledDatabaseLease> {
@@ -899,14 +1684,22 @@ impl PooledSessionState {
         }
     }
 
-    async fn clear_handle_if_worker(&self, worker_id: usize) {
+    /// Unbind a lost worker. Returns whether the cleared lease held a debug
+    /// pin, so the caller can report a live debugger session ending with its
+    /// worker instead of a bare transport error.
+    async fn clear_handle_if_worker(&self, worker_id: usize) -> bool {
         let mut guard = self.handle.lock().await;
         if guard
             .as_ref()
             .is_some_and(|lease| lease.handle.worker_id == worker_id)
         {
+            // The debug pin lives inside the lease, so dropping the lease
+            // erases it structurally (invariant I1) — no separate cleanup.
+            let debug_pinned = guard.as_ref().is_some_and(|lease| lease.debug_pinned);
             *guard = None;
+            return debug_pinned;
         }
+        false
     }
 
     /// Call a child tool, optionally bound to one database lifetime (see
@@ -919,29 +1712,68 @@ impl PooledSessionState {
         cancel: Option<CancellationToken>,
         expected_generation: Option<DatabaseGeneration>,
     ) -> Result<CallToolResult, ToolError> {
-        let handle = self
+        self.dispatch_result_for_generation(tool, args, timeout_secs, cancel, expected_generation)
+            .await
+            .result
+    }
+
+    /// Like [`Self::call_result_for_generation`], but also reports which
+    /// lease (worker id, database generation) served the call — even when the
+    /// call itself failed — so debugger completions can bind their pin
+    /// decision to the exact ownership that produced them (invariant I1).
+    async fn dispatch_result_for_generation(
+        &self,
+        tool: &'static str,
+        args: Value,
+        timeout_secs: Option<u64>,
+        cancel: Option<CancellationToken>,
+        expected_generation: Option<DatabaseGeneration>,
+    ) -> DispatchedCall {
+        let (handle, generation) = match self
             .required_handle_for_generation(expected_generation)
-            .await?;
-        let timeout = self.pool.worker_op_timeout(timeout_secs);
-        match handle
-            .call_tool(tool, remote::json_object(args)?, timeout, cancel)
             .await
         {
+            Ok(dispatched) => dispatched,
+            Err(err) => {
+                return DispatchedCall {
+                    result: Err(err),
+                    lease: None,
+                };
+            }
+        };
+        let lease = Some((handle.worker_id, generation));
+        let args = match remote::json_object(args) {
+            Ok(args) => args,
+            Err(err) => {
+                return DispatchedCall {
+                    result: Err(err),
+                    lease,
+                };
+            }
+        };
+        let timeout = self.pool.worker_op_timeout(timeout_secs);
+        let result = match handle.call_tool(tool, args, timeout, cancel, None).await {
             Ok(result) => {
                 if let Some(err) = remote::result_error(&result, tool) {
-                    if child_tool_error_retires_worker(&err) {
-                        self.clear_handle_if_worker(handle.worker_id).await;
+                    if child_tool_error_retires_worker(tool, &err) {
+                        let mut retire_guard = WorkerRetireGuard::call(&handle, tool);
+                        let debug_pinned = self.clear_handle_if_worker(handle.worker_id).await;
                         self.pool.mark_dead(&handle.slot).await;
+                        retire_guard.disarm();
+                        Err(debugger_worker_loss_error(tool, err, debug_pinned))
+                    } else {
+                        Err(err)
                     }
-                    return Err(err);
+                } else {
+                    Ok(result)
                 }
-                Ok(result)
             }
             Err(err) => {
-                self.clear_handle_if_worker(handle.worker_id).await;
-                Err(err)
+                let debug_pinned = self.clear_handle_if_worker(handle.worker_id).await;
+                Err(debugger_worker_loss_error(tool, err, debug_pinned))
             }
-        }
+        };
+        DispatchedCall { result, lease }
     }
 
     async fn call_json<T: DeserializeOwned>(
@@ -1050,6 +1882,7 @@ impl PooledSessionState {
         rebuild: bool,
         file_type: Option<String>,
         auto_analyse: bool,
+        raw_target: RawBinaryTarget,
         extra_args: Vec<String>,
         idb_out: Option<String>,
         timeout_secs: Option<u64>,
@@ -1065,6 +1898,7 @@ impl PooledSessionState {
             rebuild,
             file_type,
             auto_analyse,
+            raw_target,
             extra_args,
             idb_out,
             timeout_secs,
@@ -1086,6 +1920,7 @@ impl PooledSessionState {
         rebuild: bool,
         file_type: Option<String>,
         auto_analyse: bool,
+        raw_target: RawBinaryTarget,
         extra_args: Vec<String>,
         idb_out: Option<String>,
         timeout_secs: Option<u64>,
@@ -1094,6 +1929,7 @@ impl PooledSessionState {
     ) -> Result<OpenedDatabase, ToolError> {
         let (handle, generation, fresh_lease) = self.lease_for_open().await?;
         let timeout = self.pool.worker_op_timeout(timeout_secs);
+        let open_dispatch = OpenDispatch::for_request(path, idb_out.as_deref(), rebuild);
         let result = handle
             .call_tool(
                 "open_idb",
@@ -1106,12 +1942,14 @@ impl PooledSessionState {
                     rebuild,
                     file_type,
                     auto_analyse,
+                    raw_target,
                     extra_args,
                     idb_out,
                     timeout_secs,
                 ))?,
                 timeout,
                 cancel,
+                Some(open_dispatch),
             )
             .await;
 
@@ -1170,6 +2008,128 @@ impl PooledSessionState {
             None,
         )
         .await
+    }
+
+    pub async fn debug_launch(
+        &self,
+        path: &str,
+        arguments: Option<String>,
+        start_directory: Option<String>,
+        timeout_seconds: u32,
+    ) -> Result<Value, ToolError> {
+        self.debug_start(
+            "debug_launch",
+            json!({
+                "path": path,
+                "arguments": arguments,
+                "start_directory": start_directory,
+                "timeout_secs": timeout_seconds,
+            }),
+            timeout_seconds,
+        )
+        .await
+    }
+
+    pub async fn debug_attach(&self, pid: u32, timeout_seconds: u32) -> Result<Value, ToolError> {
+        self.debug_start(
+            "debug_attach",
+            json!({ "pid": pid, "timeout_secs": timeout_seconds }),
+            timeout_seconds,
+        )
+        .await
+    }
+
+    /// Dispatch a debugger start and pin this database while the child owns a
+    /// live process. The pin is applied against the exact lease that served
+    /// the call, so a completion that raced worker loss or a database
+    /// replacement pins nothing (invariant I1) — the session it reports died
+    /// with its worker.
+    async fn debug_start(
+        &self,
+        tool: &'static str,
+        args: Value,
+        timeout_seconds: u32,
+    ) -> Result<Value, ToolError> {
+        let dispatched = self
+            .dispatch_result_for_generation(
+                tool,
+                args,
+                Some(debugger_response_timeout_secs(timeout_seconds)),
+                None,
+                None,
+            )
+            .await;
+        let result = dispatched
+            .result
+            .and_then(|result| remote::parse_value(result, tool));
+        if debug_start_retains_session(&result) {
+            let pinned = match dispatched.lease {
+                Some(lease) => self.set_debug_pin_for_lease(lease, true).await,
+                None => false,
+            };
+            if !pinned {
+                // The session this result reports died with its worker before
+                // it could be tracked. Returning the original success-shaped
+                // result would tell the client it owns a live session, so the
+                // outcome is replaced with the truth.
+                warn!(
+                    session_id = %self.session_id,
+                    tool,
+                    "retained debugger session lost its lease before pinning; \
+                     reporting the session as lost"
+                );
+                // Do not claim the debuggee ended. A worker killed outside
+                // its own control (SIGKILL, crash) never runs
+                // DebuggerRuntime::drop, so its debug-server helper is
+                // reparented rather than terminated and can keep the target
+                // process alive.
+                return Err(ToolError::DebuggerSessionLost(format!(
+                    "{tool} started a debugger session, but its worker was lost before the \
+                     session could be tracked; ida-mcp no longer controls that session and the \
+                     target process may still be running — check for a stray debuggee before \
+                     retrying {tool}"
+                )));
+            }
+        }
+        result
+    }
+
+    pub async fn debug_modules(&self) -> Result<Value, ToolError> {
+        self.call_value(
+            "debug_modules",
+            json!({}),
+            Some(DEBUG_MODULES_TIMEOUT_SECS),
+            None,
+        )
+        .await
+    }
+
+    pub async fn debug_stop(
+        &self,
+        action: DebugStopAction,
+        timeout_seconds: u32,
+    ) -> Result<Value, ToolError> {
+        let dispatched = self
+            .dispatch_result_for_generation(
+                "debug_stop",
+                json!({ "action": action.as_str(), "timeout_secs": timeout_seconds }),
+                Some(debugger_response_timeout_secs(timeout_seconds)),
+                None,
+                None,
+            )
+            .await;
+        let result = dispatched
+            .result
+            .and_then(|result| remote::parse_value(result, "debug_stop"));
+        // A successful stop ended ownership for the lease that served it; a
+        // failed stop keeps the session (and its pin) fail-closed. A stale
+        // lease needs no clearing — its pin died with it.
+        if result.is_ok()
+            && let Some(lease) = dispatched.lease
+        {
+            let _ = self.set_debug_pin_for_lease(lease, false).await;
+        }
+        result
     }
 
     pub async fn analysis_status(&self) -> Result<AnalysisStatus, ToolError> {
@@ -1264,6 +2224,21 @@ impl PooledSessionState {
         self.call_text(
             "disasm",
             json!({ "address": remote::hex_addr(addr), "count": count }),
+            None,
+            None,
+        )
+        .await
+    }
+
+    pub async fn render_range(
+        &self,
+        start: u64,
+        end: u64,
+        max_lines: usize,
+    ) -> Result<Value, ToolError> {
+        self.call_value(
+            "render_range",
+            json!({ "start": remote::hex_addr(start), "end": remote::hex_addr(end), "max_lines": max_lines }),
             None,
             None,
         )
@@ -1653,6 +2628,27 @@ impl PooledSessionState {
         .await
     }
 
+    pub async fn list_patches(
+        &self,
+        start: Option<u64>,
+        end: Option<u64>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Value, ToolError> {
+        self.call_value(
+            "list_patches",
+            json!({
+                "start": remote::opt_hex_addr(start),
+                "end": remote::opt_hex_addr(end),
+                "offset": offset,
+                "limit": limit,
+            }),
+            None,
+            None,
+        )
+        .await
+    }
+
     pub async fn set_comments(
         &self,
         addr: Option<u64>,
@@ -2008,12 +3004,13 @@ impl PooledSessionState {
     pub async fn callgraph(
         &self,
         addr: u64,
+        direction: CallGraphDirection,
         max_depth: usize,
         max_nodes: usize,
     ) -> Result<Value, ToolError> {
         self.call_value(
             "callgraph",
-            json!({ "roots": remote::hex_addr(addr), "max_depth": max_depth, "max_nodes": max_nodes }),
+            json!({ "roots": remote::hex_addr(addr), "direction": direction.as_str(), "max_depth": max_depth, "max_nodes": max_nodes }),
             None,
             None,
         )
@@ -2085,7 +3082,7 @@ impl PooledSessionState {
     }
 }
 
-impl Drop for PooledSessionState {
+impl Drop for WorkspaceDatabase {
     fn drop(&mut self) {
         let pool = self.pool.clone();
         let handle_slot = self.handle.clone();
@@ -2116,6 +3113,7 @@ fn open_idb_child_args(
     rebuild: bool,
     file_type: Option<String>,
     auto_analyse: bool,
+    raw_target: RawBinaryTarget,
     extra_args: Vec<String>,
     idb_out: Option<String>,
     timeout_secs: Option<u64>,
@@ -2129,6 +3127,10 @@ fn open_idb_child_args(
         "rebuild": rebuild,
         "file_type": file_type,
         "auto_analyse": auto_analyse,
+        "processor": raw_target.processor,
+        "bitness": raw_target.bitness.map(idalib::segment::Bitness::bits),
+        "base_address": raw_target.base_address.map(remote::hex_addr),
+        "entry_point": raw_target.entry_point.map(remote::hex_addr),
         "_worker_extra_args": extra_args,
         "_worker_idb_out": idb_out,
         "timeout_secs": timeout_secs,
@@ -2254,16 +3256,34 @@ fn release_error_retires_worker(err: &ToolError) -> bool {
         ToolError::Timeout(_)
             | ToolError::TimeoutDetailed(_)
             | ToolError::Cancelled(_)
+            | ToolError::DebuggerTeardown(_)
             | ToolError::WorkerCrashed { .. }
             | ToolError::RemoteProtocol(_)
             | ToolError::WorkerClosed
     )
 }
 
-fn child_tool_error_retires_worker(err: &ToolError) -> bool {
-    matches!(
+fn child_tool_error_retires_worker(tool: &str, err: &ToolError) -> bool {
+    if matches!(
         err,
         ToolError::WorkerClosed | ToolError::WorkerCrashed { .. } | ToolError::RemoteProtocol(_)
+    ) {
+        return true;
+    }
+
+    matches!(
+        tool,
+        "debug_launch" | "debug_attach" | "debug_modules" | "debug_stop"
+    ) && matches!(err, ToolError::Timeout(_) | ToolError::TimeoutDetailed(_))
+}
+
+fn unsettled_open_error_retires_worker(err: &ToolError) -> bool {
+    matches!(
+        err,
+        ToolError::Timeout(_)
+            | ToolError::TimeoutDetailed(_)
+            | ToolError::Cancelled(_)
+            | ToolError::WorkerClosed
     )
 }
 
@@ -2335,16 +3355,26 @@ fn log_stderr_line(worker_id: usize, line: &[u8]) {
 #[cfg(test)]
 mod tests {
     use crate::error::ToolError;
+    use crate::ida::handlers::debugger::DEBUGGER_TEARDOWN_TIMEOUT_SECS;
     use crate::ida::pool::{
-        analyze_funcs_child_args, child_tool_error_retires_worker, extract_first_matches,
-        find_bytes_child_args, lumina_apply_child_args, open_error_releases_lease,
-        open_idb_child_args, release_error_retires_worker, require_lease_generation,
-        run_script_child_args, search_child_args, WorkerPool, WorkerPoolConfig,
+        analyze_funcs_child_args, child_tool_error_retires_worker, debug_start_retains_session,
+        debugger_worker_loss_error, extract_first_matches, find_bytes_child_args,
+        lumina_apply_child_args, open_error_releases_lease, open_idb_child_args,
+        release_error_retires_worker, require_lease_generation, run_script_child_args,
+        search_child_args, unsettled_open_error_retires_worker, LeaseReapDecision, OpenDispatch,
+        WorkerPool, WorkerPoolConfig, WorkspaceRegistry, CHILD_TIMEOUT_GRACE_SECS,
+        MIN_CHILD_CLOSE_RPC_TIMEOUT_SECS,
     };
-    use crate::ida::types::{ConditionalCloseResult, DatabaseGeneration};
+    use crate::ida::types::{ConditionalCloseResult, DatabaseGeneration, RawBinaryTarget};
+    use crate::ida::worker::{
+        debugger_response_timeout_secs, CLOSE_SEND_TIMEOUT_SECS, DEBUG_MODULES_TIMEOUT_SECS,
+    };
     use serde_json::json;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
+    use std::time::Instant;
 
     fn test_pool(max_workers: usize) -> WorkerPool {
         WorkerPool::new(WorkerPoolConfig {
@@ -2355,6 +3385,316 @@ mod tests {
             exe_path: PathBuf::from("/does/not/spawn/in/this/test"),
             worker_args: Vec::new(),
         })
+    }
+
+    #[tokio::test]
+    async fn workspace_and_legacy_bindings_share_one_registry_map() {
+        let registry = WorkspaceRegistry::new(test_pool(4), Duration::ZERO);
+        let first = registry.allocate_database();
+        let second = registry.allocate_database();
+        assert_ne!(first.database_id(), second.database_id());
+        assert_eq!(registry.entries().len(), 2);
+
+        let first_id = first.database_id().to_string();
+        drop(first);
+        let first_entry = registry
+            .entries()
+            .get(&first_id)
+            .cloned()
+            .expect("allocated database remains registered");
+        assert_eq!(first_entry.active_calls.load(Ordering::Relaxed), 0);
+        let acquired = registry
+            .acquire(&first_id)
+            .expect("database remains routed");
+        assert_eq!(acquired.database_id(), first_id);
+        assert_eq!(first_entry.active_calls.load(Ordering::Relaxed), 1);
+        let pin = registry.pin(&first_id).expect("database can be pinned");
+        assert_eq!(first_entry.pins.load(Ordering::Relaxed), 1);
+        drop(pin);
+        assert_eq!(first_entry.pins.load(Ordering::Relaxed), 0);
+        drop(acquired);
+        assert_eq!(first_entry.active_calls.load(Ordering::Relaxed), 0);
+
+        let legacy = registry.bind_legacy("legacy-test".to_string());
+        assert_eq!(registry.entries().len(), 3);
+        drop(legacy);
+        assert_eq!(registry.entries().len(), 2);
+
+        assert!(registry.remove(&first_id).is_some());
+        let second_id = second.database_id().to_string();
+        drop(second);
+        assert!(registry.remove(&second_id).is_some());
+        assert!(registry.entries().is_empty());
+        registry.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn workspace_idle_reaper_respects_every_lifetime_guard() {
+        let registry = WorkspaceRegistry::new(test_pool(4), Duration::from_millis(10));
+
+        let idle = registry.allocate_database();
+        let idle_id = idle.database_id().to_string();
+        drop(idle);
+
+        let active = registry.allocate_database();
+        let active_id = active.database_id().to_string();
+
+        let pinned = registry.allocate_database();
+        let pinned_id = pinned.database_id().to_string();
+        let pin = registry
+            .pin(&pinned_id)
+            .expect("allocated database can be pinned");
+        drop(pinned);
+
+        // A held handle mutex stands in for a live debugger dispatch: the
+        // reaper's try_lock read must treat contention as pinned/busy.
+        let debug_busy = registry.allocate_database();
+        let debug_busy_id = debug_busy.database_id().to_string();
+        let debug_busy_database = debug_busy.database();
+        let debug_busy_guard = debug_busy_database.handle.lock().await;
+        drop(debug_busy);
+
+        let legacy = registry.bind_legacy("legacy-reaper-test".to_string());
+        let legacy_id = legacy.database_id.clone();
+
+        // The production reaper interval is clamped to one second. Waiting
+        // past its first pass exercises the actual spawned lifecycle rather
+        // than only restating its selection predicate in a helper test.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+
+        {
+            let entries = registry.entries();
+            assert!(!entries.contains_key(&idle_id));
+            assert!(entries.contains_key(&active_id));
+            assert!(entries.contains_key(&pinned_id));
+            assert!(entries.contains_key(&debug_busy_id));
+            assert!(entries.contains_key(&legacy_id));
+        }
+
+        drop(active);
+        drop(pin);
+        drop(debug_busy_guard);
+        drop(legacy);
+        registry.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn workspace_zero_ttl_still_reaps_terminal_no_lease_handles() {
+        let registry = WorkspaceRegistry::new(test_pool(3), Duration::ZERO);
+
+        let terminal = registry.allocate_database();
+        let terminal_id = terminal.database_id().to_string();
+        drop(terminal);
+
+        let active = registry.allocate_database();
+        let active_id = active.database_id().to_string();
+
+        let pinned = registry.allocate_database();
+        let pinned_id = pinned.database_id().to_string();
+        let pin = registry
+            .pin(&pinned_id)
+            .expect("allocated database can be pinned");
+        drop(pinned);
+
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+
+        {
+            let entries = registry.entries();
+            assert!(
+                !entries.contains_key(&terminal_id),
+                "zero TTL disables healthy idle eviction, not terminal cleanup"
+            );
+            assert!(entries.contains_key(&active_id));
+            assert!(entries.contains_key(&pinned_id));
+        }
+
+        drop(active);
+        drop(pin);
+        registry.shutdown().await;
+    }
+
+    /// Lifecycle invariant I1: a debug pin exists only inside a worker lease,
+    /// so it structurally cannot outlive the ownership that produced it. A
+    /// pin decision from a dispatch whose lease is gone applies nothing, a
+    /// lease-less database never reports a blocking pin, and a contended
+    /// lease mutex reads as busy. The matching-lease apply path needs a live
+    /// pooled worker and is covered by the debugger integration tests.
+    #[tokio::test]
+    async fn debug_pin_cannot_exist_without_its_lease() {
+        let registry = WorkspaceRegistry::new(test_pool(2), Duration::from_secs(300));
+        let lease = registry.allocate_database();
+        let database = lease.database();
+
+        // A completion for a lease that no longer exists applies nothing.
+        assert!(
+            !database
+                .set_debug_pin_for_lease((7, DatabaseGeneration(1)), true)
+                .await
+        );
+        let LeaseReapDecision::NoLease = database.lease_reap_decision().await else {
+            panic!("a lease-less database must not report a blocking pin");
+        };
+
+        // Worker loss with no lease installed is a no-op, not a panic.
+        database.clear_handle_if_worker(7).await;
+        let LeaseReapDecision::NoLease = database.lease_reap_decision().await else {
+            panic!("worker loss without a lease must leave the entry reapable");
+        };
+
+        // A contended lease mutex reads as busy rather than unpinned.
+        let guard = database.handle.lock().await;
+        let LeaseReapDecision::Busy = database.lease_reap_decision().await else {
+            panic!("a contended lease mutex must read as busy");
+        };
+        drop(guard);
+
+        drop(lease);
+        registry.shutdown().await;
+    }
+
+    /// Lifecycle invariant I2: a guard release must never expose a zero
+    /// guard count beside a stale idle timestamp, or a reaper pass landing in
+    /// that window reaps a database that was in use an instant earlier. A
+    /// concurrent sampler watches for that pair while long-idle leases are
+    /// released; with the decrement ordered first it is observable, with the
+    /// timestamp published first it cannot occur.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guard_release_refreshes_idle_time_before_dropping_its_count() {
+        let registry = WorkspaceRegistry::new(test_pool(2), Duration::from_secs(300));
+        let lease = registry.allocate_database();
+        let database_id = lease.database_id().to_string();
+        drop(lease);
+        let entry = registry
+            .entries()
+            .get(&database_id)
+            .cloned()
+            .expect("allocated database remains registered");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let violations = Arc::new(AtomicUsize::new(0));
+        let sampler = {
+            let entry = entry.clone();
+            let stop = stop.clone();
+            let violations = violations.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    // Read the timestamp and both counts as one snapshot,
+                    // holding the lock `touch` uses. Sampling them as three
+                    // independent loads would report torn states that never
+                    // existed simultaneously.
+                    let idle = {
+                        let last_used = match entry.last_used.lock() {
+                            Ok(last_used) => last_used,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        let idle = last_used.elapsed();
+                        let guards = entry.active_calls.load(Ordering::Relaxed)
+                            + entry.pins.load(Ordering::Relaxed);
+                        (guards == 0).then_some(idle)
+                    };
+                    if idle.is_some_and(|idle| idle >= Duration::from_secs(30)) {
+                        violations.fetch_add(1, Ordering::Relaxed);
+                    }
+                    std::hint::spin_loop();
+                }
+            })
+        };
+
+        let stale = Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .expect("test clock supports a 60s offset");
+        for _ in 0..5_000 {
+            let held = registry.acquire(&database_id).expect("database is routed");
+            match entry.last_used.lock() {
+                Ok(mut last_used) => *last_used = stale,
+                Err(poisoned) => *poisoned.into_inner() = stale,
+            }
+            drop(held);
+
+            let pin = registry.pin(&database_id).expect("database can be pinned");
+            match entry.last_used.lock() {
+                Ok(mut last_used) => *last_used = stale,
+                Err(poisoned) => *poisoned.into_inner() = stale,
+            }
+            drop(pin);
+        }
+        stop.store(true, Ordering::Relaxed);
+        sampler.join().expect("sampler thread finishes");
+
+        assert_eq!(
+            violations.load(Ordering::Relaxed),
+            0,
+            "a released guard exposed a stale idle timestamp to a concurrent reaper"
+        );
+        registry.shutdown().await;
+    }
+
+    /// Every known or possible debugger-session loss must be reported
+    /// truthfully — never as a bare timeout — without claiming the debuggee
+    /// ended. Unrelated losses keep their original error.
+    #[test]
+    fn retiring_a_debugger_worker_reports_session_loss_truthfully() {
+        let wedged = debugger_worker_loss_error(
+            "debug_modules",
+            ToolError::Timeout(DEBUG_MODULES_TIMEOUT_SECS),
+            true,
+        );
+        let ToolError::DebuggerSessionLost(message) = &wedged else {
+            panic!("a wedged debugger worker must report a lost session, got: {wedged}");
+        };
+        assert!(message.contains("debug_modules"));
+        assert!(message.contains("may still be running"));
+        assert!(!message.contains("ended with the worker"));
+
+        let crashed = debugger_worker_loss_error(
+            "debug_modules",
+            ToolError::WorkerCrashed {
+                worker_id: 3,
+                last_op: "debug_modules".to_string(),
+            },
+            true,
+        );
+        assert!(matches!(crashed, ToolError::DebuggerSessionLost(_)));
+
+        // No debugger session: the original error survives unchanged.
+        let plain = debugger_worker_loss_error(
+            "run_script",
+            ToolError::Timeout(DEBUG_MODULES_TIMEOUT_SECS),
+            false,
+        );
+        assert!(matches!(plain, ToolError::Timeout(_)));
+
+        let uncertain_launch =
+            debugger_worker_loss_error("debug_launch", ToolError::Timeout(5), false);
+        let ToolError::DebuggerSessionLost(message) = uncertain_launch else {
+            panic!("a timed-out debugger start must report possible target loss");
+        };
+        assert!(message.contains("cannot determine whether the debugger started"));
+        assert!(message.contains("may still be running"));
+    }
+
+    /// Ownership signals that must pin: an explicit `session_retained`
+    /// result or the dedicated retained-start error, and nothing else.
+    #[test]
+    fn debug_start_pins_whenever_worker_retains_ownership() {
+        assert!(debug_start_retains_session(&Ok(json!({
+            "status": "ready",
+            "session_retained": true
+        }))));
+        assert!(debug_start_retains_session(&Ok(json!({
+            "status": "user_action_required",
+            "session_retained": true
+        }))));
+        assert!(!debug_start_retains_session(&Ok(json!({
+            "status": "user_action_required",
+            "session_retained": false
+        }))));
+        assert!(debug_start_retains_session(&Err(
+            ToolError::DebuggerStartRetained("initial wait failed".to_string())
+        )));
+        assert!(!debug_start_retains_session(&Err(ToolError::IdaError(
+            "start failed before process creation".to_string()
+        ))));
     }
 
     #[test]
@@ -2397,7 +3737,50 @@ mod tests {
     }
 
     #[test]
-    fn pooled_observed_child_args_forward_timeouts() {
+    fn debugger_timeout_layers_are_strictly_nested() {
+        let pool = test_pool(1);
+        let sdk_timeout = 120;
+        let child_timeout = debugger_response_timeout_secs(sdk_timeout);
+        let parent_timeout = pool.worker_op_timeout(Some(child_timeout)).as_secs();
+
+        assert!(u64::from(sdk_timeout) < child_timeout);
+        assert!(child_timeout < parent_timeout);
+        assert_eq!(
+            MIN_CHILD_CLOSE_RPC_TIMEOUT_SECS,
+            CLOSE_SEND_TIMEOUT_SECS
+                + u64::from(DEBUGGER_TEARDOWN_TIMEOUT_SECS)
+                + CHILD_TIMEOUT_GRACE_SECS
+        );
+        assert!(
+            CLOSE_SEND_TIMEOUT_SECS + u64::from(DEBUGGER_TEARDOWN_TIMEOUT_SECS)
+                < MIN_CHILD_CLOSE_RPC_TIMEOUT_SECS,
+            "close_idb must leave time to pack the IDB and return after debugger teardown"
+        );
+        assert_eq!(
+            pool.close_rpc_timeout(),
+            pool.config.worker_op_timeout,
+            "the configured operation budget should remain available for IDB packing"
+        );
+
+        let short_pool = WorkerPool::new(WorkerPoolConfig {
+            worker_op_timeout: Duration::from_secs(1),
+            ..pool.config.as_ref().clone()
+        });
+        assert_eq!(
+            short_pool.close_rpc_timeout(),
+            Duration::from_secs(MIN_CHILD_CLOSE_RPC_TIMEOUT_SECS),
+            "configuration must not undercut the bounded child cleanup phases"
+        );
+    }
+
+    #[test]
+    fn pooled_observed_child_args_forward_timeouts_and_raw_target() {
+        let raw_target = RawBinaryTarget {
+            processor: Some("arm:ARMv7-M".to_string()),
+            bitness: Some(idalib::segment::Bitness::Bits32),
+            base_address: Some(0x0800_0000),
+            entry_point: Some(0x0800_0100),
+        };
         let open_args = open_idb_child_args(
             "/tmp/a",
             true,
@@ -2407,12 +3790,17 @@ mod tests {
             false,
             Some("pe".to_string()),
             true,
+            raw_target,
             vec!["-A".to_string()],
             Some("/tmp/a.out.i64".to_string()),
             Some(600),
         );
         assert_eq!(open_args["timeout_secs"], json!(600));
         assert_eq!(open_args["rebuild"], json!(false));
+        assert_eq!(open_args["processor"], json!("arm:ARMv7-M"));
+        assert_eq!(open_args["bitness"], json!(32));
+        assert_eq!(open_args["base_address"], json!("0x8000000"));
+        assert_eq!(open_args["entry_point"], json!("0x8000100"));
         assert_eq!(open_args["_worker_idb_out"], json!("/tmp/a.out.i64"));
 
         let analyze_args = analyze_funcs_child_args(Some(600), false);
@@ -2425,6 +3813,40 @@ mod tests {
 
         let script_args = run_script_child_args("print(1)", Some(30));
         assert_eq!(script_args["timeout_secs"], json!(30));
+    }
+
+    #[test]
+    fn open_dispatch_tracks_the_effective_output_before_child_dispatch() {
+        let dir =
+            std::env::temp_dir().join(format!("ida-mcp-open-dispatch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create open dispatch fixture directory");
+        let input = dir.join("firmware.bin");
+        let output = dir.join("custom.i64");
+        std::fs::write(&input, b"raw").expect("write raw input");
+
+        let new_output = OpenDispatch::for_request(
+            &input.display().to_string(),
+            Some(&output.display().to_string()),
+            false,
+        );
+        assert_eq!(new_output.database_path, output);
+        assert!(
+            new_output.artifacts.is_some(),
+            "a new raw output needs forced-retirement cleanup"
+        );
+
+        std::fs::write(&output, b"existing database").expect("write existing output");
+        let reuse = OpenDispatch::for_request(
+            &input.display().to_string(),
+            Some(&output.display().to_string()),
+            false,
+        );
+        assert!(
+            reuse.artifacts.is_none(),
+            "verified reuse must not claim ownership of existing artifacts"
+        );
+
+        std::fs::remove_dir_all(dir).expect("remove open dispatch fixture directory");
     }
 
     #[test]
@@ -2470,14 +3892,38 @@ mod tests {
     }
 
     #[test]
-    fn child_tool_error_retire_decision_keeps_routine_timeouts_reusable() {
+    fn child_tool_error_retire_decision_is_operation_specific() {
         assert!(!child_tool_error_retires_worker(
+            "run_script",
             &ToolError::TimeoutDetailed("run_script timed out after 5 seconds".to_string())
         ));
-        assert!(!child_tool_error_retires_worker(&ToolError::Cancelled(
-            "run_script cancelled".to_string()
-        )));
-        assert!(child_tool_error_retires_worker(&ToolError::WorkerClosed));
+        assert!(!child_tool_error_retires_worker(
+            "run_script",
+            &ToolError::Cancelled("run_script cancelled".to_string())
+        ));
+        for tool in [
+            "debug_launch",
+            "debug_attach",
+            "debug_modules",
+            "debug_stop",
+        ] {
+            assert!(child_tool_error_retires_worker(
+                tool,
+                &ToolError::Timeout(DEBUG_MODULES_TIMEOUT_SECS)
+            ));
+            assert!(child_tool_error_retires_worker(
+                tool,
+                &ToolError::TimeoutDetailed(format!("{tool} timed out"))
+            ));
+        }
+        assert!(!child_tool_error_retires_worker(
+            "debug_status",
+            &ToolError::Timeout(5)
+        ));
+        assert!(child_tool_error_retires_worker(
+            "run_script",
+            &ToolError::WorkerClosed
+        ));
     }
 
     #[test]
@@ -2487,6 +3933,9 @@ mod tests {
         )));
         assert!(release_error_retires_worker(&ToolError::Timeout(5)));
         assert!(release_error_retires_worker(&ToolError::WorkerClosed));
+        assert!(release_error_retires_worker(&ToolError::DebuggerTeardown(
+            "terminal event missing".to_string()
+        )));
     }
 
     #[test]
@@ -2519,7 +3968,7 @@ mod tests {
     #[tokio::test]
     async fn conditional_close_without_matching_pooled_generation_is_a_noop() {
         let state =
-            crate::ida::pool::PooledSessionState::new(test_pool(1), "generation-test".to_string());
+            crate::ida::pool::WorkspaceDatabase::new(test_pool(1), "generation-test".to_string());
 
         assert_eq!(
             state
@@ -2564,7 +4013,7 @@ mod tests {
     #[tokio::test]
     async fn bound_call_reports_no_database_rather_than_a_redirect() {
         let state =
-            crate::ida::pool::PooledSessionState::new(test_pool(1), "redirect-test".to_string());
+            crate::ida::pool::WorkspaceDatabase::new(test_pool(1), "redirect-test".to_string());
 
         assert!(matches!(
             state
@@ -2585,6 +4034,24 @@ mod tests {
     #[test]
     fn open_failure_releases_existing_lease_for_closed_worker() {
         assert!(open_error_releases_lease(false, &ToolError::WorkerClosed));
+    }
+
+    #[test]
+    fn unsettled_open_errors_require_retirement() {
+        for error in [
+            ToolError::Timeout(5),
+            ToolError::TimeoutDetailed("open_idb timed out".to_string()),
+            ToolError::Cancelled("open_idb cancelled".to_string()),
+            ToolError::WorkerClosed,
+        ] {
+            assert!(unsettled_open_error_retires_worker(&error));
+        }
+        assert!(!unsettled_open_error_retires_worker(
+            &ToolError::InvalidParams("bad processor".to_string())
+        ));
+        assert!(!unsettled_open_error_retires_worker(&ToolError::IdaError(
+            "unsupported input".to_string()
+        )));
     }
 
     #[tokio::test]

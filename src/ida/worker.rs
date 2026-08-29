@@ -2,8 +2,8 @@
 
 use crate::error::ToolError;
 use crate::ida::observability::ProgressSender;
-use crate::ida::pool::PooledSessionState;
-use crate::ida::request::IdaRequest;
+use crate::ida::pool::{LegacySessionBinding, PooledDatabaseBinding, WorkspaceDatabase};
+use crate::ida::request::{IdaRequest, SideEffectAdmission};
 use crate::ida::types::*;
 use serde_json::Value;
 use std::sync::{mpsc, Arc, Mutex};
@@ -14,12 +14,22 @@ use tokio_util::sync::CancellationToken;
 
 /// Default timeout for IDA operations (2 minutes)
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
+/// Debugger module enumeration has no SDK-level timeout, so bound the caller
+/// and pooled-child watchdog explicitly instead of waiting forever.
+pub(crate) const DEBUG_MODULES_TIMEOUT_SECS: u64 = 120;
 /// Maximum allowed timeout (10 minutes)
 pub const MAX_TIMEOUT_SECS: u64 = 600;
+/// Time for an IDA-thread debugger result to cross the worker response path
+/// after the SDK-level event wait expires.
+const DEBUGGER_RESPONSE_GRACE_SECS: u64 = 5;
 /// Maximum time to retry enqueuing close requests when the queue is full.
-const CLOSE_SEND_TIMEOUT_SECS: u64 = 5;
+pub(crate) const CLOSE_SEND_TIMEOUT_SECS: u64 = 5;
 /// Backoff between control enqueue retries (milliseconds).
 const CONTROL_SEND_BACKOFF_MS: u64 = 25;
+
+pub(crate) fn debugger_response_timeout_secs(timeout_seconds: u32) -> u64 {
+    u64::from(timeout_seconds).saturating_add(DEBUGGER_RESPONSE_GRACE_SECS)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CloseTokenLease {
@@ -122,6 +132,20 @@ pub struct IdaWorker {
     close_token: Arc<CloseTokenState>,
 }
 
+/// Cancels a side effect that is still queued if its awaiting request future
+/// is dropped (disconnect, task cancellation, or timeout). Once the IDA
+/// thread has started the operation, cancellation can no longer pretend the
+/// native side effect did not occur.
+struct SideEffectWaitGuard {
+    admission: SideEffectAdmission,
+}
+
+impl Drop for SideEffectWaitGuard {
+    fn drop(&mut self) {
+        let _ = self.admission.cancel_if_queued();
+    }
+}
+
 impl IdaWorker {
     /// Create a new worker handle with the given sender.
     pub fn new(tx: mpsc::SyncSender<IdaRequest>) -> Self {
@@ -183,19 +207,43 @@ impl IdaWorker {
         }
     }
 
-    /// Helper to receive with optional timeout
-    async fn recv_with_timeout<T>(
-        rx: oneshot::Receiver<Result<T, ToolError>>,
-        timeout_secs: Option<u64>,
-    ) -> Result<T, ToolError> {
-        let timeout = Duration::from_secs(
+    /// Caller-supplied timeout, defaulted and clamped to the worker maximum.
+    fn clamped_timeout(timeout_secs: Option<u64>) -> Duration {
+        Duration::from_secs(
             timeout_secs
                 .unwrap_or(DEFAULT_TIMEOUT_SECS)
                 .min(MAX_TIMEOUT_SECS),
-        );
+        )
+    }
+
+    /// Bound a read-only request. Mutations must use [`Self::recv_side_effect`]
+    /// so a receiver timeout cannot abandon queued work that later runs.
+    async fn recv_read_only_with_timeout<T>(
+        rx: oneshot::Receiver<Result<T, ToolError>>,
+        timeout_secs: Option<u64>,
+    ) -> Result<T, ToolError> {
+        let timeout = Self::clamped_timeout(timeout_secs);
         match tokio::time::timeout(timeout, rx).await {
             Ok(result) => result?,
             Err(_) => Err(ToolError::Timeout(timeout.as_secs())),
+        }
+    }
+
+    /// Bound queueing time for a request with side effects without abandoning
+    /// an operation that the IDA thread already started.
+    async fn recv_side_effect<T>(
+        mut rx: oneshot::Receiver<Result<T, ToolError>>,
+        admission: SideEffectAdmission,
+        timeout_secs: Option<u64>,
+    ) -> Result<T, ToolError> {
+        let wait_guard = SideEffectWaitGuard { admission };
+        let timeout = Self::clamped_timeout(timeout_secs);
+        match tokio::time::timeout(timeout, &mut rx).await {
+            Ok(result) => result?,
+            Err(_) if wait_guard.admission.cancel_if_queued() => {
+                Err(ToolError::Timeout(timeout.as_secs()))
+            }
+            Err(_) => Self::recv(rx).await,
         }
     }
 
@@ -215,6 +263,7 @@ impl IdaWorker {
         rebuild: bool,
         file_type: Option<String>,
         auto_analyse: bool,
+        raw_target: RawBinaryTarget,
         extra_args: Vec<String>,
         idb_out: Option<String>,
         _timeout_secs: Option<u64>,
@@ -230,6 +279,7 @@ impl IdaWorker {
             rebuild,
             file_type,
             auto_analyse,
+            raw_target,
             extra_args,
             idb_out,
             _timeout_secs,
@@ -253,6 +303,7 @@ impl IdaWorker {
         rebuild: bool,
         file_type: Option<String>,
         auto_analyse: bool,
+        raw_target: RawBinaryTarget,
         extra_args: Vec<String>,
         idb_out: Option<String>,
         _timeout_secs: Option<u64>,
@@ -269,6 +320,7 @@ impl IdaWorker {
             rebuild,
             file_type,
             auto_analyse,
+            raw_target,
             extra_args,
             idb_out,
             progress_tx,
@@ -308,14 +360,14 @@ impl IdaWorker {
             Some(Duration::from_secs(CLOSE_SEND_TIMEOUT_SECS)),
         )
         .await?;
-        rx.await.map_err(|_| ToolError::WorkerClosed)
+        rx.await.map_err(|_| ToolError::WorkerClosed)?
     }
 
     pub async fn close_for_shutdown(&self) -> Result<(), ToolError> {
         let (tx, rx) = oneshot::channel();
         self.send_with_retry(IdaRequest::Close { resp: tx }, None)
             .await?;
-        rx.await.map_err(|_| ToolError::WorkerClosed)
+        rx.await.map_err(|_| ToolError::WorkerClosed)?
     }
 
     /// Load external debug info (e.g., dSYM/DWARF) into the current database.
@@ -331,6 +383,75 @@ impl IdaWorker {
             resp: tx,
         })?;
         rx.await?
+    }
+
+    pub async fn debug_launch(
+        &self,
+        path: &str,
+        arguments: Option<String>,
+        start_directory: Option<String>,
+        timeout_seconds: u32,
+    ) -> Result<Value, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        let admission = SideEffectAdmission::default();
+        self.try_send(IdaRequest::DebugLaunch {
+            path: path.to_string(),
+            arguments,
+            start_directory,
+            timeout_seconds,
+            admission: admission.clone(),
+            resp: tx,
+        })?;
+        Self::recv_side_effect(
+            rx,
+            admission,
+            Some(debugger_response_timeout_secs(timeout_seconds)),
+        )
+        .await
+    }
+
+    pub async fn debug_attach(&self, pid: u32, timeout_seconds: u32) -> Result<Value, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        let admission = SideEffectAdmission::default();
+        self.try_send(IdaRequest::DebugAttach {
+            pid,
+            timeout_seconds,
+            admission: admission.clone(),
+            resp: tx,
+        })?;
+        Self::recv_side_effect(
+            rx,
+            admission,
+            Some(debugger_response_timeout_secs(timeout_seconds)),
+        )
+        .await
+    }
+
+    pub async fn debug_modules(&self) -> Result<Value, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::DebugModules { resp: tx })?;
+        Self::recv_read_only_with_timeout(rx, Some(DEBUG_MODULES_TIMEOUT_SECS)).await
+    }
+
+    pub async fn debug_stop(
+        &self,
+        action: DebugStopAction,
+        timeout_seconds: u32,
+    ) -> Result<Value, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        let admission = SideEffectAdmission::default();
+        self.try_send(IdaRequest::DebugStop {
+            action,
+            timeout_seconds,
+            admission: admission.clone(),
+            resp: tx,
+        })?;
+        Self::recv_side_effect(
+            rx,
+            admission,
+            Some(debugger_response_timeout_secs(timeout_seconds)),
+        )
+        .await
     }
 
     /// Report current auto-analysis status.
@@ -371,12 +492,14 @@ impl IdaWorker {
         expected_generation: Option<DatabaseGeneration>,
     ) -> Result<DscImageInfo, ToolError> {
         let (tx, rx) = oneshot::channel();
+        let admission = SideEffectAdmission::default();
         self.try_send(IdaRequest::DscLoadImage {
             module: module.to_string(),
             expected_generation,
+            admission: admission.clone(),
             resp: tx,
         })?;
-        Self::recv_with_timeout(rx, timeout_secs).await
+        Self::recv_side_effect(rx, admission, timeout_secs).await
     }
 
     /// Load a DSC region into the current database via IDA's native dscu service.
@@ -386,8 +509,13 @@ impl IdaWorker {
         timeout_secs: Option<u64>,
     ) -> Result<DscRegionInfo, ToolError> {
         let (tx, rx) = oneshot::channel();
-        self.try_send(IdaRequest::DscLoadRegion { addr, resp: tx })?;
-        Self::recv_with_timeout(rx, timeout_secs).await
+        let admission = SideEffectAdmission::default();
+        self.try_send(IdaRequest::DscLoadRegion {
+            addr,
+            admission: admission.clone(),
+            resp: tx,
+        })?;
+        Self::recv_side_effect(rx, admission, timeout_secs).await
     }
 
     /// Shutdown the IDA worker loop.
@@ -410,7 +538,7 @@ impl IdaWorker {
             filter,
             resp: tx,
         })?;
-        Self::recv_with_timeout(rx, timeout_secs).await
+        Self::recv_read_only_with_timeout(rx, timeout_secs).await
     }
 
     /// Resolve a function by name (exact or partial match).
@@ -445,6 +573,22 @@ impl IdaWorker {
         rx.await?
     }
 
+    pub async fn render_range(
+        &self,
+        start: u64,
+        end: u64,
+        max_lines: usize,
+    ) -> Result<Value, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::RenderRange {
+            start,
+            end,
+            max_lines,
+            resp: tx,
+        })?;
+        rx.await?
+    }
+
     /// Decompile a function using Hex-Rays.
     pub async fn decompile(&self, addr: u64) -> Result<String, ToolError> {
         let (tx, rx) = oneshot::channel();
@@ -474,7 +618,7 @@ impl IdaWorker {
             filter,
             resp: tx,
         })?;
-        Self::recv_with_timeout(rx, timeout_secs).await
+        Self::recv_read_only_with_timeout(rx, timeout_secs).await
     }
 
     /// List local types with pagination and optional filter.
@@ -492,7 +636,7 @@ impl IdaWorker {
             filter,
             resp: tx,
         })?;
-        Self::recv_with_timeout(rx, timeout_secs).await
+        Self::recv_read_only_with_timeout(rx, timeout_secs).await
     }
 
     /// Declare a type (single or multi).
@@ -680,7 +824,7 @@ impl IdaWorker {
             filter,
             resp: tx,
         })?;
-        Self::recv_with_timeout(rx, timeout_secs).await
+        Self::recv_read_only_with_timeout(rx, timeout_secs).await
     }
 
     /// Get struct info by ordinal or name.
@@ -730,7 +874,7 @@ impl IdaWorker {
             limit,
             resp: tx,
         })?;
-        Self::recv_with_timeout(rx, timeout_secs).await
+        Self::recv_read_only_with_timeout(rx, timeout_secs).await
     }
 
     /// Get cross-references from an address.
@@ -748,7 +892,7 @@ impl IdaWorker {
             limit,
             resp: tx,
         })?;
-        Self::recv_with_timeout(rx, timeout_secs).await
+        Self::recv_read_only_with_timeout(rx, timeout_secs).await
     }
 
     /// Get xrefs to a struct field.
@@ -815,7 +959,7 @@ impl IdaWorker {
             offset,
             resp: tx,
         })?;
-        Self::recv_with_timeout(rx, timeout_secs).await
+        Self::recv_read_only_with_timeout(rx, timeout_secs).await
     }
 
     pub async fn lumina_apply(
@@ -853,6 +997,24 @@ impl IdaWorker {
             name,
             offset,
             size,
+            resp: tx,
+        })?;
+        rx.await?
+    }
+
+    pub async fn list_patches(
+        &self,
+        start: Option<u64>,
+        end: Option<u64>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Value, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::ListPatches {
+            start,
+            end,
+            offset,
+            limit,
             resp: tx,
         })?;
         rx.await?
@@ -986,7 +1148,7 @@ impl IdaWorker {
             limit,
             resp: tx,
         })?;
-        Self::recv_with_timeout(rx, timeout_secs).await
+        Self::recv_read_only_with_timeout(rx, timeout_secs).await
     }
 
     /// Analyze strings (with xrefs).
@@ -1004,7 +1166,7 @@ impl IdaWorker {
             limit,
             resp: tx,
         })?;
-        Self::recv_with_timeout(rx, timeout_secs).await
+        Self::recv_read_only_with_timeout(rx, timeout_secs).await
     }
 
     /// Find strings matching a query.
@@ -1026,7 +1188,7 @@ impl IdaWorker {
             limit,
             resp: tx,
         })?;
-        Self::recv_with_timeout(rx, timeout_secs).await
+        Self::recv_read_only_with_timeout(rx, timeout_secs).await
     }
 
     /// Get xrefs to strings matching a query.
@@ -1051,18 +1213,20 @@ impl IdaWorker {
             max_xrefs,
             resp: tx,
         })?;
-        Self::recv_with_timeout(rx, timeout_secs).await
+        Self::recv_read_only_with_timeout(rx, timeout_secs).await
     }
 
     /// Run auto-analysis (functions) and wait for completion.
     pub async fn analyze_funcs(&self, timeout_secs: Option<u64>) -> Result<Value, ToolError> {
         let (tx, rx) = oneshot::channel();
+        let admission = SideEffectAdmission::default();
         self.try_send(IdaRequest::AnalyzeFuncs {
             progress_tx: None,
             cancel: None,
+            admission: admission.clone(),
             resp: tx,
         })?;
-        Self::recv_with_timeout(rx, timeout_secs).await
+        Self::recv_side_effect(rx, admission, timeout_secs).await
     }
 
     /// Run auto-analysis (functions) and stream progress for foreground callers.
@@ -1072,9 +1236,11 @@ impl IdaWorker {
         cancel: Option<CancellationToken>,
     ) -> Result<Value, ToolError> {
         let (tx, rx) = oneshot::channel();
+        let admission = SideEffectAdmission::default();
         self.try_send(IdaRequest::AnalyzeFuncs {
             progress_tx,
             cancel,
+            admission,
             resp: tx,
         })?;
         Self::recv(rx).await
@@ -1093,7 +1259,7 @@ impl IdaWorker {
             max_results,
             resp: tx,
         })?;
-        Self::recv_with_timeout(rx, timeout_secs).await
+        Self::recv_read_only_with_timeout(rx, timeout_secs).await
     }
 
     /// Search text in the database.
@@ -1109,7 +1275,7 @@ impl IdaWorker {
             max_results,
             resp: tx,
         })?;
-        Self::recv_with_timeout(rx, timeout_secs).await
+        Self::recv_read_only_with_timeout(rx, timeout_secs).await
     }
 
     /// Search immediate values in the database.
@@ -1125,7 +1291,7 @@ impl IdaWorker {
             max_results,
             resp: tx,
         })?;
-        Self::recv_with_timeout(rx, timeout_secs).await
+        Self::recv_read_only_with_timeout(rx, timeout_secs).await
     }
 
     /// Find instruction sequences by mnemonic patterns.
@@ -1143,7 +1309,7 @@ impl IdaWorker {
             case_insensitive,
             resp: tx,
         })?;
-        Self::recv_with_timeout(rx, timeout_secs).await
+        Self::recv_read_only_with_timeout(rx, timeout_secs).await
     }
 
     /// Find instruction operands by operand substring patterns.
@@ -1161,7 +1327,7 @@ impl IdaWorker {
             case_insensitive,
             resp: tx,
         })?;
-        Self::recv_with_timeout(rx, timeout_secs).await
+        Self::recv_read_only_with_timeout(rx, timeout_secs).await
     }
 
     /// Read integer value of size (1/2/4/8) at address.
@@ -1216,12 +1382,14 @@ impl IdaWorker {
     pub async fn callgraph(
         &self,
         addr: u64,
+        direction: CallGraphDirection,
         max_depth: usize,
         max_nodes: usize,
     ) -> Result<Value, ToolError> {
         let (tx, rx) = oneshot::channel();
         self.try_send(IdaRequest::CallGraph {
             addr,
+            direction,
             max_depth,
             max_nodes,
             resp: tx,
@@ -1258,13 +1426,15 @@ impl IdaWorker {
         timeout_secs: Option<u64>,
     ) -> Result<Value, ToolError> {
         let (tx, rx) = oneshot::channel();
+        let admission = SideEffectAdmission::default();
         self.try_send(IdaRequest::RunScript {
             code: code.to_string(),
             progress_tx: None,
             cancel: None,
+            admission: admission.clone(),
             resp: tx,
         })?;
-        Self::recv_with_timeout(rx, timeout_secs).await
+        Self::recv_side_effect(rx, admission, timeout_secs).await
     }
 
     /// Run a Python script via IDAPython and stream progress for foreground callers.
@@ -1275,10 +1445,12 @@ impl IdaWorker {
         cancel: Option<CancellationToken>,
     ) -> Result<Value, ToolError> {
         let (tx, rx) = oneshot::channel();
+        let admission = SideEffectAdmission::default();
         self.try_send(IdaRequest::RunScript {
             code: code.to_string(),
             progress_tx,
             cancel,
+            admission,
             resp: tx,
         })?;
         Self::recv(rx).await
@@ -1309,7 +1481,7 @@ impl IdaWorker {
 #[derive(Clone)]
 pub enum WorkerBackend {
     Local(Arc<IdaWorker>),
-    Pooled(Arc<PooledSessionState>),
+    Pooled(PooledDatabaseBinding),
 }
 
 impl WorkerBackend {
@@ -1317,8 +1489,12 @@ impl WorkerBackend {
         Self::Local(worker)
     }
 
-    pub fn pooled(state: Arc<PooledSessionState>) -> Self {
-        Self::Pooled(state)
+    pub fn pooled(state: Arc<WorkspaceDatabase>) -> Self {
+        Self::Pooled(PooledDatabaseBinding::Workspace(state))
+    }
+
+    pub fn pooled_legacy(binding: Arc<LegacySessionBinding>) -> Self {
+        Self::Pooled(PooledDatabaseBinding::Legacy(binding))
     }
 
     pub(crate) fn uses_close_tokens(&self) -> bool {
@@ -1329,6 +1505,10 @@ impl WorkerBackend {
         matches!(self, Self::Pooled(_))
     }
 
+    pub(crate) fn is_legacy_pooled(&self) -> bool {
+        matches!(self, Self::Pooled(PooledDatabaseBinding::Legacy(_)))
+    }
+
     pub(crate) fn issue_close_token_for_session(
         &self,
         session_id: &str,
@@ -1336,6 +1516,18 @@ impl WorkerBackend {
         match self {
             Self::Local(worker) => Some(worker.issue_close_token_for_session(session_id)),
             Self::Pooled(_) => None,
+        }
+    }
+
+    pub async fn render_range(
+        &self,
+        start: u64,
+        end: u64,
+        max_lines: usize,
+    ) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.render_range(start, end, max_lines).await,
+            Self::Pooled(state) => state.render_range(start, end, max_lines).await,
         }
     }
 
@@ -1371,6 +1563,7 @@ impl WorkerBackend {
         rebuild: bool,
         file_type: Option<String>,
         auto_analyse: bool,
+        raw_target: RawBinaryTarget,
         extra_args: Vec<String>,
         idb_out: Option<String>,
         timeout_secs: Option<u64>,
@@ -1386,6 +1579,7 @@ impl WorkerBackend {
             rebuild,
             file_type,
             auto_analyse,
+            raw_target,
             extra_args,
             idb_out,
             timeout_secs,
@@ -1407,6 +1601,7 @@ impl WorkerBackend {
         rebuild: bool,
         file_type: Option<String>,
         auto_analyse: bool,
+        raw_target: RawBinaryTarget,
         extra_args: Vec<String>,
         idb_out: Option<String>,
         timeout_secs: Option<u64>,
@@ -1425,6 +1620,7 @@ impl WorkerBackend {
                         rebuild,
                         file_type,
                         auto_analyse,
+                        raw_target,
                         extra_args,
                         idb_out,
                         timeout_secs,
@@ -1444,6 +1640,7 @@ impl WorkerBackend {
                         rebuild,
                         file_type,
                         auto_analyse,
+                        raw_target,
                         extra_args,
                         idb_out,
                         timeout_secs,
@@ -1494,6 +1691,52 @@ impl WorkerBackend {
         match self {
             Self::Local(worker) => worker.load_debug_info(path, verbose).await,
             Self::Pooled(state) => state.load_debug_info(path, verbose).await,
+        }
+    }
+
+    pub async fn debug_launch(
+        &self,
+        path: &str,
+        arguments: Option<String>,
+        start_directory: Option<String>,
+        timeout_seconds: u32,
+    ) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => {
+                worker
+                    .debug_launch(path, arguments, start_directory, timeout_seconds)
+                    .await
+            }
+            Self::Pooled(state) => {
+                state
+                    .debug_launch(path, arguments, start_directory, timeout_seconds)
+                    .await
+            }
+        }
+    }
+
+    pub async fn debug_attach(&self, pid: u32, timeout_seconds: u32) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.debug_attach(pid, timeout_seconds).await,
+            Self::Pooled(state) => state.debug_attach(pid, timeout_seconds).await,
+        }
+    }
+
+    pub async fn debug_modules(&self) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.debug_modules().await,
+            Self::Pooled(state) => state.debug_modules().await,
+        }
+    }
+
+    pub async fn debug_stop(
+        &self,
+        action: DebugStopAction,
+        timeout_seconds: u32,
+    ) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.debug_stop(action, timeout_seconds).await,
+            Self::Pooled(state) => state.debug_stop(action, timeout_seconds).await,
         }
     }
 
@@ -1951,6 +2194,19 @@ impl WorkerBackend {
         }
     }
 
+    pub async fn list_patches(
+        &self,
+        start: Option<u64>,
+        end: Option<u64>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.list_patches(start, end, offset, limit).await,
+            Self::Pooled(state) => state.list_patches(start, end, offset, limit).await,
+        }
+    }
+
     pub async fn set_comments(
         &self,
         addr: Option<u64>,
@@ -2302,12 +2558,17 @@ impl WorkerBackend {
     pub async fn callgraph(
         &self,
         addr: u64,
+        direction: CallGraphDirection,
         max_depth: usize,
         max_nodes: usize,
     ) -> Result<Value, ToolError> {
         match self {
-            Self::Local(worker) => worker.callgraph(addr, max_depth, max_nodes).await,
-            Self::Pooled(state) => state.callgraph(addr, max_depth, max_nodes).await,
+            Self::Local(worker) => {
+                worker
+                    .callgraph(addr, direction, max_depth, max_nodes)
+                    .await
+            }
+            Self::Pooled(state) => state.callgraph(addr, direction, max_depth, max_nodes).await,
         }
     }
 
@@ -2377,13 +2638,64 @@ mod tests {
 
     use serde_json::json;
 
-    use crate::ida::request::IdaRequest;
+    use crate::error::ToolError;
+    use crate::ida::request::{IdaRequest, SideEffectAdmission};
     use crate::ida::worker::{CloseAuthorization, IdaWorker, WorkerBackend};
     use std::sync::mpsc;
 
     fn test_worker() -> IdaWorker {
         let (tx, _rx) = mpsc::sync_channel(1);
         IdaWorker::new(tx)
+    }
+
+    #[tokio::test]
+    async fn queued_side_effect_timeout_prevents_later_start() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), ToolError>>();
+        let admission = SideEffectAdmission::default();
+
+        let result = IdaWorker::recv_side_effect(rx, admission.clone(), Some(0)).await;
+        assert!(matches!(result, Err(ToolError::Timeout(0))));
+        assert!(
+            admission.start().is_err(),
+            "the IDA thread must not start a mutation after timeout was reported"
+        );
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn started_side_effect_settles_instead_of_reporting_timeout() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let admission = SideEffectAdmission::default();
+        admission.start().expect("IDA thread claims the mutation");
+        let sender = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let _ = tx.send(Ok::<_, ToolError>("settled"));
+        });
+
+        let result = IdaWorker::recv_side_effect(rx, admission, Some(0))
+            .await
+            .expect("started mutation returns its real result");
+        assert_eq!(result, "settled");
+        sender.await.expect("response sender task finishes");
+    }
+
+    #[tokio::test]
+    async fn dropped_waiter_cancels_a_still_queued_side_effect() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), ToolError>>();
+        let admission = SideEffectAdmission::default();
+        let waiter_admission = admission.clone();
+        let waiter = tokio::spawn(async move {
+            IdaWorker::recv_side_effect(rx, waiter_admission, Some(60)).await
+        });
+        tokio::task::yield_now().await;
+        waiter.abort();
+        let _ = waiter.await;
+
+        assert!(
+            admission.start().is_err(),
+            "dropping the waiter must cancel a mutation that has not started"
+        );
+        drop(tx);
     }
 
     /// Wiring oracle: the generation a caller binds must reach the worker

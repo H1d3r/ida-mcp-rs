@@ -1,6 +1,6 @@
 //! Helpers for calling a child `ida-mcp worker` over MCP stdio.
 
-use crate::error::ToolError;
+use crate::error::{ToolError, DEBUGGER_START_RETAINED_PREFIX};
 use rmcp::model::{CallToolRequestParams, CallToolResult, JsonObject};
 use rmcp::service::{Peer, RoleClient};
 use serde::de::DeserializeOwned;
@@ -83,6 +83,9 @@ pub(crate) fn result_error(result: &CallToolResult, tool: &str) -> Option<ToolEr
 }
 
 fn classify_child_error(message: String) -> ToolError {
+    if let Some(detail) = message.strip_prefix(DEBUGGER_START_RETAINED_PREFIX) {
+        return ToolError::DebuggerStartRetained(detail.to_string());
+    }
     let lowered = message.to_ascii_lowercase();
     if lowered.contains("worker channel closed") {
         return ToolError::WorkerClosed;
@@ -95,6 +98,9 @@ fn classify_child_error(message: String) -> ToolError {
     }
     if lowered.contains("cancelled") || lowered.contains("canceled") {
         return ToolError::Cancelled(message);
+    }
+    if lowered.contains("debugger teardown incomplete") {
+        return ToolError::DebuggerTeardown(message);
     }
     ToolError::IdaError(message)
 }
@@ -196,6 +202,32 @@ mod tests {
         let err = parse_value(result, "run_script").expect_err("cancellation must fail");
 
         assert!(matches!(err, ToolError::Cancelled(message) if message.contains("cancelled")));
+    }
+
+    #[test]
+    fn parse_value_preserves_debugger_teardown_errors() {
+        let result = CallToolResult::error(vec![Content::text(
+            "Debugger teardown incomplete: timed out waiting for debugger teardown",
+        )]);
+
+        let err = parse_value(result, "close_idb").expect_err("teardown failure must fail");
+
+        assert!(
+            matches!(err, ToolError::DebuggerTeardown(message) if message.contains("timed out"))
+        );
+    }
+
+    #[test]
+    fn parse_value_preserves_retained_debugger_start_errors() {
+        let result =
+            ToolError::DebuggerStartRetained("initial wait cancelled".to_string()).to_tool_result();
+
+        let err = parse_value(result, "debug_launch")
+            .expect_err("retained debugger ownership must remain typed");
+
+        assert!(
+            matches!(err, ToolError::DebuggerStartRetained(message) if message.contains("cancelled"))
+        );
     }
 
     #[test]

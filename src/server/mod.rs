@@ -11,15 +11,18 @@ pub use requests::*;
 
 use crate::error::ToolError;
 use crate::ida::observability::{ProgressReceiver, ProgressSender};
-use crate::ida::pool::CHILD_TIMEOUT_GRACE_SECS;
-use crate::ida::types::{ConditionalCloseResult, DatabaseGeneration};
+use crate::ida::pool::{WorkspacePin, WorkspaceRegistry, CHILD_TIMEOUT_GRACE_SECS};
+use crate::ida::types::{
+    CallGraphDirection, ConditionalCloseResult, DatabaseGeneration, DebugStopAction,
+    RawBinaryTarget, SegmentInfo,
+};
 use crate::ida::worker::{
     CloseAuthorization, CloseTokenGrant, IdaWorker, WorkerBackend, MAX_TIMEOUT_SECS,
 };
 use crate::server::operation::{
     next_operation_id, OperationRegistry, OperationSnapshot, RecentOperations,
 };
-use crate::tool_registry::{self, ToolCategory};
+use crate::tool_registry::{self, ToolCategory, ToolScope};
 use rmcp::{
     handler::server::{
         router::tool::ToolRouter,
@@ -70,12 +73,24 @@ pub struct ServerRuntimeState {
 impl Default for ServerRuntimeState {
     fn default() -> Self {
         let signing_key = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let request_state_codec =
+            match rmcp::model::RequestStateCodec::try_new(signing_key.into_bytes()) {
+                Ok(codec) => codec,
+                Err(error) => {
+                    // Two textual UUIDs are always well above rmcp's minimum key
+                    // length. Keep this branch non-panicking if that invariant or
+                    // the SDK validation changes in a future release.
+                    warn!(%error, "generated request-state signing key was rejected; regenerating");
+                    let fallback_key = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+                    rmcp::model::RequestStateCodec::new_unchecked(fallback_key.into_bytes())
+                }
+            };
         Self {
             task_registry: task::TaskRegistry::new(),
             operation_registry: OperationRegistry::new(),
             operation_nonce: Arc::new(AtomicU64::new(0)),
             runtime_lifetime: Arc::new(SessionLifetime::new()),
-            request_state_codec: rmcp::model::RequestStateCodec::new(signing_key.into_bytes()),
+            request_state_codec,
             stateless_http: false,
         }
     }
@@ -118,7 +133,11 @@ impl Drop for SessionLifetime {
 #[derive(Clone)]
 pub struct IdaMcpServer {
     worker: WorkerBackend,
-    tool_mux: ToolMux<IdaMcpServer>,
+    workspace_registry: Option<WorkspaceRegistry>,
+    workspace_database_id: Option<String>,
+    /// Shared: `IdaMcpServer` is cloned per call to rebind the worker for
+    /// workspace routing, and the route map holds every tool's schema.
+    tool_mux: Arc<ToolMux<IdaMcpServer>>,
     mode: ServerMode,
     task_registry: task::TaskRegistry,
     operation_registry: OperationRegistry,
@@ -198,7 +217,7 @@ fn is_sessionless_request_meta(meta: &rmcp::model::RequestMetaObject) -> bool {
 impl ToolMux<IdaMcpServer> {
     async fn call(
         &self,
-        context: ToolCallContext<'_, IdaMcpServer>,
+        mut context: ToolCallContext<'_, IdaMcpServer>,
     ) -> Result<CallToolResponse, rmcp::ErrorData> {
         // rmcp routes any request carrying the complete 2026 inline-metadata
         // key set through the sessionless path even when it declares a legacy
@@ -206,7 +225,7 @@ impl ToolMux<IdaMcpServer> {
         // HTTP session, so a sessionless tool call would mint (and leak) a
         // fresh worker lease per request. Reject it before it reaches the
         // worker pool; the version allowlist alone cannot catch this case.
-        if context.service.worker.is_pooled()
+        if context.service.worker.is_legacy_pooled()
             && is_sessionless_request_meta(&context.request_context().meta)
         {
             return Err(McpError::invalid_params(
@@ -230,6 +249,7 @@ impl ToolMux<IdaMcpServer> {
         // parse a `resultType: "task"` response even if they declared the
         // tasks extension capability.
         let should_materialize_task = context.name() == "open_dsc"
+            && context.service.workspace_registry.is_none()
             && context
                 .request_context()
                 .protocol_version()
@@ -239,9 +259,166 @@ impl ToolMux<IdaMcpServer> {
                 .client_capabilities()
                 .is_some_and(|capabilities| capabilities.supports_tasks());
         let task_registry = context.service.task_registry.clone();
-        let response = self.call_router.call(context).await?;
+        let mut routed_service = context.service.clone();
+        let workspace_registry = context.service.workspace_registry.clone();
+        let tool_name = context.name().to_string();
+        let supplied_database_id = take_workspace_database_id(&mut context.arguments)?;
+        let mut allocated_database_id = None;
+        let mut selected_database_id = supplied_database_id.clone();
+        let mut workspace_lease = None;
+
+        if let Some(registry) = workspace_registry.as_ref() {
+            let tool = tool_registry::get_tool(&tool_name).ok_or_else(|| {
+                McpError::invalid_params(format!("unknown tool: {tool_name}"), None)
+            })?;
+            let opens_database = tool_registry::allocates_database(&tool_name);
+            if opens_database {
+                if supplied_database_id.is_some() {
+                    return Err(McpError::invalid_params(
+                        "open_idb/open_dsc allocate a new database_id; do not provide one",
+                        None,
+                    ));
+                }
+                let lease = registry.allocate_database();
+                let database_id = lease.database_id().to_string();
+                routed_service.worker = WorkerBackend::pooled(lease.database());
+                selected_database_id = Some(database_id.clone());
+                allocated_database_id = Some(database_id);
+                workspace_lease = Some(lease);
+            } else if tool.scope == ToolScope::Database {
+                let database_id = supplied_database_id.as_deref().ok_or_else(|| {
+                    McpError::invalid_params(
+                        format!("{tool_name} requires database_id in workspace mode"),
+                        None,
+                    )
+                })?;
+                let lease = registry.acquire(database_id).ok_or_else(|| {
+                    McpError::invalid_params(
+                        format!("unknown or expired database_id: {database_id}"),
+                        None,
+                    )
+                })?;
+                routed_service.worker = WorkerBackend::pooled(lease.database());
+                workspace_lease = Some(lease);
+            } else if supplied_database_id.is_some() {
+                return Err(McpError::invalid_params(
+                    format!("{tool_name} is runtime-scoped and does not accept database_id"),
+                    None,
+                ));
+            }
+        } else if supplied_database_id.is_some() {
+            return Err(McpError::invalid_params(
+                "database_id is available only when ida-mcp starts with --workspace",
+                None,
+            ));
+        }
+
+        routed_service.workspace_database_id = selected_database_id.clone();
+        let mut params = CallToolRequestParams::new(context.name.clone());
+        params.arguments = context.arguments.take();
+        params.input_responses = context.input_responses.take();
+        params.request_state = context.request_state.take();
+        let routed_context = ToolCallContext::new(&routed_service, params, context.request_context);
+        let response = self.call_router.call(routed_context).await;
+        drop(workspace_lease);
+        let mut response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                if let (Some(registry), Some(database_id)) = (
+                    workspace_registry.as_ref(),
+                    allocated_database_id.as_deref(),
+                ) {
+                    let _ = registry.remove(database_id);
+                }
+                return Err(error);
+            }
+        };
+
+        if let (Some(registry), Some(database_id)) = (
+            workspace_registry.as_ref(),
+            allocated_database_id.as_deref(),
+        ) && !attach_workspace_database_id(&mut response, database_id)
+        {
+            let _ = registry.remove(database_id);
+        }
         materialize_task_response(&task_registry, should_materialize_task, response)
     }
+}
+
+fn take_workspace_database_id(
+    arguments: &mut Option<JsonObject>,
+) -> Result<Option<String>, McpError> {
+    let Some(value) = arguments
+        .as_mut()
+        .and_then(|arguments| arguments.remove("database_id"))
+    else {
+        return Ok(None);
+    };
+    let Value::String(database_id) = value else {
+        return Err(McpError::invalid_params(
+            "database_id must be a UUID string",
+            None,
+        ));
+    };
+    let parsed = uuid::Uuid::parse_str(database_id.trim())
+        .map_err(|_| McpError::invalid_params("database_id must be a UUID string", None))?;
+    Ok(Some(parsed.to_string()))
+}
+
+fn attach_workspace_database_id(response: &mut CallToolResponse, database_id: &str) -> bool {
+    let CallToolResponse::Complete(result) = response else {
+        return false;
+    };
+    if result.is_error == Some(true) {
+        return false;
+    }
+
+    let parsed = result
+        .content
+        .first()
+        .and_then(|content| content.as_text())
+        .and_then(|text| serde_json::from_str::<Value>(&text.text).ok());
+    // A deduplicated open_dsc did not start work on this newly allocated
+    // workspace database. Its existing task will eventually report the
+    // original database_id, so attaching this phantom allocation would mint a
+    // handle that can never open.
+    if parsed
+        .as_ref()
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        == Some("already_running")
+    {
+        return false;
+    }
+
+    let replacement = parsed.and_then(|mut value| {
+        let Value::Object(map) = &mut value else {
+            return None;
+        };
+        map.insert("database_id".to_string(), json!(database_id));
+        serde_json::to_string_pretty(&value).ok()
+    });
+    if let (Some(text), Some(first)) = (replacement, result.content.first_mut()) {
+        *first = Content::text(text);
+    } else {
+        result.content.push(Content::text(
+            json!({ "database_id": database_id }).to_string(),
+        ));
+    }
+    true
+}
+
+fn workspace_close_should_remove_entry(
+    result: &Result<(), ToolError>,
+    task_registry: &task::TaskRegistry,
+    database_id: Option<&str>,
+) -> bool {
+    // WorkspaceDatabase::close takes its worker lease before dispatching the
+    // child close. Every later result consumes that lease, including teardown
+    // errors that retire the child. NoDatabaseOpen is the one pre-dispatch
+    // result and can mean a pinned background open has not installed its lease.
+    !matches!(result, Err(ToolError::NoDatabaseOpen))
+        || !database_id.is_some_and(|id| task_registry.has_running_workspace_open(id))
 }
 
 /// Parameters for the background DSC loading task.
@@ -307,28 +484,115 @@ fn sanitize_temp_component(value: &str) -> String {
     }
 }
 
+/// Content identity of the DSC at `path`, used to key the managed database
+/// cache: the dyld cache header UUID (bytes 0x58..0x68, valid when
+/// `mappingOffset` places the header past it). Never derived from the path:
+/// DSCs are typically opened through a mount point, so a different firmware
+/// mounted at the same path must key a different database, and the same
+/// firmware must reuse its analysis wherever it is mounted. A file without a
+/// trustworthy UUID is rejected — a partial-content digest could collide, so
+/// there is no fallback identity.
+fn dsc_content_identity(path: &std::path::Path) -> Result<String, ToolError> {
+    use std::io::Read;
+
+    let read_error = |error: std::io::Error| {
+        ToolError::InvalidPath(format!(
+            "failed to read DSC header for cache identity ({}): {error}",
+            path.display()
+        ))
+    };
+    let mut file = std::fs::File::open(path).map_err(read_error)?;
+    let mut header = [0u8; 0x68];
+    let mut filled = 0usize;
+    while filled < header.len() {
+        let count = file.read(&mut header[filled..]).map_err(read_error)?;
+        if count == 0 {
+            break;
+        }
+        filled += count;
+    }
+
+    if filled == header.len() && header.starts_with(b"dyld_v1") {
+        let mapping_offset =
+            u32::from_le_bytes([header[0x10], header[0x11], header[0x12], header[0x13]]);
+        let uuid = &header[0x58..0x68];
+        if mapping_offset as usize >= header.len() && uuid.iter().any(|byte| *byte != 0) {
+            return Ok(crate::ida::handlers::hex_encode(uuid));
+        }
+    }
+
+    Err(ToolError::InvalidParams(format!(
+        "{} does not carry a dyld_shared_cache UUID, so its generated database cannot be \
+         identified safely; open it with open_idb instead",
+        path.display()
+    )))
+}
+
 /// Deterministic per-DSC database location for the IDA 9.4 direct open path.
 ///
 /// DSCs commonly sit on read-only mounts, so the generated database cannot
 /// reliably live next to them the way the legacy idat path's sibling `.i64`
-/// does. Deriving the name from the absolute DSC path — never pid or time —
-/// means every `open_dsc` of the same cache resolves to one file: repeat opens
-/// reuse the analyzed database (with any renames/comments) instead of leaking
-/// a fresh multi-GB orphan per call.
-fn direct_dsc_cache_i64_path(dsc_path: &std::path::Path) -> std::path::PathBuf {
-    use std::hash::{DefaultHasher, Hash, Hasher};
-    let absolute = dsc_path
-        .canonicalize()
-        .unwrap_or_else(|_| dsc_path.to_path_buf());
-    let name = absolute
+/// does. The name is keyed by the cache's content identity — never pid, time,
+/// or mount path — so every `open_dsc` of the same firmware resolves to one
+/// reusable file, and a different firmware at the same mount path can never
+/// silently serve the previous firmware's analysis.
+fn direct_dsc_cache_i64_path(dsc_path: &std::path::Path) -> Result<std::path::PathBuf, ToolError> {
+    let name = dsc_path
         .file_name()
         .and_then(|name| name.to_str())
         .map(sanitize_temp_component)
         .unwrap_or_else(|| "dsc".to_string());
-    let mut hasher = DefaultHasher::new();
-    absolute.hash(&mut hasher);
-    let hash = hasher.finish();
-    std::env::temp_dir().join(format!("ida-mcp-dsc-{name}-{hash:016x}.i64"))
+    let identity = dsc_content_identity(dsc_path)?;
+    Ok(std::env::temp_dir().join(format!("ida-mcp-dsc-{name}-{identity}.i64")))
+}
+
+fn expanded_dsc_path(path: &str) -> std::path::PathBuf {
+    crate::expand_path(path.trim())
+}
+
+fn dsc_task_key(output: &std::path::Path) -> String {
+    output.display().to_string()
+}
+
+fn validate_raw_processor(processor: &str) -> Result<(), ToolError> {
+    if processor.len() > 128 || processor.chars().any(char::is_control) {
+        return Err(ToolError::InvalidParams(
+            "processor must be at most 128 characters and contain no control characters"
+                .to_string(),
+        ));
+    }
+
+    let normalized = processor.to_ascii_lowercase();
+    let hint = match normalized.as_str() {
+        "arm" => Some(
+            "\"arm\" is ambiguous for a raw blob in headless mode; use an explicit variant such as \"arm:ARMv7-M\" or \"arm:ARMv8-A\"",
+        ),
+        "metapc" | "pc" => Some(
+            "\"metapc\" is ambiguous for a raw blob in headless mode; use an explicit variant such as \"metapc:80386p\"",
+        ),
+        "mips" | "mipsl" | "mipsb" | "ppc" | "riscv" => Some(
+            "the selected processor has ambiguous modes for a raw blob in headless mode; use an explicit processor:variant",
+        ),
+        _ => None,
+    };
+    if let Some(hint) = hint {
+        return Err(ToolError::InvalidParams(hint.to_string()));
+    }
+    Ok(())
+}
+
+fn raw_blob_idb_path(input: &str, idb_out: Option<&str>) -> std::path::PathBuf {
+    if let Some(idb_out) = idb_out {
+        return crate::expand_path(idb_out);
+    }
+    let input = crate::expand_path(input);
+    let mut output = std::ffi::OsString::from(input.as_os_str());
+    output.push(".i64");
+    std::path::PathBuf::from(output)
+}
+
+fn raw_blob_database_exists(input: &str, idb_out: Option<&str>) -> bool {
+    crate::ida::handlers::database::ida_database_output_exists(&raw_blob_idb_path(input, idb_out))
 }
 
 impl TemporaryFileCleanup {
@@ -448,7 +712,9 @@ impl IdaMcpServer {
         let call_router = Self::tool_router();
         Self {
             worker,
-            tool_mux: ToolMux::new(call_router),
+            workspace_registry: None,
+            workspace_database_id: None,
+            tool_mux: Arc::new(ToolMux::new(call_router)),
             mode,
             task_registry: state.task_registry,
             operation_registry: state.operation_registry,
@@ -460,6 +726,51 @@ impl IdaMcpServer {
             session_task_owner,
             stateless_http: state.stateless_http,
             filter,
+        }
+    }
+
+    pub fn with_workspace_and_state(
+        registry: WorkspaceRegistry,
+        mode: ServerMode,
+        filter: Arc<tool_filter::ToolFilter>,
+        state: ServerRuntimeState,
+    ) -> Self {
+        let runtime_database = registry.runtime_database();
+        let mut server = Self::with_filter_and_state(
+            WorkerBackend::pooled(runtime_database),
+            mode,
+            filter,
+            state,
+        );
+        server.workspace_registry = Some(registry);
+        server
+    }
+
+    pub fn workspace_enabled(&self) -> bool {
+        self.workspace_registry.is_some()
+    }
+
+    fn workspace_pin(&self) -> Option<WorkspacePin> {
+        let registry = self.workspace_registry.as_ref()?;
+        let database_id = self.workspace_database_id.as_deref()?;
+        registry.pin(database_id)
+    }
+
+    /// Shape a debugger-start outcome for the client. Workspace debug
+    /// pinning happens inside the pooled dispatch itself
+    /// (`WorkspaceDatabase::debug_start`), bound to the lease that served
+    /// the call, so no pin bookkeeping belongs here.
+    fn finish_debugger_start(result: Result<Value, ToolError>) -> CallToolResult {
+        match result {
+            Ok(result) => CallToolResult::success(vec![Content::text(pretty_json(&result))]),
+            Err(error) => error.to_tool_result(),
+        }
+    }
+
+    fn workspace_task_key(&self, key: &str) -> String {
+        match self.workspace_database_id.as_deref() {
+            Some(database_id) => format!("{database_id}:{key}"),
+            None => key.to_string(),
         }
     }
 
@@ -504,11 +815,14 @@ impl IdaMcpServer {
     }
 
     fn close_hint(&self) -> &'static str {
-        close_hint_for(self.mode, self.worker.is_pooled())
+        close_hint_for(self.mode, self.worker.is_pooled(), self.workspace_enabled())
     }
 
     fn http_close_grant(&self) -> Option<Result<CloseTokenGrant, String>> {
-        if matches!(self.mode, ServerMode::Http) && self.worker.uses_close_tokens() {
+        if !self.workspace_enabled()
+            && matches!(self.mode, ServerMode::Http)
+            && self.worker.uses_close_tokens()
+        {
             self.worker.issue_close_token_for_session(&self.session_id)
         } else {
             None
@@ -571,6 +885,17 @@ impl IdaMcpServer {
         // Check: exists, is file, no path traversal
         // IDA can open many formats: .i64, .idb, ELF, Mach-O, PE, raw binaries, etc.
         p.exists() && p.is_file() && !path.contains("..")
+    }
+
+    fn validate_open_path(path: &str) -> bool {
+        if Self::validate_path(path) {
+            return true;
+        }
+        if path.contains("..") || !Self::is_database_path(path) {
+            return false;
+        }
+        let expanded = crate::expand_path(path.trim());
+        !expanded.exists() && crate::ida::handlers::database::ida_database_output_exists(&expanded)
     }
 
     fn parse_address(s: &str) -> Result<u64, ToolError> {
@@ -676,6 +1001,8 @@ impl IdaMcpServer {
     const DEFAULT_XREFS_LIMIT: usize = 1000;
     /// Hard cap on a single xref page, mirroring other paginated tools.
     const MAX_XREFS_LIMIT: usize = 10000;
+    /// A matrix is quadratic in both allocation and serialized output size.
+    const MAX_XREF_MATRIX_ADDRESSES: usize = 512;
 
     /// Parse and clamp the pagination inputs shared by `xrefs_to`/`xrefs_from`.
     ///
@@ -691,6 +1018,17 @@ impl IdaMcpServer {
         let offset = parse_optional_unsigned::<usize>(req.offset, "offset")?.unwrap_or(0);
         let timeout_secs = parse_optional_unsigned::<u64>(req.timeout_secs, "timeout_secs")?;
         Ok((offset, limit, timeout_secs))
+    }
+
+    fn validate_xref_matrix_size(addrs: &[u64]) -> Result<(), ToolError> {
+        if addrs.len() > Self::MAX_XREF_MATRIX_ADDRESSES {
+            return Err(ToolError::InvalidParams(format!(
+                "xref_matrix accepts at most {} addresses (received {})",
+                Self::MAX_XREF_MATRIX_ADDRESSES,
+                addrs.len()
+            )));
+        }
+        Ok(())
     }
 
     /// Wrap a per-address xref result for the multi-address response, injecting
@@ -1119,6 +1457,10 @@ impl IdaMcpServer {
             }
             Err(error) => return Ok(task_create_error_to_tool_error(error).to_tool_result()),
         };
+        if let Some(database_id) = self.workspace_database_id.as_deref() {
+            self.task_registry
+                .bind_workspace_open(&task_id, database_id);
+        }
 
         let backend = match &ctx.open {
             DscBackgroundOpen::DirectRawDsc { .. } => "dscu",
@@ -1133,10 +1475,22 @@ impl IdaMcpServer {
         let registry = self.task_registry.clone();
         let worker = self.worker.clone();
         let mode = self.mode;
+        let workspace_database_id = self.workspace_database_id.clone();
+        let workspace_pin = self.workspace_pin();
         let tid = task_id.clone();
         let task_cancel_token = cancel_token.clone();
         tokio::spawn(async move {
-            Self::run_dsc_background(tid, registry, worker, mode, ctx, task_cancel_token).await;
+            let _workspace_pin = workspace_pin;
+            Self::run_dsc_background(
+                tid,
+                registry,
+                worker,
+                mode,
+                workspace_database_id,
+                ctx,
+                task_cancel_token,
+            )
+            .await;
         });
         self.task_registry.set_cancel_token(&task_id, cancel_token);
 
@@ -1176,6 +1530,7 @@ impl IdaMcpServer {
                 false,
                 file_type.map(str::to_string),
                 false,
+                RawBinaryTarget::default(),
                 Vec::new(),
                 None,
                 None,
@@ -1353,6 +1708,7 @@ impl IdaMcpServer {
         registry: task::TaskRegistry,
         worker: WorkerBackend,
         mode: ServerMode,
+        workspace_database_id: Option<String>,
         ctx: DscBackgroundCtx,
         cancel_token: tokio_util::sync::CancellationToken,
     ) {
@@ -1376,6 +1732,16 @@ impl IdaMcpServer {
                     "Background: opening raw DSC through idalib"
                 );
                 registry.update_message(&task_id, "Opening DSC directly with idalib...");
+                if let Err(error) = remove_orphaned_dsc_output_artifacts(&idb_out) {
+                    Self::complete_background_tool_error(
+                        &task_id,
+                        &registry,
+                        &error,
+                        &cancel_token,
+                        "Cancelled while preparing the DSC output",
+                    );
+                    return;
+                }
                 (open_path, Some(idb_out), false, true)
             }
             DscBackgroundOpen::LegacyIdat {
@@ -1386,6 +1752,17 @@ impl IdaMcpServer {
                 out_i64,
             } => {
                 let mut script_cleanup = TemporaryFileCleanup::new(script_path);
+
+                if let Err(error) = remove_orphaned_dsc_output_artifacts(&out_i64) {
+                    Self::complete_background_tool_error(
+                        &task_id,
+                        &registry,
+                        &error,
+                        &cancel_token,
+                        "Cancelled while preparing the DSC output",
+                    );
+                    return;
+                }
 
                 // Phase 1: run idat subprocess
                 info!("Background: running idat");
@@ -1501,6 +1878,7 @@ impl IdaMcpServer {
                 false,
                 None,
                 auto_analyse,
+                RawBinaryTarget::default(),
                 Vec::new(),
                 idb_out.as_ref().map(|path| path.display().to_string()),
                 None,
@@ -1678,7 +2056,14 @@ impl IdaMcpServer {
                 map.insert("analysis_ready".to_string(), json!(analysis_ready));
                 map.insert("next_steps".to_string(), json!(next_steps));
             }
-            apply_close_metadata(map, close_token, close_hint_for(mode, worker.is_pooled()));
+            if let Some(database_id) = workspace_database_id.as_deref() {
+                map.insert("database_id".to_string(), json!(database_id));
+            }
+            apply_close_metadata(
+                map,
+                close_token,
+                close_hint_for(mode, worker.is_pooled(), workspace_database_id.is_some()),
+            );
         }
 
         match registry.complete_or_defer_cancellation(&task_id, value, &cancel_token) {
@@ -1719,6 +2104,241 @@ where
     }
 }
 
+fn parse_debug_timeout(value: Option<i64>, default: u32) -> Result<u32, ToolError> {
+    let timeout = parse_optional_unsigned::<u32>(value, "timeout_secs")?.unwrap_or(default);
+    if !(1..=120).contains(&timeout) {
+        return Err(ToolError::InvalidParams(
+            "timeout_secs must be between 1 and 120".to_string(),
+        ));
+    }
+    Ok(timeout)
+}
+
+fn select_runtime_module(modules: &Value, query: &str) -> Result<Value, ToolError> {
+    if query.is_empty() {
+        return Err(ToolError::InvalidParams(
+            "module must be an exact runtime path or unambiguous basename".to_string(),
+        ));
+    }
+    let candidates = modules
+        .get("modules")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ToolError::RemoteProtocol(
+                "debug_modules response did not contain a modules array".to_string(),
+            )
+        })?;
+    let exact = candidates
+        .iter()
+        .filter(|module| module.get("path").and_then(Value::as_str) == Some(query))
+        .cloned()
+        .collect::<Vec<_>>();
+    if exact.len() == 1 {
+        return exact.into_iter().next().ok_or_else(|| {
+            ToolError::RemoteProtocol("selected runtime module disappeared".to_string())
+        });
+    }
+
+    let basename = std::path::Path::new(query)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(query);
+    let matching = candidates
+        .iter()
+        .filter(|module| {
+            module
+                .get("path")
+                .and_then(Value::as_str)
+                .and_then(|path| std::path::Path::new(path).file_name())
+                .and_then(|name| name.to_str())
+                == Some(basename)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    match matching.len() {
+        1 => matching.into_iter().next().ok_or_else(|| {
+            ToolError::RemoteProtocol("selected runtime module disappeared".to_string())
+        }),
+        0 => Err(ToolError::InvalidParams(format!(
+            "runtime module not found: {query}"
+        ))),
+        count => Err(ToolError::InvalidParams(format!(
+            "runtime module basename is ambiguous ({count} matches); use the exact path from debug_modules"
+        ))),
+    }
+}
+
+enum RuntimeModuleSource {
+    Standalone(std::path::PathBuf),
+    #[cfg(target_os = "macos")]
+    DyldSharedCache(std::path::PathBuf),
+}
+
+impl RuntimeModuleSource {
+    fn open_path(&self) -> &std::path::Path {
+        match self {
+            Self::Standalone(path) => path,
+            #[cfg(target_os = "macos")]
+            Self::DyldSharedCache(path) => path,
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Standalone(_) => "standalone",
+            #[cfg(target_os = "macos")]
+            Self::DyldSharedCache(_) => "dyld_shared_cache",
+        }
+    }
+
+    fn is_dyld_shared_cache(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            matches!(self, Self::DyldSharedCache(_))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn target_dyld_cache_names(meta: &Value) -> Result<&'static [&'static str], ToolError> {
+    const ARM64: &[&str] = &["dyld_shared_cache_arm64e", "dyld_shared_cache_arm64"];
+    const X86_64: &[&str] = &["dyld_shared_cache_x86_64h", "dyld_shared_cache_x86_64"];
+
+    let bits = meta.get("bits").and_then(Value::as_u64).ok_or_else(|| {
+        ToolError::RemoteProtocol("idb_meta response did not contain target bitness".to_string())
+    })?;
+    let processor = meta
+        .get("processor")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            ToolError::RemoteProtocol(
+                "idb_meta response did not contain target processor".to_string(),
+            )
+        })?
+        .to_ascii_lowercase();
+    if bits != 64 {
+        return Err(ToolError::NotSupported(format!(
+            "dyld shared-cache module opening requires a 64-bit target, got {bits}-bit {processor}"
+        )));
+    }
+    if processor.contains("arm") || processor.contains("aarch64") {
+        return Ok(ARM64);
+    }
+    if processor.contains("metapc")
+        || processor.contains("80x86")
+        || processor.contains("x86")
+        || processor.contains("intel")
+    {
+        return Ok(X86_64);
+    }
+    Err(ToolError::NotSupported(format!(
+        "cannot select a dyld shared cache for target processor {processor}"
+    )))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn find_target_dyld_cache(
+    meta: &Value,
+    roots: &[&std::path::Path],
+) -> Result<std::path::PathBuf, ToolError> {
+    let names = target_dyld_cache_names(meta)?;
+    for root in roots {
+        for name in names {
+            let candidate = root.join(name);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    Err(ToolError::InvalidPath(format!(
+        "no host dyld shared cache found for target architecture (looked for {})",
+        names.join(", ")
+    )))
+}
+
+fn resolve_runtime_module_source(
+    module_path: &std::path::Path,
+    source_meta: Option<&Value>,
+) -> Result<RuntimeModuleSource, ToolError> {
+    if !module_path.is_absolute() {
+        return Err(ToolError::InvalidPath(module_path.display().to_string()));
+    }
+    if module_path.is_file() {
+        return Ok(RuntimeModuleSource::Standalone(module_path.to_path_buf()));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if idalib::SDK_VERSION < (9, 4) {
+            return Err(ToolError::NotSupported(
+                "cache-backed runtime modules require the IDA 9.4 in-process DSC APIs".to_string(),
+            ));
+        }
+        let source_meta = source_meta.ok_or_else(|| {
+            ToolError::RemoteProtocol(
+                "target metadata is required to select the host dyld shared cache".to_string(),
+            )
+        })?;
+        let roots = [
+            std::path::Path::new("/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld"),
+            std::path::Path::new("/System/Library/dyld"),
+        ];
+        find_target_dyld_cache(source_meta, &roots).map(RuntimeModuleSource::DyldSharedCache)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = source_meta;
+        Err(ToolError::InvalidPath(format!(
+            "{} is mapped at runtime but has no on-disk image",
+            module_path.display()
+        )))
+    }
+}
+
+fn checked_runtime_slide(runtime_base: u64, preferred_base: u64) -> Value {
+    if runtime_base >= preferred_base {
+        let magnitude = runtime_base - preferred_base;
+        json!({
+            "direction": "add",
+            "magnitude": format!("{magnitude:#x}"),
+            "magnitude_value": magnitude,
+            "signed": format!("+{magnitude:#x}"),
+        })
+    } else {
+        let magnitude = preferred_base - runtime_base;
+        json!({
+            "direction": "subtract",
+            "magnitude": format!("{magnitude:#x}"),
+            "magnitude_value": magnitude,
+            "signed": format!("-{magnitude:#x}"),
+        })
+    }
+}
+
+fn runtime_module_preferred_base(
+    selected_dsc_image_address: Option<u64>,
+    segment_bases: impl Iterator<Item = (u64, bool)>,
+) -> Option<u64> {
+    selected_dsc_image_address.or_else(|| {
+        segment_bases
+            .filter_map(|(base, loaded)| loaded.then_some(base))
+            .min()
+    })
+}
+
+fn segment_defines_runtime_image_base(segment: &SegmentInfo) -> bool {
+    !segment.name.eq_ignore_ascii_case("__PAGEZERO")
+        && segment
+            .permissions
+            .bytes()
+            .any(|permission| permission != b'-')
+}
+
 /// Short-circuit on a `Result<_, ToolError>` from within a `#[tool]` async fn,
 /// surfacing the error to the client as an `is_error: true` CallToolResult
 /// (matching the existing `Err(e) => Ok(e.to_tool_result())` pattern used by
@@ -1732,7 +2352,10 @@ macro_rules! try_param {
     };
 }
 
-fn close_hint_for(mode: ServerMode, pooled: bool) -> &'static str {
+fn close_hint_for(mode: ServerMode, pooled: bool, workspace: bool) -> &'static str {
+    if workspace {
+        return "In workspace mode, call close_idb with this database_id to release its IDA worker and database state.";
+    }
     match (mode, pooled) {
         (ServerMode::Http, true) => {
             "In pooled HTTP/SSE mode, close_idb releases this session's child worker lease. Sessions do not share one global close_token."
@@ -1777,6 +2400,47 @@ fn remove_partial_idat_outputs(out_i64: &std::path::Path) {
             }
         }
     }
+}
+
+/// Remove non-primary artifacts left by an interrupted DSC generation after
+/// proving no other ida-mcp process owns the output lock. A packed `.i64` or
+/// unpacked `.id0` is never removed here; open_dsc will try to preserve it.
+fn remove_orphaned_dsc_output_artifacts(out_i64: &std::path::Path) -> Result<(), ToolError> {
+    if crate::ida::handlers::database::ida_database_output_exists(out_i64) {
+        return Err(ToolError::DatabaseLocked(format!(
+            "{} appeared while preparing DSC generation; retry open_dsc to reuse it",
+            out_i64.display()
+        )));
+    }
+    let lock = crate::ida::lock::acquire_mcp_lock(out_i64)?;
+    if crate::ida::handlers::database::ida_database_output_exists(out_i64) {
+        crate::ida::lock::release_mcp_lock_file(lock);
+        return Err(ToolError::DatabaseLocked(format!(
+            "{} appeared while preparing DSC generation; retry open_dsc to reuse it",
+            out_i64.display()
+        )));
+    }
+    let mut paths = Vec::new();
+    for extension in ["id1", "id2", "nam", "til"] {
+        let mut path = out_i64.to_path_buf();
+        path.set_extension(extension);
+        paths.push(path);
+    }
+    for path in paths {
+        match std::fs::remove_file(&path) {
+            Ok(()) => info!(path = %path.display(), "removed orphaned DSC database artifact"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                crate::ida::lock::release_mcp_lock_file(lock);
+                return Err(ToolError::OpenFailed(format!(
+                    "failed to remove orphaned DSC database artifact {}: {error}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    crate::ida::lock::release_mcp_lock_file(lock);
+    Ok(())
 }
 
 /// Insert close-ownership metadata onto a tool result, identical for foreground
@@ -1829,8 +2493,9 @@ fn apply_close_metadata(
 impl IdaMcpServer {
     #[tool(
         description = "Open an IDA database (.i64/.idb) or raw binary (Mach-O/ELF/PE). \
-        Raw binaries are saved as .i64 alongside the input and later raw-path opens reuse \
-        that database unless rebuild=true is set. \
+        Raw binaries default to a .i64 alongside the input; idb_out selects another output path. \
+        Later raw-path opens reuse only a database whose recorded input SHA-256 matches. \
+        rebuild=true may replace only a provenance-matched database. \
         For raw binaries, auto-analysis is OFF by default — check analysis_status; \
         call analyze_funcs(background=true) for full xrefs/decompile. \
         Returns close_token in HTTP/SSE mode (provide to close_idb). \
@@ -1849,7 +2514,7 @@ impl IdaMcpServer {
         debug!("Tool call: open_idb");
         let path = req.path.trim().to_string();
         // Validate path (prevent directory traversal, check extension)
-        if !Self::validate_path(&path) {
+        if !Self::validate_open_path(&path) {
             return Ok(ToolError::InvalidPath(path).to_tool_result().into());
         }
         let timeout_secs = match parse_optional_unsigned::<u64>(req.timeout_secs, "timeout_secs") {
@@ -1857,24 +2522,94 @@ impl IdaMcpServer {
             Err(error) => return Ok(error.to_tool_result().into()),
         };
 
+        let input_is_database = Self::is_database_path(&path);
         let debug_info_path = req.normalized_debug_info_path();
         let file_type = req.normalized_file_type();
+        let processor = req.normalized_processor();
+        if let Some(processor) = processor.as_deref()
+            && let Err(error) = validate_raw_processor(processor)
+        {
+            return Ok(error.to_tool_result().into());
+        }
+        let bitness_value = match parse_optional_unsigned::<u32>(req.bitness, "bitness") {
+            Ok(value) => value,
+            Err(error) => return Ok(error.to_tool_result().into()),
+        };
+        let bitness = match bitness_value {
+            None => None,
+            Some(16) => Some(idalib::segment::Bitness::Bits16),
+            Some(32) => Some(idalib::segment::Bitness::Bits32),
+            Some(64) => Some(idalib::segment::Bitness::Bits64),
+            Some(_) => {
+                return Ok(
+                    ToolError::InvalidParams("bitness must be 16, 32, or 64".to_string())
+                        .to_tool_result()
+                        .into(),
+                );
+            }
+        };
+        let base_address = match req
+            .base_address
+            .as_ref()
+            .map(|value| Self::value_to_exactly_one_address(value, "base_address"))
+            .transpose()
+        {
+            Ok(value) => value,
+            Err(error) => return Ok(error.to_tool_result().into()),
+        };
+        if base_address.is_some_and(|address| address & 0xf != 0) {
+            return Ok(ToolError::InvalidParams(
+                "base_address must be 16-byte aligned".to_string(),
+            )
+            .to_tool_result()
+            .into());
+        }
+        let entry_point = match req
+            .entry_point
+            .as_ref()
+            .map(|value| Self::value_to_exactly_one_address(value, "entry_point"))
+            .transpose()
+        {
+            Ok(value) => value,
+            Err(error) => return Ok(error.to_tool_result().into()),
+        };
+        let idb_out = req.effective_idb_out(matches!(self.mode, ServerMode::Worker));
+        let raw_target = RawBinaryTarget {
+            processor,
+            bitness,
+            base_address,
+            entry_point,
+        };
+        if input_is_database && (idb_out.is_some() || !raw_target.is_empty()) {
+            return Ok(ToolError::InvalidParams(
+                "processor, bitness, base_address, entry_point, and idb_out are only valid when opening a raw input"
+                    .to_string(),
+            )
+            .to_tool_result()
+            .into());
+        }
+        if !raw_target.is_empty()
+            && !req.rebuild.unwrap_or(false)
+            && raw_blob_database_exists(&path, idb_out.as_deref())
+        {
+            return Ok(ToolError::InvalidParams(
+                "raw target options only affect a newly-created database; the output already exists. Set rebuild=true to recreate it, or omit processor/bitness/base_address/entry_point to reuse the verified database."
+                    .to_string(),
+            )
+            .to_tool_result()
+            .into());
+        }
         let worker_extra_args = if matches!(self.mode, ServerMode::Worker) {
             req.worker_extra_args.clone()
         } else {
             Vec::new()
-        };
-        let worker_idb_out = if matches!(self.mode, ServerMode::Worker) {
-            req.worker_idb_out.clone()
-        } else {
-            None
         };
         let open_timeout_secs = timeout_secs.unwrap_or(300).min(MAX_TIMEOUT_SECS);
         let foreground_timeout_secs = self.foreground_timeout_secs(timeout_secs, 300);
         let user_auto_analyse = req.auto_analyse.unwrap_or(false);
         let large_input_size = if !matches!(self.mode, ServerMode::Worker)
             && user_auto_analyse
-            && !Self::is_database_path(&path)
+            && !input_is_database
         {
             Self::input_size_above_threshold(&path)
         } else {
@@ -1925,8 +2660,9 @@ impl IdaMcpServer {
                         req.rebuild.unwrap_or(false),
                         file_type.clone(),
                         effective_auto_analyse,
+                        raw_target.clone(),
                         worker_extra_args.clone(),
-                        worker_idb_out.clone(),
+                        idb_out.clone(),
                         Some(open_timeout_secs),
                         Some(progress_tx),
                         Some(cancel),
@@ -2310,6 +3046,305 @@ impl IdaMcpServer {
         }
     }
 
+    #[tool(
+        description = "Report opt-in headless debugger backend, transport, and authorization readiness."
+    )]
+    #[instrument(skip_all)]
+    async fn debug_status(&self) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: debug_status");
+        // Backend/authorization readiness only. Live process state is not
+        // reported here: it would have to be a database-scoped query
+        // dispatched to the selected worker, never inferred by the parent.
+        let status = crate::ida::handlers::debugger::runtime_status();
+        Ok(CallToolResult::success(vec![Content::text(pretty_json(
+            &status,
+        ))]))
+    }
+
+    #[tool(
+        description = "Launch an executable through IDA's native debugger and wait for its initial suspended event."
+    )]
+    #[instrument(skip_all, fields(path = %req.path))]
+    async fn debug_launch(
+        &self,
+        Parameters(req): Parameters<DebugLaunchRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: debug_launch");
+        let expanded = crate::expand_path(req.path.trim());
+        if !expanded.is_absolute() || !expanded.is_file() {
+            return Ok(ToolError::InvalidPath(expanded.display().to_string()).to_tool_result());
+        }
+        if req
+            .arguments
+            .as_deref()
+            .is_some_and(|value| value.contains('\0'))
+        {
+            return Ok(ToolError::InvalidParams(
+                "arguments must not contain a NUL byte".to_string(),
+            )
+            .to_tool_result());
+        }
+        let start_directory = req
+            .start_directory
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(crate::expand_path);
+        if let Some(directory) = start_directory.as_ref()
+            && (!directory.is_absolute() || !directory.is_dir())
+        {
+            return Ok(ToolError::InvalidPath(directory.display().to_string()).to_tool_result());
+        }
+        let timeout_seconds = match parse_debug_timeout(req.timeout_secs, 30) {
+            Ok(timeout) => timeout,
+            Err(error) => return Ok(error.to_tool_result()),
+        };
+        let result = self
+            .worker
+            .debug_launch(
+                &expanded.display().to_string(),
+                req.arguments,
+                start_directory.map(|path| path.display().to_string()),
+                timeout_seconds,
+            )
+            .await;
+        Ok(Self::finish_debugger_start(result))
+    }
+
+    #[tool(
+        description = "Attach IDA's native debugger to a process and wait for its initial suspended event."
+    )]
+    #[instrument(skip_all, fields(pid = req.pid))]
+    async fn debug_attach(
+        &self,
+        Parameters(req): Parameters<DebugAttachRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: debug_attach");
+        let pid = match u32::try_from(req.pid) {
+            Ok(pid) if pid > 0 => pid,
+            _ => {
+                return Ok(ToolError::InvalidParams(
+                    "pid must be a positive 32-bit process ID".to_string(),
+                )
+                .to_tool_result());
+            }
+        };
+        let timeout_seconds = match parse_debug_timeout(req.timeout_secs, 30) {
+            Ok(timeout) => timeout,
+            Err(error) => return Ok(error.to_tool_result()),
+        };
+        let result = self.worker.debug_attach(pid, timeout_seconds).await;
+        Ok(Self::finish_debugger_start(result))
+    }
+
+    #[tool(
+        description = "List modules loaded in the active debuggee with runtime base, end, and size."
+    )]
+    #[instrument(skip_all)]
+    async fn debug_modules(&self) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: debug_modules");
+        match self.worker.debug_modules().await {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(pretty_json(
+                &result,
+            ))])),
+            Err(error) => Ok(error.to_tool_result()),
+        }
+    }
+
+    #[tool(
+        description = "Detach or terminate the active debug target. auto terminates launched targets and detaches attached targets."
+    )]
+    #[instrument(skip_all, fields(action = ?req.action))]
+    async fn debug_stop(
+        &self,
+        Parameters(req): Parameters<DebugStopRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: debug_stop");
+        let action = match DebugStopAction::parse(req.action.as_deref()) {
+            Ok(action) => action,
+            Err(message) => return Ok(ToolError::InvalidParams(message).to_tool_result()),
+        };
+        let timeout_seconds = match parse_debug_timeout(req.timeout_secs, 10) {
+            Ok(timeout) => timeout,
+            Err(error) => return Ok(error.to_tool_result()),
+        };
+        // Workspace debug-pin release happens inside the pooled debug_stop
+        // dispatch, bound to the lease that served it.
+        match self.worker.debug_stop(action, timeout_seconds).await {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(pretty_json(
+                &result,
+            ))])),
+            Err(error) => Ok(error.to_tool_result()),
+        }
+    }
+
+    #[tool(
+        description = "Open a module returned by debug_modules in a new workspace database. Standalone images open directly; cache-backed macOS system modules use IDA 9.4's in-process DSC APIs. idb_out is always required."
+    )]
+    #[instrument(skip_all)]
+    async fn debug_open_module(
+        &self,
+        Parameters(req): Parameters<DebugOpenModuleRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: debug_open_module");
+        let Some(registry) = self.workspace_registry.as_ref() else {
+            return Ok(ToolError::InvalidParams(
+                "debug_open_module requires ida-mcp --workspace".to_string(),
+            )
+            .to_tool_result());
+        };
+        let Some(source_database_id) = self.workspace_database_id.as_deref() else {
+            return Ok(ToolError::InvalidParams(
+                "debug_open_module requires the source debug database_id".to_string(),
+            )
+            .to_tool_result());
+        };
+        let output = crate::expand_path(req.idb_out.trim());
+        let output_is_supported_database = output
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("i64") || extension.eq_ignore_ascii_case("idb")
+            });
+        if req.idb_out.trim().is_empty() || !output.is_absolute() || !output_is_supported_database {
+            return Ok(ToolError::InvalidParams(
+                "idb_out must be an absolute .i64/.idb output path".to_string(),
+            )
+            .to_tool_result());
+        }
+        let timeout_secs = match parse_optional_unsigned::<u64>(req.timeout_secs, "timeout_secs") {
+            Ok(Some(timeout)) if (1..=600).contains(&timeout) => timeout,
+            Ok(None) => 300,
+            Ok(Some(_)) => {
+                return Ok(ToolError::InvalidParams(
+                    "timeout_secs must be between 1 and 600".to_string(),
+                )
+                .to_tool_result());
+            }
+            Err(error) => return Ok(error.to_tool_result()),
+        };
+
+        let modules = match self.worker.debug_modules().await {
+            Ok(modules) => modules,
+            Err(error) => return Ok(error.to_tool_result()),
+        };
+        let module = match select_runtime_module(&modules, req.module.trim()) {
+            Ok(module) => module,
+            Err(error) => return Ok(error.to_tool_result()),
+        };
+        let Some(module_path) = module.get("path").and_then(Value::as_str) else {
+            return Ok(ToolError::RemoteProtocol(
+                "debug_modules returned a module without a path".to_string(),
+            )
+            .to_tool_result());
+        };
+        let module_path = module_path.to_string();
+        let expanded_module = crate::expand_path(&module_path);
+        let source_meta = if expanded_module.is_file() {
+            None
+        } else {
+            match self.worker.idb_meta().await {
+                Ok(meta) => Some(meta),
+                Err(error) => return Ok(error.to_tool_result()),
+            }
+        };
+        let source = match resolve_runtime_module_source(&expanded_module, source_meta.as_ref()) {
+            Ok(source) => source,
+            Err(error) => return Ok(error.to_tool_result()),
+        };
+        if source.open_path() == output {
+            return Ok(ToolError::InvalidParams(
+                "idb_out must not overwrite the runtime module source".to_string(),
+            )
+            .to_tool_result());
+        }
+
+        let lease = registry.allocate_database();
+        let database_id = lease.database_id().to_string();
+        let destination = WorkerBackend::pooled(lease.database());
+        let opened = destination
+            .open_observed_with_generation(
+                &source.open_path().display().to_string(),
+                false,
+                None,
+                false,
+                false,
+                req.rebuild.unwrap_or(false),
+                None,
+                false,
+                RawBinaryTarget::default(),
+                Vec::new(),
+                Some(output.display().to_string()),
+                Some(timeout_secs),
+                None,
+                None,
+            )
+            .await;
+        let opened = match opened {
+            Ok(opened) => opened,
+            Err(error) => {
+                drop(lease);
+                let _ = registry.close_database(&database_id).await;
+                return Ok(error.to_tool_result());
+            }
+        };
+        let generation = opened.generation;
+        let opened = opened.info;
+        let dsc_image = if source.is_dyld_shared_cache() {
+            match destination
+                .dsc_load_image_for_generation(&module_path, Some(timeout_secs), Some(generation))
+                .await
+            {
+                Ok(image) => Some(image),
+                Err(error) => {
+                    drop(lease);
+                    let _ = registry.close_database(&database_id).await;
+                    return Ok(error.to_tool_result());
+                }
+            }
+        } else {
+            None
+        };
+        let segments = match destination.segments().await {
+            Ok(segments) => segments,
+            Err(error) => {
+                drop(lease);
+                let _ = registry.close_database(&database_id).await;
+                return Ok(error.to_tool_result());
+            }
+        };
+        let preferred_base = runtime_module_preferred_base(
+            dsc_image.as_ref().map(|image| image.address_value),
+            segments.iter().filter_map(|segment| {
+                Self::parse_address(&segment.start)
+                    .ok()
+                    .map(|base| (base, segment_defines_runtime_image_base(segment)))
+            }),
+        );
+        let runtime_base = module.get("base_value").and_then(Value::as_u64);
+        let runtime_slide = runtime_base
+            .zip(preferred_base)
+            .map(|(runtime, preferred)| checked_runtime_slide(runtime, preferred));
+        drop(lease);
+
+        let result = json!({
+            "status": "ready",
+            "source_database_id": source_database_id,
+            "database_id": database_id,
+            "module": module,
+            "database": opened,
+            "module_source": source.kind(),
+            "dsc_image": dsc_image,
+            "preferred_base": preferred_base.map(|base| format!("{base:#x}")),
+            "preferred_base_value": preferred_base,
+            "runtime_slide": runtime_slide,
+            "note": "The new database remains at its on-disk preferred addresses; use runtime_slide to translate runtime addresses."
+        });
+        Ok(CallToolResult::success(vec![Content::text(pretty_json(
+            &result,
+        ))]))
+    }
+
     #[tool(description = "Report auto-analysis status (auto_is_ok, auto_state). \
         Use this to check whether analysis-dependent tools (xrefs, decompile) are fully ready.")]
     #[instrument(skip_all)]
@@ -2344,7 +3379,10 @@ impl IdaMcpServer {
         Parameters(req): Parameters<CloseIdbRequest>,
     ) -> Result<CallToolResult, McpError> {
         info!("Tool call: close_idb received");
-        if matches!(self.mode, ServerMode::Http) && self.worker.uses_close_tokens() {
+        if !self.workspace_enabled()
+            && matches!(self.mode, ServerMode::Http)
+            && self.worker.uses_close_tokens()
+        {
             match self.worker.authorize_close(
                 &self.session_id,
                 req.token.as_deref(),
@@ -2373,7 +3411,18 @@ impl IdaMcpServer {
                 }
             }
         }
-        match self.worker.close().await {
+        let result = self.worker.close().await;
+        if workspace_close_should_remove_entry(
+            &result,
+            &self.task_registry,
+            self.workspace_database_id.as_deref(),
+        ) && let (Some(registry), Some(database_id)) = (
+            self.workspace_registry.as_ref(),
+            self.workspace_database_id.as_deref(),
+        ) {
+            let _ = registry.remove(database_id);
+        }
+        match result {
             Ok(()) => {
                 self.worker.clear_close_token();
                 info!("Tool call: close_idb completed successfully");
@@ -2405,12 +3454,14 @@ impl IdaMcpServer {
         {
             let tools: Vec<_> = tool_registry::tools_by_category(cat)
                 .filter(|t| filter.is_enabled(t.name))
+                .filter(|t| !t.requirements.workspace || self.workspace_enabled())
                 .take(limit)
                 .map(|t| {
                     json!({
                         "name": t.name,
                         "description": t.short_desc,
                         "category": t.category.as_str(),
+                        "scope": t.scope,
                     })
                 })
                 .collect();
@@ -2435,12 +3486,14 @@ impl IdaMcpServer {
             let tools: Vec<_> = results
                 .iter()
                 .filter(|(t, _)| filter.is_enabled(t.name))
+                .filter(|(t, _)| !t.requirements.workspace || self.workspace_enabled())
                 .take(limit)
                 .map(|(t, keywords)| {
                     json!({
                         "name": t.name,
                         "description": t.short_desc,
                         "category": t.category.as_str(),
+                        "scope": t.scope,
                         "matched": keywords,
                     })
                 })
@@ -2466,6 +3519,7 @@ impl IdaMcpServer {
             .map(|c| {
                 let count = tool_registry::tools_by_category(*c)
                     .filter(|t| filter.is_enabled(t.name))
+                    .filter(|t| !t.requirements.workspace || self.workspace_enabled())
                     .count();
                 json!({
                     "category": c.as_str(),
@@ -2507,32 +3561,41 @@ impl IdaMcpServer {
 
         // If the tool exists in the registry but is filter-disabled, do not
         // leak its schema as available — return a clear disabled message.
-        if self.filter.is_active()
-            && tool_registry::get_tool(&req.name).is_some()
-            && !self.filter.is_enabled(&req.name)
-        {
+        if tool_registry::get_tool(&req.name).is_some_and(|tool| {
+            !self.filter.is_enabled(&req.name)
+                || (tool.requirements.workspace && !self.workspace_enabled())
+        }) {
             return Ok(CallToolResult::success(vec![Content::text(pretty_json(
                 &json!({
-                    "error": format!(
-                        "tool '{}' is disabled by current filter \
-                         (--toolsets/--tools/--exclude-tools/--read-only)",
-                        req.name
+                    "error": disabled_tool_message(
+                        &req.name,
+                        self.workspace_enabled(),
+                        self.filter.debugger_enabled(),
                     ),
-                    "filtering_active": true,
+                    "filtering_active": self.filter.is_active(),
                     "hint": "call tool_catalog to see enabled tools",
                 }),
             ))]));
         }
 
         if let Some(tool) = tool_registry::get_tool(&req.name) {
-            let params = tool_params_schema(&req.name);
+            let mut params = tool_params_schema(&req.name);
+            let mut example = Cow::Borrowed(tool.example);
+            if self.workspace_enabled() {
+                if let Some(Value::Object(schema)) = params.as_mut() {
+                    add_workspace_database_id_schema(&req.name, schema);
+                }
+                example = workspace_tool_example(&req.name, tool.example);
+            }
             Ok(CallToolResult::success(vec![Content::text(pretty_json(
                 &json!({
                     "name": tool.name,
                     "category": tool.category.as_str(),
+                    "scope": tool.scope,
+                    "requirements": tool.requirements,
                     "description": tool.full_desc,
                     "parameters": params,
-                    "example": tool.example,
+                    "example": example,
                     "keywords": tool.keywords,
                 }),
             ))]))
@@ -2716,6 +3779,33 @@ impl IdaMcpServer {
                 serde_json::to_string_pretty(&json!({ "results": results }))
                     .unwrap_or_else(|_| format!("{:?}", results)),
             )]))
+        }
+    }
+
+    #[tool(description = "Render a bounded half-open address range using IDA's database text")]
+    #[instrument(skip_all, fields(max_lines = req.max_lines))]
+    async fn render_range(
+        &self,
+        Parameters(req): Parameters<RenderRangeRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: render_range");
+        let start = match Self::value_to_single_address(&req.start) {
+            Ok(address) => address,
+            Err(error) => return Ok(error.to_tool_result()),
+        };
+        let end = match Self::value_to_single_address(&req.end) {
+            Ok(address) => address,
+            Err(error) => return Ok(error.to_tool_result()),
+        };
+        let max_lines = try_param!(parse_optional_unsigned::<usize>(req.max_lines, "max_lines"))
+            .unwrap_or(512)
+            .min(4096);
+
+        match self.worker.render_range(start, end, max_lines).await {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}")),
+            )])),
+            Err(error) => Ok(error.to_tool_result()),
         }
     }
 
@@ -3111,6 +4201,41 @@ impl IdaMcpServer {
             }
         } else {
             Ok(ToolError::InvalidParams("address or name required".to_string()).to_tool_result())
+        }
+    }
+
+    #[tool(description = "List IDA patch records, coalesced and paginated")]
+    #[instrument(skip_all, fields(offset = req.offset, limit = req.limit))]
+    async fn list_patches(
+        &self,
+        Parameters(req): Parameters<ListPatchesRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: list_patches");
+        let start = match req.start.as_ref() {
+            Some(value) => match Self::value_to_single_address(value) {
+                Ok(address) => Some(address),
+                Err(error) => return Ok(error.to_tool_result()),
+            },
+            None => None,
+        };
+        let end = match req.end.as_ref() {
+            Some(value) => match Self::value_to_single_address(value) {
+                Ok(address) => Some(address),
+                Err(error) => return Ok(error.to_tool_result()),
+            },
+            None => None,
+        };
+        let offset =
+            try_param!(parse_optional_unsigned::<usize>(req.offset, "offset")).unwrap_or(0);
+        let limit = try_param!(parse_optional_unsigned::<usize>(req.limit, "limit"))
+            .unwrap_or(100)
+            .min(10000);
+
+        match self.worker.list_patches(start, end, offset, limit).await {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}")),
+            )])),
+            Err(error) => Ok(error.to_tool_result()),
         }
     }
 
@@ -3677,9 +4802,17 @@ impl IdaMcpServer {
         let max_nodes = try_param!(parse_optional_unsigned::<usize>(req.max_nodes, "max_nodes"))
             .unwrap_or(256)
             .min(10000);
+        let direction = match CallGraphDirection::parse(req.direction.as_deref()) {
+            Ok(direction) => direction,
+            Err(message) => return Ok(ToolError::InvalidParams(message).to_tool_result()),
+        };
 
         if roots.len() == 1 {
-            match self.worker.callgraph(roots[0], max_depth, max_nodes).await {
+            match self
+                .worker
+                .callgraph(roots[0], direction, max_depth, max_nodes)
+                .await
+            {
                 Ok(result) => Ok(CallToolResult::success(vec![Content::text(
                     serde_json::to_string_pretty(&result)
                         .unwrap_or_else(|_| format!("{:?}", result)),
@@ -3689,7 +4822,11 @@ impl IdaMcpServer {
         } else {
             let mut results = Vec::new();
             for root in roots {
-                match self.worker.callgraph(root, max_depth, max_nodes).await {
+                match self
+                    .worker
+                    .callgraph(root, direction, max_depth, max_nodes)
+                    .await
+                {
                     Ok(result) => results.push(json!({
                         "root": format!("{:#x}", root),
                         "callgraph": result
@@ -3718,6 +4855,9 @@ impl IdaMcpServer {
             Ok(v) => v,
             Err(e) => return Ok(e.to_tool_result()),
         };
+        if let Err(error) = Self::validate_xref_matrix_size(&addrs) {
+            return Ok(error.to_tool_result());
+        }
         match self.worker.xref_matrix(addrs).await {
             Ok(result) => Ok(CallToolResult::success(vec![Content::text(
                 serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
@@ -4429,10 +5569,11 @@ impl IdaMcpServer {
         owner: &task::TaskOwner,
         cancel_token: tokio_util::sync::CancellationToken,
     ) -> Result<String, task::TaskCreateError> {
+        let dedup_key = self.workspace_task_key("analyze_funcs");
         let task_id = self.task_registry.create_keyed(
             owner,
             "analyze",
-            "analyze_funcs",
+            &dedup_key,
             "Waiting for IDA auto-analysis to finish",
         )?;
 
@@ -4440,10 +5581,12 @@ impl IdaMcpServer {
 
         let registry = self.task_registry.clone();
         let worker = self.worker.clone();
+        let workspace_pin = self.workspace_pin();
         let tid = task_id.clone();
         let worker_cancel_token = cancel_token.clone();
 
         tokio::spawn(async move {
+            let _workspace_pin = workspace_pin;
             // Bridge worker progress updates → task registry messages.
             // The drain task ends when tx is dropped after analyze_funcs_observed returns.
             let (tx, mut rx): (ProgressSender, ProgressReceiver) =
@@ -4584,21 +5727,34 @@ impl IdaMcpServer {
 
         let file_type = crate::dsc::dsc_file_type(&req.arch, ida_version);
         let frameworks = req.frameworks.unwrap_or_default();
-        let dsc_path = std::path::Path::new(&req.path);
+        let dsc_path = expanded_dsc_path(&req.path);
         let out_i64 = dsc_path.with_extension("i64");
         // Reuse order: a sibling .i64 (legacy idat output or user-provided)
         // first, then the 9.4 direct-path cache. Pre-9.4 never considers the
         // cache — those databases were written by a newer IDA and cannot be
-        // opened there.
-        let cache_i64 = direct_dsc_cache_i64_path(dsc_path);
-        let existing_i64 = if out_i64.exists() {
-            Some(out_i64.clone())
-        } else if idalib::SDK_VERSION >= (9, 4) && cache_i64.exists() {
-            Some(cache_i64.clone())
+        // opened there. Provenance: the sibling is a user-managed artifact
+        // next to their own file (documented exemption — delete it to force a
+        // reload), while the managed temp cache is keyed by the DSC's header
+        // UUID so it can never serve a different firmware's analysis. The
+        // cache path is derived only when the sibling is absent, so a sibling
+        // database keeps working even for inputs whose identity cannot be
+        // derived.
+        let sibling_exists = crate::ida::handlers::database::ida_database_output_exists(&out_i64);
+        let cache_i64 = if !sibling_exists && idalib::SDK_VERSION >= (9, 4) {
+            match direct_dsc_cache_i64_path(&dsc_path) {
+                Ok(cache) => Some(cache),
+                Err(error) => return Ok(error.to_tool_result()),
+            }
         } else {
             None
         };
-
+        let existing_i64 = if sibling_exists {
+            Some(out_i64.clone())
+        } else {
+            cache_i64
+                .clone()
+                .filter(|cache| crate::ida::handlers::database::ida_database_output_exists(cache))
+        };
         match dsc_open_plan(idalib::SDK_VERSION, existing_i64.is_some()) {
             // Existing .i64 databases are already in IDA's database format.
             DscOpenPlan::DirectExistingI64 => {
@@ -4615,10 +5771,17 @@ impl IdaMcpServer {
             // Do not pass the legacy -T file-type selector here. IDA 9.4's
             // direct idalib open path rejects it with "Unknown switch '-T'".
             DscOpenPlan::BackgroundDirectRawDsc => {
-                let idb_out = cache_i64;
+                // dsc_open_plan selects this arm only on SDK >= 9.4, where the
+                // content-keyed cache path was just computed.
+                let Some(idb_out) = cache_i64 else {
+                    return Ok(ToolError::IdaError(
+                        "direct DSC open selected without a cache path".to_string(),
+                    )
+                    .to_tool_result());
+                };
                 let dsc_ctx = DscBackgroundCtx {
                     open: DscBackgroundOpen::DirectRawDsc {
-                        open_path: dsc_path.to_path_buf(),
+                        open_path: dsc_path.clone(),
                         idb_out: idb_out.clone(),
                     },
                     module: req.module.clone(),
@@ -4628,7 +5791,7 @@ impl IdaMcpServer {
                 };
                 return self.start_dsc_background(
                     &self.task_owner(&ctx.meta),
-                    dsc_path.display().to_string(),
+                    dsc_task_key(&idb_out),
                     &format!(
                         "Opening DSC directly with idalib (idb_out={})...",
                         idb_out.display()
@@ -4667,13 +5830,13 @@ impl IdaMcpServer {
             .to_tool_result());
         }
         let idat_args = crate::dsc::idat_dsc_args(
-            dsc_path,
+            &dsc_path,
             &out_i64,
             &script_path,
             &file_type,
             log_path.as_deref(),
         );
-        let dedup_key = out_i64.display().to_string();
+        let dedup_key = dsc_task_key(&out_i64);
 
         let dsc_ctx = DscBackgroundCtx {
             open: DscBackgroundOpen::LegacyIdat {
@@ -4870,6 +6033,41 @@ impl IdaMcpServer {
             }
             Err(e) => Ok(e.to_tool_result()),
         }
+    }
+
+    #[tool(
+        description = "List every workspace database_id this server routes, with its path and \
+        lifecycle state. Use it to recover a handle after a lost response or a stateless HTTP \
+        reconnect. Read-only; workspace mode only."
+    )]
+    #[instrument(skip_all)]
+    async fn list_databases(&self) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: list_databases");
+        let Some(registry) = self.workspace_registry.as_ref() else {
+            return Ok(ToolError::InvalidParams(
+                "list_databases requires workspace mode; start the server with --workspace"
+                    .to_string(),
+            )
+            .to_tool_result());
+        };
+        let databases: Vec<Value> = registry
+            .list_databases()
+            .into_iter()
+            .map(|summary| {
+                json!({
+                    "database_id": summary.database_id,
+                    "path": summary.path,
+                    "state": summary.state,
+                    "idle_seconds": summary.idle_seconds,
+                    "active_calls": summary.active_calls,
+                    "pinned": summary.pinned,
+                    "debug_pinned": summary.debug_pinned,
+                })
+            })
+            .collect();
+        Ok(CallToolResult::success(vec![Content::text(pretty_json(
+            &json!({ "count": databases.len(), "databases": databases }),
+        ))]))
     }
 
     #[tool(
@@ -5257,10 +6455,17 @@ fn tool_params_schema(name: &str) -> Option<Value> {
         "dsc_add_region" => Some(schema::<DscAddRegionRequest>()),
         "close_idb" => Some(schema::<CloseIdbRequest>()),
         "load_debug_info" => Some(schema::<LoadDebugInfoRequest>()),
+        "debug_status" | "debug_modules" => Some(schema::<EmptyParams>()),
+        "debug_launch" => Some(schema::<DebugLaunchRequest>()),
+        "debug_attach" => Some(schema::<DebugAttachRequest>()),
+        "debug_stop" => Some(schema::<DebugStopRequest>()),
+        "debug_open_module" => Some(schema::<DebugOpenModuleRequest>()),
         "analysis_status" => Some(schema::<EmptyParams>()),
+        "list_databases" => Some(schema::<EmptyParams>()),
         "tool_catalog" => Some(schema::<ToolCatalogRequest>()),
         "tool_help" => Some(schema::<ToolHelpRequest>()),
         "recent_operations" => Some(schema::<RecentOperationsRequest>()),
+        "task_status" => Some(schema::<TaskStatusRequest>()),
         "idb_meta" => Some(schema::<EmptyParams>()),
 
         // Functions
@@ -5273,6 +6478,7 @@ fn tool_params_schema(name: &str) -> Option<Value> {
 
         // Disassembly / Decompile
         "disasm" => Some(schema::<DisasmRequest>()),
+        "render_range" => Some(schema::<RenderRangeRequest>()),
         "disasm_by_name" => Some(schema::<DisasmByNameRequest>()),
         "disasm_function_at" => Some(schema::<DisasmFunctionAtRequest>()),
         "decompile" => Some(schema::<DecompileRequest>()),
@@ -5287,6 +6493,7 @@ fn tool_params_schema(name: &str) -> Option<Value> {
 
         // Memory / Search / Metadata
         "get_bytes" => Some(schema::<GetBytesRequest>()),
+        "list_patches" => Some(schema::<ListPatchesRequest>()),
         "get_string" => Some(schema::<GetStringRequest>()),
         "get_u8" | "get_u16" | "get_u32" | "get_u64" => Some(schema::<AddressRequest>()),
         "get_global_value" => Some(schema::<GetGlobalValueRequest>()),
@@ -5496,7 +6703,7 @@ fn materialize_task_response(
 #[tool_handler(router = self.tool_mux)]
 impl ServerHandler for IdaMcpServer {
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
-        supported_protocol_versions(self.worker.is_pooled())
+        supported_protocol_versions(self.worker.is_legacy_pooled())
     }
 
     fn get_info(&self) -> ServerInfo {
@@ -5564,6 +6771,7 @@ impl ServerHandler for IdaMcpServer {
 pub struct SanitizedIdaServer<S> {
     inner: S,
     filter: Arc<tool_filter::ToolFilter>,
+    workspace: bool,
 }
 
 impl<S> SanitizedIdaServer<S> {
@@ -5573,12 +6781,25 @@ impl<S> SanitizedIdaServer<S> {
         Self {
             inner,
             filter: Arc::new(tool_filter::ToolFilter::unrestricted()),
+            workspace: false,
         }
     }
 
     /// Wrap with an explicit filter (built from CLI/env at startup).
     pub fn with_filter(inner: S, filter: Arc<tool_filter::ToolFilter>) -> Self {
-        Self { inner, filter }
+        Self {
+            inner,
+            filter,
+            workspace: false,
+        }
+    }
+
+    pub fn with_workspace(inner: S, filter: Arc<tool_filter::ToolFilter>) -> Self {
+        Self {
+            inner,
+            filter,
+            workspace: true,
+        }
     }
 }
 
@@ -5600,14 +6821,18 @@ fn tool_annotations_for(name: &str) -> ToolAnnotations {
             .read_only(false)
             .destructive(true)
             .open_world(true),
-        "run_script" => ToolAnnotations::new()
+        "run_script" | "debug_launch" | "debug_attach" => ToolAnnotations::new()
             .read_only(false)
             .destructive(true)
             .open_world(true),
+        "debug_stop" => ToolAnnotations::new()
+            .read_only(false)
+            .destructive(true)
+            .open_world(false),
         "patch" | "patch_asm" => ToolAnnotations::new().read_only(false).destructive(true),
         "open_idb" | "open_dsc" | "dsc_add_dylib" | "dsc_add_region" | "close_idb"
         | "load_debug_info" | "declare_type" | "apply_types" | "declare_stack" | "delete_stack"
-        | "rename" | "set_comments" => ToolAnnotations::new()
+        | "rename" | "set_comments" | "debug_open_module" => ToolAnnotations::new()
             .read_only(false)
             .destructive(name == "close_idb")
             .open_world(false),
@@ -5626,6 +6851,66 @@ fn set_tool_metadata(tool: &mut Tool) {
 fn apply_tool_metadata(mut tool: Tool) -> Tool {
     set_tool_metadata(&mut tool);
     tool
+}
+
+fn add_workspace_database_id_schema(name: &str, schema: &mut Map<String, Value>) {
+    if !workspace_requires_database_id(name) {
+        return;
+    }
+
+    let properties = schema
+        .entry("properties".to_string())
+        .or_insert_with(|| json!({}));
+    if let Value::Object(properties) = properties {
+        properties.insert(
+            "database_id".to_string(),
+            json!({
+                "type": "string",
+                "format": "uuid",
+                "description": "Opaque database handle returned by open_idb/open_dsc in workspace mode"
+            }),
+        );
+    }
+    let required = schema
+        .entry("required".to_string())
+        .or_insert_with(|| json!([]));
+    if let Value::Array(required) = required
+        && !required.iter().any(|value| value == "database_id")
+    {
+        required.push(json!("database_id"));
+    }
+}
+
+fn workspace_requires_database_id(name: &str) -> bool {
+    tool_registry::get_tool(name).is_some_and(|info| info.scope == ToolScope::Database)
+}
+
+fn workspace_tool_example<'a>(name: &str, example: &'a str) -> Cow<'a, str> {
+    if !workspace_requires_database_id(name) {
+        return Cow::Borrowed(example);
+    }
+    let Ok(Value::Object(mut arguments)) = serde_json::from_str(example) else {
+        return Cow::Borrowed(example);
+    };
+    arguments.insert(
+        "database_id".to_string(),
+        json!("00000000-0000-0000-0000-000000000000"),
+    );
+    Cow::Owned(Value::Object(arguments).to_string())
+}
+
+fn add_workspace_schema(tool: &mut Tool) {
+    if tool_registry::allocates_database(tool.name.as_ref()) {
+        let description = tool.description.as_deref().unwrap_or_default();
+        tool.description = Some(Cow::Owned(format!(
+            "{description} Workspace mode allocates and returns a new database_id."
+        )));
+        return;
+    }
+
+    let mut schema = tool.input_schema.as_ref().clone();
+    add_workspace_database_id_schema(&tool.name, &mut schema);
+    tool.input_schema = Arc::new(schema);
 }
 
 fn is_null_schema(value: &Value) -> bool {
@@ -5770,7 +7055,21 @@ fn normalize_tool_schemas(result: &mut ListToolsResult) {
 
 /// Error message for a filter-rejected tool/call. Centralized so the
 /// dispatch and tool_help paths return identical wording.
-fn disabled_tool_message(name: &str) -> String {
+fn disabled_tool_message(name: &str, workspace: bool, debugger: bool) -> String {
+    if tool_registry::get_tool(name).is_some_and(|tool| tool.requirements.workspace && !workspace) {
+        return format!(
+            "tool '{name}' requires explicit --workspace startup; call tool_catalog to see enabled tools"
+        );
+    }
+    // Only blame the debugger gate when it is actually closed. A debugger
+    // tool rejected while the gate is open was filtered by --read-only or a
+    // tool/toolset selection, and saying otherwise sends the caller to add a
+    // flag they already passed.
+    if !debugger && tool_registry::get_tool(name).is_some_and(|tool| tool.requirements.debugger) {
+        return format!(
+            "tool '{name}' requires explicit --enable-debugger startup and a platform whose native debugger integration gate has passed; call tool_catalog to see enabled tools"
+        );
+    }
     format!(
         "tool '{name}' is disabled by current filter \
          (--toolsets/--tools/--exclude-tools/--read-only); \
@@ -5802,10 +7101,15 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
         ctx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         let mut result = self.inner.list_tools(params, ctx).await?;
-        if self.filter.is_active() {
-            result
-                .tools
-                .retain(|tool| self.filter.is_enabled(&tool.name));
+        result.tools.retain(|tool| {
+            self.filter.is_enabled(&tool.name)
+                && tool_registry::get_tool(&tool.name)
+                    .is_none_or(|info| !info.requirements.workspace || self.workspace)
+        });
+        if self.workspace {
+            for tool in &mut result.tools {
+                add_workspace_schema(tool);
+            }
         }
         normalize_tool_schemas(&mut result);
         Ok(result)
@@ -5816,9 +7120,18 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
         params: CallToolRequestParams,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        if self.filter.is_active() && !self.filter.is_enabled(&params.name) {
+        if tool_registry::get_tool(&params.name).is_some() && !self.filter.is_enabled(&params.name)
+        {
             return Err(McpError::invalid_params(
-                disabled_tool_message(&params.name),
+                disabled_tool_message(&params.name, self.workspace, self.filter.debugger_enabled()),
+                None,
+            ));
+        }
+        if tool_registry::get_tool(&params.name)
+            .is_some_and(|tool| tool.requirements.workspace && !self.workspace)
+        {
+            return Err(McpError::invalid_params(
+                disabled_tool_message(&params.name, self.workspace, self.filter.debugger_enabled()),
                 None,
             ));
         }
@@ -5830,10 +7143,16 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        if self.filter.is_active() && !self.filter.is_enabled(name) {
+        if !self.filter.is_enabled(name)
+            || tool_registry::get_tool(name)
+                .is_some_and(|tool| tool.requirements.workspace && !self.workspace)
+        {
             return None;
         }
         self.inner.get_tool(name).map(|mut tool| {
+            if self.workspace {
+                add_workspace_schema(&mut tool);
+            }
             normalize_tool_input_schema(&mut tool);
             apply_tool_metadata(tool)
         })
@@ -5867,23 +7186,29 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
 #[cfg(test)]
 mod tests {
     use crate::error::ToolError;
+    use crate::ida::types::SegmentInfo;
     use crate::ida::worker::{CloseTokenGrant, WorkerBackend};
     use crate::server::{
-        apply_close_metadata, apply_task_update, call_tool_result_to_value, close_hint_for,
-        dsc_open_plan, is_sessionless_request_meta, materialize_task_response,
+        add_workspace_database_id_schema, add_workspace_schema, apply_close_metadata,
+        apply_task_update, attach_workspace_database_id, call_tool_result_to_value,
+        checked_runtime_slide, close_hint_for, disabled_tool_message, dsc_open_plan,
+        find_target_dyld_cache, is_sessionless_request_meta, materialize_task_response,
         normalize_schema_value,
         operation::{OperationSnapshot, OperationStatus},
-        run_script_failure_message, run_script_succeeded, run_script_timeout_message,
-        run_script_truncate_chars, supported_protocol_versions, task, task_payload_result_value,
-        task_state_to_detailed_task, task_state_to_mcp_task, timeout_with_child_grace,
-        tool_params_schema, DscOpenPlan, IdaMcpServer, OpenIdbBackgroundDecision,
-        RecentOperationsRequest, ServerRuntimeState, ToolCatalogRequest, ToolHelpRequest,
-        XrefsRequest,
+        raw_blob_database_exists, run_script_failure_message, run_script_succeeded,
+        run_script_timeout_message, run_script_truncate_chars, runtime_module_preferred_base,
+        segment_defines_runtime_image_base, select_runtime_module, supported_protocol_versions,
+        target_dyld_cache_names, task, task_payload_result_value, task_state_to_detailed_task,
+        task_state_to_mcp_task, timeout_with_child_grace, tool_annotations_for, tool_params_schema,
+        workspace_close_should_remove_entry, workspace_tool_example, DscOpenPlan, IdaMcpServer,
+        OpenIdbBackgroundDecision, RecentOperationsRequest, ServerRuntimeState, ToolCatalogRequest,
+        ToolHelpRequest, XrefsRequest,
     };
     use rmcp::handler::server::wrapper::Parameters;
     use rmcp::model::{CallToolResponse, CallToolResult, InputResponses, ProtocolVersion};
     use rmcp::ServerHandler;
     use serde_json::{json, Value};
+    use sha2::{Digest, Sha256};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc};
 
@@ -6221,6 +7546,19 @@ mod tests {
     }
 
     #[test]
+    fn xref_matrix_rejects_quadratic_inputs_before_dispatch() {
+        let at_limit = vec![0; IdaMcpServer::MAX_XREF_MATRIX_ADDRESSES];
+        assert!(IdaMcpServer::validate_xref_matrix_size(&at_limit).is_ok());
+
+        let over_limit = vec![0; IdaMcpServer::MAX_XREF_MATRIX_ADDRESSES + 1];
+        let error = IdaMcpServer::validate_xref_matrix_size(&over_limit)
+            .expect_err("oversized xref matrix must be rejected");
+        assert!(
+            matches!(error, ToolError::InvalidParams(message) if message.contains("at most 512"))
+        );
+    }
+
+    #[test]
     fn dsc_open_plan_backgrounds_ida_94_raw_dsc() {
         assert_eq!(
             dsc_open_plan((9, 4), false),
@@ -6254,26 +7592,201 @@ mod tests {
         assert_eq!(dsc_open_plan((10, 0), true), DscOpenPlan::DirectExistingI64);
     }
 
-    /// The direct-path database name must depend only on the DSC's absolute
-    /// path — never pid or time — so repeat opens resolve to one reusable
-    /// file instead of accumulating orphans.
-    #[test]
-    fn direct_dsc_cache_path_is_deterministic_per_dsc() {
-        let dsc = std::path::Path::new("/nonexistent/A/dyld_shared_cache_arm64e");
-        let first = crate::server::direct_dsc_cache_i64_path(dsc);
-        let second = crate::server::direct_dsc_cache_i64_path(dsc);
-        let other = crate::server::direct_dsc_cache_i64_path(std::path::Path::new(
-            "/nonexistent/B/dyld_shared_cache_arm64e",
-        ));
+    fn write_dsc_fixture(dir: &std::path::Path, name: &str, uuid: [u8; 16], tail: &[u8]) {
+        let mut contents = vec![0u8; 0x68];
+        contents[..7].copy_from_slice(b"dyld_v1");
+        contents[0x10..0x14].copy_from_slice(&0x200u32.to_le_bytes());
+        contents[0x58..0x68].copy_from_slice(&uuid);
+        contents.extend_from_slice(tail);
+        std::fs::write(dir.join(name), contents).expect("write DSC fixture");
+    }
 
-        assert_eq!(first, second);
-        assert_ne!(first, other, "different DSC paths must not collide");
-        let name = first
+    #[test]
+    fn open_dsc_expands_tilde_before_deriving_paths() {
+        let home = std::env::var_os("HOME").expect("HOME is required for tilde expansion");
+        let expanded = crate::server::expanded_dsc_path(
+            "~/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e",
+        );
+        let expected = std::path::PathBuf::from(home)
+            .join("Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e");
+
+        assert_eq!(expanded, expected);
+        assert_eq!(
+            expanded.with_extension("i64"),
+            expected.with_extension("i64")
+        );
+    }
+
+    /// The direct-path database name must depend on the DSC's content
+    /// identity — never pid, time, or mount path — so repeat opens of the
+    /// same firmware resolve to one reusable file, a remounted different
+    /// firmware never inherits stale analysis, and the same firmware reuses
+    /// its database from any mount path.
+    #[test]
+    fn direct_dsc_cache_path_is_keyed_by_content_identity() {
+        let dir = std::env::temp_dir().join(format!("ida-mcp-dsc-key-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let mount_a = dir.join("A");
+        let mount_b = dir.join("B");
+        std::fs::create_dir_all(&mount_a).expect("create mount A");
+        std::fs::create_dir_all(&mount_b).expect("create mount B");
+
+        // Same firmware (same UUID) at two mount paths: one cache database.
+        write_dsc_fixture(&mount_a, "dyld_shared_cache_arm64e", [0xAA; 16], b"first");
+        write_dsc_fixture(&mount_b, "dyld_shared_cache_arm64e", [0xAA; 16], b"second");
+        let at_a =
+            crate::server::direct_dsc_cache_i64_path(&mount_a.join("dyld_shared_cache_arm64e"))
+                .expect("cache path for mount A");
+        let at_b =
+            crate::server::direct_dsc_cache_i64_path(&mount_b.join("dyld_shared_cache_arm64e"))
+                .expect("cache path for mount B");
+        assert_eq!(at_a, at_b, "same firmware must share one cache database");
+
+        // Different firmware mounted at the same path: a different database.
+        write_dsc_fixture(&mount_a, "dyld_shared_cache_arm64e", [0xBB; 16], b"first");
+        let replaced =
+            crate::server::direct_dsc_cache_i64_path(&mount_a.join("dyld_shared_cache_arm64e"))
+                .expect("cache path for replaced firmware");
+        assert_ne!(
+            at_a, replaced,
+            "different firmware at the same path must not collide"
+        );
+
+        let name = at_a
             .file_name()
             .and_then(|name| name.to_str())
             .expect("cache path should have a printable file name");
         assert!(name.starts_with("ida-mcp-dsc-dyld_shared_cache_arm64e-"));
         assert!(name.ends_with(".i64"));
+
+        // A file without a trustworthy dyld UUID is rejected outright: a
+        // partial-content digest could collide, so no identity is derived.
+        std::fs::write(mount_a.join("blob.bin"), b"blob-one").expect("write blob");
+        assert!(
+            crate::server::direct_dsc_cache_i64_path(&mount_a.join("blob.bin")).is_err(),
+            "a non-DSC file must fail identity derivation"
+        );
+        write_dsc_fixture(&mount_a, "zero-uuid.dsc", [0u8; 16], b"tail");
+        assert!(
+            crate::server::direct_dsc_cache_i64_path(&mount_a.join("zero-uuid.dsc")).is_err(),
+            "an all-zero UUID is not a trustworthy identity"
+        );
+
+        // An unreadable DSC is an error, never a silently path-keyed cache.
+        assert!(
+            crate::server::direct_dsc_cache_i64_path(&dir.join("missing.dsc")).is_err(),
+            "unreadable DSC must fail identity derivation"
+        );
+
+        std::fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn dsc_task_key_is_output_scoped_not_workspace_scoped() {
+        let output = std::path::Path::new("/tmp/shared-dsc.i64");
+        assert_eq!(crate::server::dsc_task_key(output), "/tmp/shared-dsc.i64");
+    }
+
+    #[test]
+    fn workspace_open_dsc_dedup_does_not_attach_a_phantom_database_id() {
+        let result = CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+            json!({"status": "already_running", "task_id": "dsc-existing"}).to_string(),
+        )]);
+        let mut response = CallToolResponse::Complete(result);
+
+        assert!(!attach_workspace_database_id(
+            &mut response,
+            "phantom-database"
+        ));
+        let CallToolResponse::Complete(result) = response else {
+            panic!("response should remain complete");
+        };
+        let value: Value = serde_json::from_str(&tool_result_text(result))
+            .expect("dedup response should remain JSON");
+        assert!(value.get("database_id").is_none());
+    }
+
+    #[test]
+    fn workspace_open_dsc_started_task_receives_its_database_id() {
+        let result = CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+            json!({"status": "started", "task_id": "dsc-new"}).to_string(),
+        )]);
+        let mut response = CallToolResponse::Complete(result);
+
+        assert!(attach_workspace_database_id(&mut response, "new-database"));
+        let CallToolResponse::Complete(result) = response else {
+            panic!("response should remain complete");
+        };
+        let value: Value = serde_json::from_str(&tool_result_text(result))
+            .expect("started response should remain JSON");
+        assert_eq!(value["database_id"], "new-database");
+    }
+
+    #[test]
+    fn workspace_close_retains_entry_while_background_open_is_running() {
+        let registry = task::TaskRegistry::new();
+        let task_id = registry
+            .create_keyed(&TASK_OWNER, "dsc", "/tmp/test.i64", "opening")
+            .expect("create running DSC task");
+        registry.bind_workspace_open(&task_id, "pending-database");
+        let result = Err(ToolError::NoDatabaseOpen);
+
+        assert!(!workspace_close_should_remove_entry(
+            &result,
+            &registry,
+            Some("pending-database")
+        ));
+    }
+
+    #[test]
+    fn workspace_close_removes_terminal_lease_less_entry() {
+        let registry = task::TaskRegistry::new();
+        let task_id = registry
+            .create_keyed(&TASK_OWNER, "dsc", "/tmp/test.i64", "opening")
+            .expect("create running DSC task");
+        registry.bind_workspace_open(&task_id, "terminal-database");
+        assert!(registry.finish_cancelled(&task_id, "cancelled"));
+        let result = Err(ToolError::NoDatabaseOpen);
+
+        assert!(workspace_close_should_remove_entry(
+            &result,
+            &registry,
+            Some("terminal-database")
+        ));
+    }
+
+    #[test]
+    fn workspace_close_removes_entry_after_teardown_consumes_its_lease() {
+        let registry = task::TaskRegistry::new();
+        let result = Err(ToolError::DebuggerTeardown("incomplete".to_string()));
+
+        assert!(workspace_close_should_remove_entry(
+            &result,
+            &registry,
+            Some("debug-database")
+        ));
+    }
+
+    #[test]
+    fn open_path_validation_accepts_unpacked_database_sibling() {
+        let dir = std::env::temp_dir().join(format!(
+            "ida-mcp-unpacked-open-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("create unpacked database fixture directory");
+        let packed = dir.join("sample.i64");
+        let unpacked = dir.join("sample.id0");
+        std::fs::write(&unpacked, b"unpacked database").expect("write unpacked database fixture");
+
+        assert!(!IdaMcpServer::validate_path(&packed.display().to_string()));
+        assert!(IdaMcpServer::validate_open_path(
+            &packed.display().to_string()
+        ));
+        assert!(!IdaMcpServer::validate_open_path(
+            &dir.join("missing.bin").display().to_string()
+        ));
+
+        std::fs::remove_dir_all(dir).expect("remove unpacked database fixture directory");
     }
 
     fn tool_result_text(result: CallToolResult) -> String {
@@ -6335,6 +7848,147 @@ mod tests {
         assert!(run_script_succeeded(&json!({ "success": true })));
         assert!(!run_script_succeeded(&json!({ "success": false })));
         assert!(!run_script_succeeded(&json!({})));
+    }
+
+    #[test]
+    fn runtime_module_selection_requires_an_exact_or_unambiguous_match() {
+        let modules = json!({
+            "modules": [
+                {"path": "/usr/lib/libsame.dylib", "base_value": 0x1000},
+                {"path": "/opt/lib/libsame.dylib", "base_value": 0x2000},
+                {"path": "/usr/lib/libunique.dylib", "base_value": 0x3000}
+            ]
+        });
+        assert_eq!(
+            select_runtime_module(&modules, "/opt/lib/libsame.dylib")
+                .expect("exact module")
+                .get("base_value"),
+            Some(&json!(0x2000))
+        );
+        assert_eq!(
+            select_runtime_module(&modules, "libunique.dylib")
+                .expect("unambiguous basename")
+                .get("base_value"),
+            Some(&json!(0x3000))
+        );
+        assert!(select_runtime_module(&modules, "libsame.dylib").is_err());
+        assert!(select_runtime_module(&modules, "missing.dylib").is_err());
+    }
+
+    /// A debugger tool rejected while --enable-debugger is already active was
+    /// filtered by something else (--read-only, --toolsets, --tools). Never
+    /// tell the caller to pass a flag they passed.
+    #[test]
+    fn disabled_message_blames_the_gate_only_when_the_gate_is_closed() {
+        let gate_closed = disabled_tool_message("debug_launch", true, false);
+        assert!(gate_closed.contains("--enable-debugger"));
+
+        let gate_open = disabled_tool_message("debug_launch", true, true);
+        assert!(!gate_open.contains("--enable-debugger"));
+        assert!(gate_open.contains("--read-only"));
+
+        // Workspace gating still takes precedence and is unaffected.
+        let workspace_closed = disabled_tool_message("list_databases", false, true);
+        assert!(workspace_closed.contains("--workspace"));
+    }
+
+    #[test]
+    fn runtime_slide_preserves_direction_without_signed_overflow() {
+        assert_eq!(checked_runtime_slide(0x3000, 0x1000)["signed"], "+0x2000");
+        assert_eq!(checked_runtime_slide(0x1000, 0x3000)["signed"], "-0x2000");
+        assert_eq!(
+            checked_runtime_slide(u64::MAX, 0)["magnitude_value"],
+            json!(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn runtime_module_base_uses_the_selected_image_or_loaded_segments() {
+        let pagezero = SegmentInfo {
+            name: "__PAGEZERO".to_string(),
+            start: "0x0".to_string(),
+            end: "0x100000000".to_string(),
+            size: 0x1_0000_0000,
+            permissions: "---".to_string(),
+            r#type: "Loader".to_string(),
+            bitness: 64,
+        };
+        assert!(!segment_defines_runtime_image_base(&pagezero));
+        assert_eq!(
+            runtime_module_preferred_base(
+                Some(0x5000),
+                [(0x1000, true), (0x5000, true), (0x9000, true)].into_iter()
+            ),
+            Some(0x5000),
+            "cache headers and other loaded images must not become the selected image base"
+        );
+        assert_eq!(
+            runtime_module_preferred_base(
+                None,
+                [(0x3000, true), (0, false), (0x1000, true), (0x2000, true)].into_iter()
+            ),
+            Some(0x1000),
+            "standalone images must ignore an unmapped Mach-O __PAGEZERO segment"
+        );
+    }
+
+    #[test]
+    fn raw_target_precheck_detects_an_unpacked_output() {
+        let dir = std::env::temp_dir().join(format!(
+            "ida-mcp-raw-target-unpacked-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create raw target fixture directory");
+        let input = dir.join("firmware.bin");
+        let output = dir.join("custom.i64");
+        let unpacked = dir.join("custom.id0");
+        std::fs::write(&input, b"raw").expect("write raw input");
+        std::fs::write(&unpacked, b"unpacked database").expect("write unpacked output");
+
+        assert!(raw_blob_database_exists(
+            &input.display().to_string(),
+            Some(&output.display().to_string())
+        ));
+
+        std::fs::remove_dir_all(dir).expect("remove raw target fixture directory");
+    }
+
+    #[test]
+    fn dyld_cache_selection_uses_target_metadata_not_host_architecture() {
+        let arm = json!({"processor": "ARM little-endian", "bits": 64});
+        let x86 = json!({"processor": "Intel 80x86 processors: metapc", "bits": 64});
+        assert_eq!(
+            target_dyld_cache_names(&arm).expect("arm64 target cache names"),
+            ["dyld_shared_cache_arm64e", "dyld_shared_cache_arm64"]
+        );
+        assert_eq!(
+            target_dyld_cache_names(&x86).expect("x86-64 target cache names"),
+            ["dyld_shared_cache_x86_64h", "dyld_shared_cache_x86_64"]
+        );
+        assert!(target_dyld_cache_names(&json!({"processor": "ARM", "bits": 32})).is_err());
+    }
+
+    #[test]
+    fn dyld_cache_lookup_respects_target_specific_candidates() {
+        let dir = std::env::temp_dir().join(format!("ida-mcp-dsc-target-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create cache fixture directory");
+        let arm_cache = dir.join("dyld_shared_cache_arm64e");
+        std::fs::write(&arm_cache, b"cache").expect("write target cache fixture");
+
+        let selected =
+            find_target_dyld_cache(&json!({"processor": "ARM", "bits": 64}), &[dir.as_path()])
+                .expect("select target cache");
+        assert_eq!(selected, arm_cache);
+        assert!(
+            find_target_dyld_cache(
+                &json!({"processor": "metapc", "bits": 64}),
+                &[dir.as_path()],
+            )
+            .is_err(),
+            "an ARM cache must not satisfy an x86-64 target"
+        );
+
+        std::fs::remove_dir_all(dir).expect("remove cache fixture directory");
     }
 
     #[test]
@@ -6536,6 +8190,152 @@ mod tests {
                 tool.name
             );
         }
+    }
+
+    #[test]
+    fn registry_router_and_schema_inventories_are_identical() {
+        use std::collections::BTreeSet;
+
+        let server = test_server();
+        let registry_names: BTreeSet<&str> = crate::tool_registry::all_tools()
+            .map(|tool| tool.name)
+            .collect();
+        let route_names: BTreeSet<&str> = server
+            .tool_mux
+            .call_router
+            .map
+            .keys()
+            .map(|name| name.as_ref())
+            .collect();
+
+        assert_eq!(
+            registry_names, route_names,
+            "registry and dispatch router must expose exactly the same tools"
+        );
+
+        let missing_schemas: Vec<_> = crate::tool_registry::all_tools()
+            .filter(|tool| tool_params_schema(tool.name).is_none())
+            .map(|tool| tool.name)
+            .collect();
+        assert!(
+            missing_schemas.is_empty(),
+            "every registered tool must have a help/schema entry; missing: {missing_schemas:?}"
+        );
+    }
+
+    #[test]
+    fn debugger_annotations_match_process_and_filesystem_effects() {
+        let stop = tool_annotations_for("debug_stop");
+        assert_eq!(stop.read_only_hint, Some(false));
+        assert_eq!(stop.destructive_hint, Some(true));
+
+        let open_module = tool_annotations_for("debug_open_module");
+        assert_eq!(open_module.read_only_hint, Some(false));
+        assert_eq!(open_module.destructive_hint, Some(false));
+    }
+
+    #[test]
+    fn workspace_schema_requires_database_id_only_for_database_scoped_tools() {
+        let server = test_server();
+        let default_disasm = server
+            .tool_mux
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "disasm")
+            .expect("disasm tool");
+        let default_disasm_schema = Value::Object(default_disasm.input_schema.as_ref().clone());
+        assert!(
+            default_disasm_schema
+                .pointer("/properties/database_id")
+                .is_none(),
+            "default schemas must remain unchanged"
+        );
+
+        let mut workspace_disasm = default_disasm.clone();
+        add_workspace_schema(&mut workspace_disasm);
+        let workspace_disasm_schema = Value::Object(workspace_disasm.input_schema.as_ref().clone());
+        assert_eq!(
+            workspace_disasm_schema.pointer("/properties/database_id/type"),
+            Some(&json!("string"))
+        );
+        assert!(workspace_disasm_schema
+            .pointer("/required")
+            .and_then(Value::as_array)
+            .is_some_and(|required| required.iter().any(|field| field == "database_id")));
+
+        let mut open_idb = server
+            .tool_mux
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "open_idb")
+            .expect("open_idb tool");
+        add_workspace_schema(&mut open_idb);
+        let open_idb_schema = Value::Object(open_idb.input_schema.as_ref().clone());
+        assert!(open_idb_schema.pointer("/properties/database_id").is_none());
+        assert!(open_idb
+            .description
+            .as_deref()
+            .is_some_and(|description| description.contains("returns a new database_id")));
+
+        let mut help_schema = tool_params_schema("disasm").expect("disasm help schema");
+        let Value::Object(help_schema) = &mut help_schema else {
+            panic!("disasm help schema must be an object");
+        };
+        add_workspace_database_id_schema("disasm", help_schema);
+        let help_schema = Value::Object(help_schema.clone());
+        assert_eq!(
+            help_schema.pointer("/properties/database_id/format"),
+            Some(&json!("uuid"))
+        );
+        assert!(help_schema
+            .pointer("/required")
+            .and_then(Value::as_array)
+            .is_some_and(|required| required.iter().any(|field| field == "database_id")));
+
+        for tool in crate::tool_registry::all_tools()
+            .filter(|tool| tool.scope == crate::tool_registry::ToolScope::Database)
+        {
+            let workspace_example = workspace_tool_example(tool.name, tool.example);
+            let workspace_example: Value = serde_json::from_str(&workspace_example)
+                .unwrap_or_else(|error| panic!("{} workspace help example: {error}", tool.name));
+            assert_eq!(
+                workspace_example["database_id"],
+                json!("00000000-0000-0000-0000-000000000000"),
+                "{} workspace help example",
+                tool.name
+            );
+        }
+        let runtime =
+            crate::tool_registry::get_tool("tool_catalog").expect("runtime registry entry");
+        assert_eq!(
+            workspace_tool_example("tool_catalog", runtime.example).as_ref(),
+            runtime.example
+        );
+    }
+
+    #[test]
+    fn default_tool_schema_snapshot() {
+        // Default mode: no --workspace, no --enable-debugger. This digest is
+        // the locked promise that opt-in capabilities never alter the schemas
+        // an ordinary client sees.
+        let schemas = crate::tool_registry::all_tools()
+            .filter(|tool| !tool.requirements.debugger && !tool.requirements.workspace)
+            .map(|tool| {
+                json!({
+                    "name": tool.name,
+                    "schema": tool_params_schema(tool.name),
+                })
+            })
+            .collect::<Vec<_>>();
+        let encoded = serde_json::to_vec(&schemas).expect("serialize schema snapshot");
+        let digest = Sha256::digest(encoded)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            digest,
+            "59568456bad624fc92694542ec5ba9d67f59b42b6134ef91f17af9c6a5d975b9"
+        );
     }
 
     #[test]
@@ -7069,6 +8869,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn orphaned_dsc_cleanup_preserves_primary_databases() {
+        let dir =
+            std::env::temp_dir().join(format!("ida-mcp-orphaned-dsc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp directory");
+        let out_i64 = dir.join("cache.i64");
+        let id1 = dir.join("cache.id1");
+        std::fs::write(&id1, b"partial").expect("write orphaned sidecar");
+
+        crate::server::remove_orphaned_dsc_output_artifacts(&out_i64)
+            .expect("remove orphaned sidecars");
+        assert!(!id1.exists());
+
+        std::fs::write(&out_i64, b"primary").expect("write primary database");
+        std::fs::write(&id1, b"analysis").expect("write associated sidecar");
+        assert!(matches!(
+            crate::server::remove_orphaned_dsc_output_artifacts(&out_i64),
+            Err(ToolError::DatabaseLocked(_))
+        ));
+        assert!(out_i64.exists());
+        assert!(id1.exists());
+
+        std::fs::remove_dir_all(dir).expect("remove temp directory");
+    }
+
     fn create_sparse_test_file(name: &str, len: u64) -> std::io::Result<std::path::PathBuf> {
         let path = std::env::temp_dir().join(format!("ida-mcp-{name}-{}", uuid::Uuid::new_v4()));
         let file = std::fs::File::create(&path)?;
@@ -7083,7 +8908,7 @@ mod tests {
         apply_close_metadata(
             &mut map,
             grant,
-            close_hint_for(crate::ServerMode::Http, false),
+            close_hint_for(crate::ServerMode::Http, false, false),
         );
         map
     }

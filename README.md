@@ -171,6 +171,9 @@ Once configured, you can analyze binaries through your AI agent:
 # Open a binary (returns quickly — analysis runs separately)
 open_idb(path: "~/samples/malware")
 
+# Keep the generated database away from a read-only input directory
+open_idb(path: "/System/example", idb_out: "~/ida-work/example.i64")
+
 # These work immediately, no analysis needed
 list_functions(limit: 20)
 disasm_by_name(name: "main", count: 20)
@@ -186,6 +189,61 @@ decompile(address: "0x100000f00")
 # Discover more tools
 tool_catalog(query: "find callers")
 ```
+
+### Raw blobs
+
+Raw inputs still use IDA's normal loader by default and save to `<input>.i64`.
+`idb_out` selects another database location, which is useful for read-only input
+directories. An existing output is reused only when IDA's recorded input
+SHA-256 matches the current file; `rebuild: true` can overwrite only a database
+whose hash or recorded input path proves that it belongs to the input.
+
+For headerless blobs, the same `open_idb` tool accepts typed loader hints:
+
+```text
+open_idb(
+  path: "~/firmware/boot.bin",
+  idb_out: "~/ida-work/boot.i64",
+  processor: "arm:ARMv7-M",
+  bitness: 32,
+  base_address: "0x08000000",
+  entry_point: "0x08000101"
+)
+```
+
+Processor families with multiple modes require an explicit IDA processor
+variant; ambiguous bare names such as `arm` or `metapc` are rejected. These
+target fields apply only while creating a raw-input database and never alter an
+existing `.i64`/`.idb`. For 32-bit ARM targets, an odd `entry_point` is treated
+as a Thumb pointer: ida-mcp clears bit 0 for the code address and records the
+Thumb state before creating the entry instruction.
+
+#### Multi-database workspace (opt-in)
+
+The default remains one implicit IDA database, so existing agent prompts and
+tool calls do not need a handle. For headless workflows that deliberately keep
+several databases open, start with `--workspace`:
+
+```bash
+ida-mcp --workspace --workspace-max-workers 4
+ida-mcp --workspace serve-http --bind 127.0.0.1:8765 --stateless
+```
+
+In workspace mode, each `open_idb`/`open_dsc` allocates and returns a
+`database_id`. Every database-scoped call must send that ID; runtime tools such
+as `tool_catalog` reject it. `close_idb(database_id: ...)` invalidates only the
+selected handle. Idle handles are reaped after 30 minutes by default; use
+`--workspace-idle-timeout-secs 0` to disable that database TTL.
+
+`list_databases` recovers handles: it returns every routed `database_id` with
+its database path and lifecycle state (`open`, `busy`, or `no_worker`), so an
+agent that lost a response — or reconnected over stateless HTTP — can re-address
+an open database instead of stranding it until the TTL expires. It is read-only
+and, like every workspace tool, is absent unless the server runs `--workspace`.
+
+Workspace routing and legacy pooled HTTP share one internal registry. The
+legacy session behavior below is preserved, but there is no second independent
+session-to-worker lease map.
 
 #### HTTP/SSE worker pool
 
@@ -209,6 +267,72 @@ immediately, but the child process may stay alive idle for reuse until
 `open_idb`/`open_dsc` calls fail with `Worker pool exhausted` so clients can
 retry later. Pooled mode requires stateful HTTP sessions; `--max-workers > 1`
 is rejected with `--stateless`.
+
+#### Headless debugger (experimental opt-in)
+
+Debugger tools are absent from the default schema. On supported builds, add
+`--enable-debugger` to expose `debug_status`, `debug_launch`, `debug_attach`,
+`debug_modules`, and `debug_stop`. `debug_open_module` additionally requires
+`--workspace`, because it opens the selected runtime image in a new database
+without replacing the database that owns the live debug session:
+
+```text
+debug_status()
+debug_launch(database_id: "…", path: "/absolute/path/to/program")
+debug_modules(database_id: "…")
+debug_open_module(
+  database_id: "…",
+  module: "/usr/lib/libobjc.A.dylib",
+  idb_out: "~/ida-work/libobjc.i64"
+)
+debug_stop(database_id: "…", action: "auto")
+```
+
+`debug_open_module` opens standalone binaries and dlopen'd plugins directly.
+On macOS, it also resolves system libraries such as
+`/usr/lib/libobjc.A.dylib` through the target architecture's host dyld shared
+cache and loads the selected image through IDA 9.4's in-process DSC service;
+it does not extract a temporary dylib or invoke `idat`.
+
+`debug_open_module.idb_out` is always required. Runtime modules often live in
+read-only system directories, and silently writing an IDB next to them is not a
+valid headless workflow. The response includes a checked runtime slide; the new
+database remains at its on-disk preferred addresses.
+
+In workspace mode, a successfully launched or attached debug session pins its
+database against the idle TTL until `debug_stop` succeeds or `close_idb`
+releases the database.
+
+Known limitation — a target that exits on its own keeps its pin. IDA's
+process state is a cached value that only refreshes when a call drains the
+pending debug event, so a debuggee killed outside ida-mcp is not observable in
+the background. Its database stays pinned (and exempt from the idle TTL) until
+`debug_stop`, `close_idb`, or worker loss clears it. Both `debug_stop` and
+`close_idb` handle an already-exited target correctly.
+
+Known limitation — worker loss does not stop the debuggee. If the worker
+process hosting a live debug session is killed, crashes, or ida-mcp retires it
+after a wedged debugger call, that process may never run its own teardown, so
+IDA's debug-server helper can be reparented instead of terminated and the
+target may keep running. When an in-flight tool call detects or causes that
+retirement, ida-mcp returns a `Debugger session lost` error saying the target
+may still be alive, clears the handle's debug pin, and never claims the
+debuggee ended. A leased worker can also die while no request is in flight to
+carry an error; `list_databases` may briefly report `no_worker` before the
+reaper removes that terminal handle, even when healthy idle eviction is
+disabled. Cleaning up a stray helper or debuggee is currently manual.
+
+The first enabled platform is macOS on Apple Silicon. ida-mcp selects IDA's
+signed loopback helper from the opened database's target architecture:
+`mac_server_arm` for ARM64 and `mac_server` for x86/x86_64. macOS may require
+IDA's supported “Take Control” authorization once per login; tools report
+`user_action_required` when it is missing. ida-mcp never asks for root, disables
+SIP, edits `authorizationdb`, or re-signs binaries. Linux and Windows remain
+fail-closed rather than being advertised optimistically: IDA's ARM Linux
+backend is remote-only and remote configuration is not exposed, while the SDK
+does not provide a Windows-on-ARM user debugger. Their native ARM64 harnesses
+pass by proving the debugger surface remains unavailable; x86 Linux and Windows
+still require a positive local-backend oracle before advertisement.
 
 MCP `2026-07-28` uses the sessionless `server/discover` lifecycle. It is
 supported over stdio and the default single-worker HTTP mode, including
@@ -309,16 +433,24 @@ because it does not modify the database.
 
 ## Context Optimization
 
-`ida-mcp` exposes 73 tools (~11k tokens of `tools/list` payload). Clients with dynamic tool discovery defer that cost; clients that preload schemas include it in every session. Filter the surface to only what you need:
+`ida-mcp` exposes the same 75 baseline tools by default (~12k tokens of
+`tools/list` payload). Six debugger tools exist behind the explicit gates above,
+so installing the new release does not enlarge existing clients' schema.
+Clients with dynamic tool discovery defer that cost; clients that preload
+schemas include it in every session. Filter the surface to only what you need:
 
 | Flag | Env var | Effect |
 |---|---|---|
 | `--toolsets=cat1,cat2` | `IDA_MCP_TOOLSETS` | Replaces "all tools" with the union of selected categories |
 | `--tools=t1,t2`        | `IDA_MCP_TOOLS`         | Adds individual tools (additive to `--toolsets`) |
 | `--exclude-tools=t1,t2`| `IDA_MCP_EXCLUDE_TOOLS` | Subtracts from the include set; always wins |
-| `--read-only`          | `IDA_MCP_READ_ONLY`     | Strips mutating/arbitrary-code tools (`run_script`, `patch*`, `rename`, `set_comments`, `lumina_apply`, type/stack edits, `dsc_add_*`, `analyze_funcs`); keeps lifecycle/discovery |
+| `--read-only`          | `IDA_MCP_READ_ONLY`     | Strips mutating/arbitrary-code tools (`run_script`, `patch*`, `rename`, `set_comments`, `lumina_apply`, type/stack edits, `dsc_add_*`, `analyze_funcs`, and debugger process control); keeps lifecycle/discovery |
 
-No flags = all 73 tools (default). Categories: `core`, `functions`, `disassembly`, `decompile`, `xrefs`, `control_flow`, `memory`, `search`, `metadata`, `types`, `editing`, `scripting` (run `tool_catalog` to enumerate). Flags override env vars; unknown names rejected at startup.
+No flags = all 75 baseline tools (default). Categories: `core`, `functions`,
+`disassembly`, `decompile`, `xrefs`, `control_flow`, `memory`, `search`,
+`metadata`, `types`, `editing`, `scripting`; `debug` appears only when its
+startup/platform gate is active (run `tool_catalog` to enumerate). Flags
+override env vars; unknown names are rejected at startup.
 
 ### Recommendations by client
 

@@ -1,19 +1,22 @@
 # Tools
 
 > Auto-generated from `src/tool_registry.rs`. Do not edit by hand.
-> Regenerate with: `cargo run --bin gen_tools_doc -- docs/TOOLS.md`.
+> Regenerate with: `just tools-doc`.
 
 ## Discovery Workflow
 
-- `tools/list` returns the full tool set (currently 73 tools)
+- `tools/list` returns 75 baseline tools by default (82 registered including opt-in workspace and debugger tools)
 - `tool_catalog(query=...)` searches all tools by intent
 - `tool_help(name=...)` returns full documentation and schema
+- Debugger tools require `--enable-debugger`; `debug_open_module` also requires `--workspace`
+- `--workspace` routes several databases by `database_id`; `list_databases` recovers a handle after a lost response or reconnect
 - Call `close_idb` when done to release locks; in multi-client servers coordinate before closing (HTTP/SSE requires the close_token from `open_idb` unless the request is in the owning legacy session)
 
 Note: `open_idb` accepts .i64/.idb or raw binaries (Mach-O/ELF/PE). Raw binaries are
-auto-analyzed and saved as a .i64 alongside the input. If that generated .i64
-already exists, it is opened directly instead of rebuilding the raw input. Set rebuild=true
-only when the input changed or stale analysis should be overwritten. If a sibling .dSYM
+saved as a .i64 alongside the input by default; analysis is off by default and `idb_out` selects another
+output path. Existing output databases are reused only when their recorded input SHA-256 matches.
+Set `rebuild=true` only when the input changed or stale analysis should be overwritten; an
+existing database is overwritten only when its hash or recorded path proves provenance. If a sibling .dSYM
 exists and no .i64 is present, its DWARF debug info is loaded automatically.
 
 ## Core (`core`)
@@ -27,6 +30,7 @@ Database open/close and discovery tools
 | `dsc_add_dylib` | Load an additional dylib into an open DSC database |
 | `dsc_add_region` | Load a DSC memory region by address (data/GOT/stubs) |
 | `idb_meta` | Get database metadata and summary |
+| `list_databases` | List open workspace database handles |
 | `load_debug_info` | Load external debug info (e.g., dSYM/DWARF) |
 | `open_dsc` | Open a dyld_shared_cache and load one module; use dsc_add_dylib/dsc_add_region for more |
 | `open_idb` | Open an IDA database or raw binary |
@@ -57,6 +61,7 @@ Disassemble code at addresses
 | `disasm` | Disassemble instructions at an address |
 | `disasm_by_name` | Disassemble a function by name |
 | `disasm_function_at` | Disassemble the function containing an address |
+| `render_range` | Render an IDA-style address range |
 
 ## Decompile (`decompile`)
 
@@ -159,11 +164,25 @@ Patching, renaming, and comment editing
 
 | Tool | Description |
 |------|-------------|
+| `list_patches` | List patched bytes without mutating the database |
 | `lumina_apply` | Apply Lumina metadata to a function |
 | `patch` | Patch bytes at an address |
 | `patch_asm` | Patch instructions with assembly text |
 | `rename` | Rename symbols |
 | `set_comments` | Set comments at an address |
+
+## Debug (`debug`)
+
+Opt-in headless debugger lifecycle and runtime modules
+
+| Tool | Description |
+|------|-------------|
+| `debug_attach` | Attach and suspend a local process |
+| `debug_launch` | Launch and suspend a local debug target |
+| `debug_modules` | List runtime modules from the suspended debuggee |
+| `debug_open_module` | Open a runtime module in a separate workspace database |
+| `debug_status` | Report debugger backend and authorization readiness |
+| `debug_stop` | Detach or terminate the active debug target |
 
 ## Scripting (`scripting`)
 
@@ -178,4 +197,5 @@ Execute Python scripts via IDAPython
 - Many tools accept a single value or array (e.g., `"0x1000"` or `["0x1000", "0x2000"]`)
 - String inputs may be comma-separated: `"0x1000, 0x2000"`
 - Addresses accept hex (`0x1000`) or decimal (`4096`)
-- Raw binaries are auto-analyzed on first open; `.i64` is saved alongside the input and reused on later raw-path opens unless `rebuild=true`
+- Raw binaries default to `<input>.i64`; use `idb_out` for read-only input locations. Existing output is reused only after input SHA-256 verification
+- `debug_open_module` always requires `idb_out`, opens a separate workspace database, and resolves macOS cache-backed modules through IDA 9.4's in-process DSC service

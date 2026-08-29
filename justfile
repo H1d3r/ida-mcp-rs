@@ -8,6 +8,10 @@ default:
 build:
     cargo build
 
+# Regenerate the checked-in tool inventory from the Rust registry.
+tools-doc:
+    cargo run --bin gen_tools_doc -- docs/TOOLS.md
+
 # Build release binary
 # KACHE_DISABLED=1: kache 0.13.0 restore-time mtime bugs can leave a stale
 # binary while reporting success (kunobi-ninja/kache#677/#680/#682, fixed
@@ -178,6 +182,10 @@ test-pool-exhaustion: build
 test-pool-second-open: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-pool-second-open
 
+# Run HTTP worker-pool timed-out raw-open cleanup test (debug)
+test-pool-open-timeout: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-pool-open-timeout
+
 # Run HTTP worker-pool abandoned-client cleanup test (debug)
 test-pool-disconnect: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-pool-disconnect
@@ -205,6 +213,18 @@ test-elicitation: build
 # Verify MCP 2026 discover/stateless lifecycle and the pooled legacy boundary.
 test-modern: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-modern
+
+# Verify explicit multi-database workspace routing over stdio.
+test-workspace: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-workspace
+
+# Verify the debugger capability gate and non-invasive status surface.
+test-debugger: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-debugger
+
+# Exercise the native debugger launch/module/stop path (macOS arm64 gate).
+test-debugger-live: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-debugger-live
 
 # Run open_idb rebuild semantics test (raw reuse vs rebuild=true overwrite)
 test-rebuild-idb: build
@@ -244,7 +264,7 @@ fmt:
 
 # Run clippy linter
 lint:
-    cargo clippy -- -D warnings
+    cargo clippy --all --benches --tests --examples --all-features -- -D warnings
 
 # Run full check (fmt + lint + test)
 check: fmt lint cargo-test

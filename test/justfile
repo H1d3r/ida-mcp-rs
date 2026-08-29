@@ -336,6 +336,27 @@ test-pool-second-open: fixture
         bash ./http_pool.sh
     echo "✅ HTTP worker-pool second-open failure test passed"
 
+# Run HTTP worker-pool timed-out raw-open cleanup test
+test-pool-open-timeout: fixture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'just build' first"
+        exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "jq is required for pool open-timeout test (brew install jq)"
+        exit 1
+    fi
+    echo "🧪 Running HTTP worker-pool timed-out raw-open cleanup test..."
+    PORT=$((9575 + RANDOM % 500)) \
+        POOL_TEST_CASE=open-timeout-cleanup WORKER_OP_TIMEOUT=1 \
+        RUST_LOG="{{ rust_log }}" IDB_PATH="{{ test_bin }}" \
+        MCP_HTTP_BIN="{{ server_bin }}" \
+        bash ./http_pool.sh
+    echo "✅ HTTP worker-pool timed-out raw-open cleanup test passed"
+
 # Run HTTP worker-pool abandoned-client cleanup test
 test-pool-disconnect: fixture
     #!/usr/bin/env bash
@@ -453,6 +474,28 @@ test-modern:
     fi
     PORT=$((9400 + RANDOM % 400)) RUST_LOG="{{ rust_log }}" \
         MCP_BIN="{{ server_bin }}" bash ./modern_protocol.sh
+
+# Verify opt-in explicit database-ID routing over one headless stdio server.
+test-workspace: test-bootstrap
+    #!/usr/bin/env bash
+    set -euo pipefail
+    RUST_LOG="{{ rust_log }}" MCP_STDIO_BIN="{{ server_bin }}" \
+        WORKSPACE_FIXTURE="{{ test_i64 }}" bash ./stdio_workspace.sh
+    PORT=$((9600 + RANDOM % 300)) RUST_LOG="{{ rust_log }}" \
+        MCP_HTTP_BIN="{{ server_bin }}" WORKSPACE_FIXTURE="{{ test_i64 }}" \
+        bash ./http_workspace.sh
+
+# Verify debugger opt-in advertisement/status without launching a target.
+test-debugger:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    SERVER_BIN="{{ server_bin }}" bash ./debugger_integration.sh
+
+# Exercise the real signed-helper launch path using the local fixture.
+test-debugger-live: test-bootstrap
+    #!/usr/bin/env bash
+    set -euo pipefail
+    SERVER_BIN="{{ server_bin }}" bash ./debugger_live.sh
 
 # Run open_idb rebuild semantics test (Cases C and D from the rebuild=bool patch)
 # Phase 1 seeds a tmpdir .i64 with a renamed function via the raw-input path,
@@ -738,13 +781,22 @@ test-dsc dsc_path=dsc_test_path:
     echo "   Initialized"
 
     # Phase 2: open_dsc
-    payload=$(sed "s|DSC_PATH|{{ dsc_path }}|g" <<< '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"open_dsc","arguments":{"path":"DSC_PATH","arch":"arm64e","module":"/System/Library/PrivateFrameworks/LockdownMode.framework/LockdownMode"}}}')
+    payload=$(sed "s|DSC_PATH|{{ dsc_path }}|g" <<< '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"open_dsc","arguments":{"path":"DSC_PATH","arch":"arm64e","module":"/usr/lib/libobjc.A.dylib"}}}')
     send "$payload"
     resp=$(wait_response 2 30)
     echo "   open_dsc responded"
 
-    # Check if we got a task_id (async) or direct db_info (sync)
+    # Tool errors contain human-readable text, not a nested JSON object. Check
+    # that envelope before asking jq to parse the content as a task/result.
+    open_error=$(echo "$resp" | jq -r '.result.isError // false')
     content_text=$(echo "$resp" | jq -r '.result.content[0].text // empty')
+    if [ "$open_error" = "true" ]; then
+        echo "❌ open_dsc returned error: $content_text"
+        cat "$log"
+        exit 1
+    fi
+
+    # Check if we got a task_id (async) or direct db_info (sync)
     task_id=$(echo "$content_text" | jq -r '.task_id // empty')
 
     if [ -n "$task_id" ]; then
@@ -761,6 +813,13 @@ test-dsc dsc_path=dsc_test_path:
 
             if [ "$status" = "completed" ]; then
                 echo "   Task completed"
+                result_error=$(echo "$poll_text" | jq -r '.result.isError // false')
+                if [ "$result_error" = "true" ]; then
+                    result_message=$(echo "$poll_text" | jq -r '.result.content[0].text // "DSC task failed"')
+                    echo "❌ DSC task completed with a tool error: $result_message"
+                    cat "$log"
+                    exit 1
+                fi
                 # Legacy idat/.i64 opens usually return functions immediately.
                 # IDA 9.4's native dscu path can complete the image load before
                 # function analysis has produced entries, so accept a loaded
@@ -784,13 +843,7 @@ test-dsc dsc_path=dsc_test_path:
             sleep 5
         done
     else
-        # Sync path — check for isError
-        is_error=$(echo "$resp" | jq -r '.result.isError // false')
-        if [ "$is_error" = "true" ]; then
-            echo "❌ open_dsc returned error: $content_text"
-            cat "$log"
-            exit 1
-        fi
+        # Sync path.
         fc=$(echo "$content_text" | jq -r '.function_count // empty')
         echo "   Opened synchronously, function_count=$fc"
     fi

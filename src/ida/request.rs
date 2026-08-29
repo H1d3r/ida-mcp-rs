@@ -4,8 +4,53 @@ use crate::error::ToolError;
 use crate::ida::observability::ProgressSender;
 use crate::ida::types::*;
 use serde_json::Value;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
+
+const SIDE_EFFECT_QUEUED: u8 = 0;
+const SIDE_EFFECT_STARTED: u8 = 1;
+const SIDE_EFFECT_CANCELLED: u8 = 2;
+
+/// Admission state for a queued request that can change external or IDA state.
+///
+/// A receiver timeout may cancel only while the request is still queued. Once
+/// the IDA thread claims it, the caller must wait for the operation's real
+/// result instead of reporting a timeout while the side effect continues.
+#[derive(Clone, Default)]
+pub struct SideEffectAdmission {
+    state: Arc<AtomicU8>,
+}
+
+impl SideEffectAdmission {
+    pub fn start(&self) -> Result<(), ToolError> {
+        self.state
+            .compare_exchange(
+                SIDE_EFFECT_QUEUED,
+                SIDE_EFFECT_STARTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|_| {
+                ToolError::Cancelled(
+                    "request expired while queued; no side effects were started".to_string(),
+                )
+            })
+    }
+
+    pub fn cancel_if_queued(&self) -> bool {
+        self.state
+            .compare_exchange(
+                SIDE_EFFECT_QUEUED,
+                SIDE_EFFECT_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
 
 /// Request types for the IDA worker
 pub enum IdaRequest {
@@ -18,6 +63,7 @@ pub enum IdaRequest {
         rebuild: bool,
         file_type: Option<String>,
         auto_analyse: bool,
+        raw_target: RawBinaryTarget,
         extra_args: Vec<String>,
         idb_out: Option<String>,
         progress_tx: Option<ProgressSender>,
@@ -25,7 +71,7 @@ pub enum IdaRequest {
         resp: oneshot::Sender<Result<OpenedDatabase, ToolError>>,
     },
     Close {
-        resp: oneshot::Sender<()>,
+        resp: oneshot::Sender<Result<(), ToolError>>,
     },
     CloseIfGeneration {
         generation: DatabaseGeneration,
@@ -34,6 +80,29 @@ pub enum IdaRequest {
     LoadDebugInfo {
         path: Option<String>,
         verbose: bool,
+        resp: oneshot::Sender<Result<Value, ToolError>>,
+    },
+    DebugLaunch {
+        path: String,
+        arguments: Option<String>,
+        start_directory: Option<String>,
+        timeout_seconds: u32,
+        admission: SideEffectAdmission,
+        resp: oneshot::Sender<Result<Value, ToolError>>,
+    },
+    DebugAttach {
+        pid: u32,
+        timeout_seconds: u32,
+        admission: SideEffectAdmission,
+        resp: oneshot::Sender<Result<Value, ToolError>>,
+    },
+    DebugModules {
+        resp: oneshot::Sender<Result<Value, ToolError>>,
+    },
+    DebugStop {
+        action: DebugStopAction,
+        timeout_seconds: u32,
+        admission: SideEffectAdmission,
         resp: oneshot::Sender<Result<Value, ToolError>>,
     },
     AnalysisStatus {
@@ -49,10 +118,12 @@ pub enum IdaRequest {
         /// image mutates the database, so a stale task must be refused before
         /// it writes into a database it does not own.
         expected_generation: Option<DatabaseGeneration>,
+        admission: SideEffectAdmission,
         resp: oneshot::Sender<Result<DscImageInfo, ToolError>>,
     },
     DscLoadRegion {
         addr: u64,
+        admission: SideEffectAdmission,
         resp: oneshot::Sender<Result<DscRegionInfo, ToolError>>,
     },
     ListFunctions {
@@ -74,6 +145,12 @@ pub enum IdaRequest {
         addr: u64,
         count: usize,
         resp: oneshot::Sender<Result<String, ToolError>>,
+    },
+    RenderRange {
+        start: u64,
+        end: u64,
+        max_lines: usize,
+        resp: oneshot::Sender<Result<Value, ToolError>>,
     },
     Decompile {
         addr: u64,
@@ -229,6 +306,13 @@ pub enum IdaRequest {
         size: usize,
         resp: oneshot::Sender<Result<BytesResult, ToolError>>,
     },
+    ListPatches {
+        start: Option<u64>,
+        end: Option<u64>,
+        offset: usize,
+        limit: usize,
+        resp: oneshot::Sender<Result<Value, ToolError>>,
+    },
     SetComments {
         addr: Option<u64>,
         name: Option<String>,
@@ -309,6 +393,7 @@ pub enum IdaRequest {
     AnalyzeFuncs {
         progress_tx: Option<ProgressSender>,
         cancel: Option<CancellationToken>,
+        admission: SideEffectAdmission,
         resp: oneshot::Sender<Result<Value, ToolError>>,
     },
     FindBytes {
@@ -361,6 +446,7 @@ pub enum IdaRequest {
     },
     CallGraph {
         addr: u64,
+        direction: CallGraphDirection,
         max_depth: usize,
         max_nodes: usize,
         resp: oneshot::Sender<Result<Value, ToolError>>,
@@ -383,6 +469,7 @@ pub enum IdaRequest {
         code: String,
         progress_tx: Option<ProgressSender>,
         cancel: Option<CancellationToken>,
+        admission: SideEffectAdmission,
         resp: oneshot::Sender<Result<Value, ToolError>>,
     },
     Shutdown,
@@ -405,5 +492,21 @@ impl IdaRequest {
             | IdaRequest::RunScript { cancel, .. } => cancel.as_ref(),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ida::request::SideEffectAdmission;
+
+    #[test]
+    fn queued_side_effect_has_one_winner() {
+        let admission = SideEffectAdmission::default();
+        assert!(admission.cancel_if_queued());
+        assert!(admission.start().is_err());
+
+        let admission = SideEffectAdmission::default();
+        admission.start().expect("IDA thread claims the request");
+        assert!(!admission.cancel_if_queued());
     }
 }

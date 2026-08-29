@@ -2,6 +2,85 @@
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DebugStopAction {
+    Auto,
+    Detach,
+    Terminate,
+}
+
+impl DebugStopAction {
+    pub fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.unwrap_or("auto").trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "detach" => Ok(Self::Detach),
+            "terminate" | "kill" => Ok(Self::Terminate),
+            value => Err(format!(
+                "action must be auto, detach, or terminate (got {value:?})"
+            )),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Detach => "detach",
+            Self::Terminate => "terminate",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallGraphDirection {
+    Callees,
+    Callers,
+    Both,
+}
+
+impl CallGraphDirection {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Callees => "callees",
+            Self::Callers => "callers",
+            Self::Both => "both",
+        }
+    }
+
+    pub fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value
+            .unwrap_or("callees")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "callees" | "callee" | "outgoing" => Ok(Self::Callees),
+            "callers" | "caller" | "incoming" => Ok(Self::Callers),
+            "both" => Ok(Self::Both),
+            value => Err(format!(
+                "direction must be callees, callers, or both (got {value:?})"
+            )),
+        }
+    }
+}
+
+/// Typed loader configuration for a newly-created raw-binary database.
+#[derive(Debug, Clone, Default)]
+pub struct RawBinaryTarget {
+    pub processor: Option<String>,
+    pub bitness: Option<idalib::segment::Bitness>,
+    pub base_address: Option<u64>,
+    pub entry_point: Option<u64>,
+}
+
+impl RawBinaryTarget {
+    pub fn is_empty(&self) -> bool {
+        self.processor.is_none()
+            && self.bitness.is_none()
+            && self.base_address.is_none()
+            && self.entry_point.is_none()
+    }
+}
+
 /// Database info returned after opening
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DbInfo {
