@@ -84,11 +84,10 @@ The binary is at:
 
 ## IDA SDK (for CI builds)
 
-CI builds require the IDA SDK. Set `IDASDKDIR` to the SDK path:
+CI builds require the IDA SDK. Set `IDASDKDIR` for the release recipe:
 
 ```bash
-export IDASDKDIR=/path/to/idasdk
-cargo build --release
+env IDASDKDIR=/path/to/idasdk just release
 ```
 
 ## RPATH
@@ -111,9 +110,26 @@ On Linux and Windows, users may need to set environment variables at runtime:
 # Streamable HTTP with concurrent multi-IDB worker pool
 ./target/release/ida-mcp serve-http --bind 127.0.0.1:8765 --max-workers 4 --min-workers 1
 
+# Explicit multi-database workspace over stdio
+./target/release/ida-mcp --workspace --workspace-max-workers 4
+
+# Explicit handles over stateless HTTP
+./target/release/ida-mcp --workspace serve-http --bind 127.0.0.1:8765 --stateless
+
+# Opt-in debugger tools (Apple Silicon macOS only for now)
+./target/release/ida-mcp --workspace --enable-debugger
+
 # CLI probe (test IDA connection)
 ./target/release/ida-mcp probe --path /path/to/binary --list 10
+
+# Probe a raw binary while writing its database somewhere else
+./target/release/ida-mcp probe --path /read-only/input --idb-out ~/ida-work/input.i64
 ```
+
+Workspace mode uses `--workspace-max-workers`; the legacy HTTP
+`--max-workers`/`--min-workers` flags do not configure it. Debugger tools only
+appear when `--enable-debugger` is set on a supported host. That currently means
+Apple Silicon macOS; Linux and Windows do not advertise them.
 
 ## Cross-Compilation
 
