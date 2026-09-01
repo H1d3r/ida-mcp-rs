@@ -141,10 +141,10 @@ run_stdio_legacy_owner() {
   server_pid=$!
   exec 3>"$fifo"
 
-  printf '%s\n' '{"jsonrpc":"2.0","id":30,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"ida-mcp-legacy-owner-test","version":"0.1"},"capabilities":{}}}' >&3
+  printf '%s\n' '{"jsonrpc":"2.0","id":30,"method":"initialize","params":{"protocolVersion":"2026-07-28","clientInfo":{"name":"ida-mcp-legacy-owner-test","version":"0.1"},"capabilities":{}}}' >&3
   local initialize
   initialize="$(wait_json_line "$log" 30)"
-  assert_json "legacy stdio initialize must negotiate 2025-11-25" "$initialize" \
+  assert_json "stdio initialize naming 2026 must negotiate legacy 2025-11-25" "$initialize" \
     '.result.protocolVersion == "2025-11-25"'
   printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' >&3
 
@@ -269,8 +269,26 @@ run_http_modern() {
     "$(extract_http_json "$tmpdir/http-call.out")" \
     '.result.resultType == "complete" and .result.isError == false'
 
+  local initialize='{"jsonrpc":"2.0","id":13,"method":"initialize","params":{"protocolVersion":"2026-07-28","clientInfo":{"name":"ida-mcp-modern-test","version":"0.1"},"capabilities":{}}}'
+  curl -sS -D "$tmpdir/http-init-headers.out" "${http_headers[@]}" \
+    -d "$initialize" "$url" >"$tmpdir/http-init.out"
+  assert_json "HTTP initialize naming 2026 must negotiate legacy 2025-11-25" \
+    "$(extract_http_json "$tmpdir/http-init.out")" \
+    '.result.protocolVersion == "2025-11-25"'
+  local session_id
+  session_id="$(awk -F': ' 'tolower($1)=="mcp-session-id" {print $2}' "$tmpdir/http-init-headers.out" | tr -d '\r')"
+  if [[ -z "$session_id" ]]; then
+    echo "HTTP initialize naming 2026 did not create a legacy session" >&2
+    cat "$tmpdir/http-init-headers.out" >&2
+    cat "$tmpdir/http-init.out" >&2
+    exit 1
+  fi
+  curl -sS "${http_headers[@]}" -H "Mcp-Session-Id: $session_id" \
+    -d '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' \
+    "$url" >/dev/null
+
   cleanup_server
-  echo "   default single-worker HTTP stayed sessionless for discover/list/call"
+  echo "   default HTTP kept discover/list/call sessionless and initialize sessionful"
 }
 
 run_pooled_boundary() {
