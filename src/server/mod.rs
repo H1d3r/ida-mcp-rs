@@ -650,10 +650,10 @@ enum ForegroundOperationError {
     Tool(ToolError),
     TimedOut {
         timeout_secs: u64,
-        snapshot: OperationSnapshot,
+        snapshot: Box<OperationSnapshot>,
     },
     Cancelled {
-        snapshot: OperationSnapshot,
+        snapshot: Box<OperationSnapshot>,
     },
 }
 
@@ -1321,7 +1321,9 @@ impl IdaMcpServer {
                                     format!("{tool_name} cancelled"),
                                 )
                             });
-                        Err(ForegroundOperationError::Cancelled { snapshot })
+                        Err(ForegroundOperationError::Cancelled {
+                            snapshot: Box::new(snapshot),
+                        })
                     }
                     Err(error) => {
                         let _ = self
@@ -1353,7 +1355,7 @@ impl IdaMcpServer {
                     });
                 Err(ForegroundOperationError::TimedOut {
                     timeout_secs,
-                    snapshot,
+                    snapshot: Box::new(snapshot),
                 })
             }
             Outcome::Cancelled => {
@@ -1373,7 +1375,9 @@ impl IdaMcpServer {
                             format!("{tool_name} cancelled by client"),
                         )
                     });
-                Err(ForegroundOperationError::Cancelled { snapshot })
+                Err(ForegroundOperationError::Cancelled {
+                    snapshot: Box::new(snapshot),
+                })
             }
         }
     }
