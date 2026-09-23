@@ -13,7 +13,7 @@ use crate::ida::worker::{
 };
 use futures_util::future::join_all;
 use rmcp::handler::client::ClientHandler;
-use rmcp::model::{CallToolResult, ClientInfo, JsonObject};
+use rmcp::model::{CallToolResult, JsonObject};
 use rmcp::service::{Peer, RoleClient, RunningService};
 use rmcp::transport::child_process::TokioChildProcess;
 use rmcp::ServiceExt;
@@ -144,11 +144,7 @@ pub struct PooledWorkerHandle {
 #[derive(Clone)]
 struct ParentClientHandler;
 
-impl ClientHandler for ParentClientHandler {
-    fn get_info(&self) -> ClientInfo {
-        ClientInfo::default()
-    }
-}
+impl ClientHandler for ParentClientHandler {}
 
 #[derive(Clone, Copy)]
 enum WorkerRetireReason {

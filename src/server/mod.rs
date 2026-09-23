@@ -30,7 +30,7 @@ use rmcp::{
         wrapper::Parameters,
     },
     model::{
-        CallToolResult, ContentBlock as Content, ServerCapabilities, ServerInfo, Tool,
+        CallToolResult, ContentBlock as Content, ServerCapabilities, ServerConfig, Tool,
         ToolAnnotations,
     },
     schemars::{schema_for, JsonSchema},
@@ -6710,8 +6710,8 @@ impl ServerHandler for IdaMcpServer {
         supported_protocol_versions(self.worker.is_legacy_pooled())
     }
 
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tasks()
@@ -7142,7 +7142,7 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
         self.inner.call_tool(params, ctx).await
     }
 
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         self.inner.get_info()
     }
 
