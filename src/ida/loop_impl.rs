@@ -132,16 +132,52 @@ fn set_idausr(value: Option<&OsStr>) -> Result<(), String> {
 /// version reporting workaround.
 fn check_ida_version() -> Option<String> {
     let (sdk_major, sdk_minor) = idalib::SDK_VERSION;
+    let loaded_from = loaded_idalib_path()
+        .map(|path| format!(" (loaded from {})", path.display()))
+        .unwrap_or_default();
     match idalib::version() {
         Ok(v) => {
-            info!("IDA runtime version: {v} (compiled for SDK {sdk_major}.{sdk_minor})");
-            check_version_mismatch((sdk_major, sdk_minor), (v.major(), v.minor()))
+            let report = format!("{v}{loaded_from}");
+            info!("IDA runtime version: {report} (compiled for SDK {sdk_major}.{sdk_minor})");
+            check_version_mismatch((sdk_major, sdk_minor), (v.major(), v.minor()), &report)
         }
         Err(e) => {
-            warn!("Could not query IDA runtime version: {e}");
+            warn!("Could not query IDA runtime version{loaded_from}: {e}");
             None
         }
     }
+}
+
+/// Resolve the file of the loaded IDA library that answers
+/// `get_library_version`, so a version report names the library the dynamic
+/// loader actually picked rather than the one the build expected.
+#[cfg(unix)]
+fn loaded_idalib_path() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+
+    // SAFETY: dlsym only reads the NUL-terminated symbol name, and
+    // RTLD_DEFAULT searches the images already loaded into this process.
+    let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"get_library_version".as_ptr()) };
+    if symbol.is_null() {
+        return None;
+    }
+    // SAFETY: Dl_info holds only raw pointers, for which all-zero is valid.
+    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+    // SAFETY: `symbol` is an address inside a loaded image and `info` is a
+    // valid, exclusively borrowed out-parameter for the duration of the call.
+    if unsafe { libc::dladdr(symbol, &mut info) } == 0 || info.dli_fname.is_null() {
+        return None;
+    }
+    // SAFETY: dladdr succeeded, so dli_fname points at the loader's
+    // NUL-terminated image path, which stays valid while the image is loaded.
+    // IDA's libraries are never unloaded during the process lifetime.
+    let name = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) };
+    Some(PathBuf::from(OsStr::from_bytes(name.to_bytes())))
+}
+
+#[cfg(not(unix))]
+fn loaded_idalib_path() -> Option<PathBuf> {
+    None
 }
 
 fn check_license_expiry() -> Result<(), String> {
@@ -2200,7 +2236,14 @@ fn reject_with_error(req: IdaRequest, err: ToolError) {
 
 /// Compare the compile-time SDK version against the runtime version.
 /// Returns an error message on mismatch, `None` if they match.
-fn check_version_mismatch(sdk_version: (i32, i32), runtime_version: (i32, i32)) -> Option<String> {
+///
+/// `runtime_report` describes the runtime in the message: its full version
+/// and the library it was loaded from.
+fn check_version_mismatch(
+    sdk_version: (i32, i32),
+    runtime_version: (i32, i32),
+    runtime_report: &str,
+) -> Option<String> {
     let (sdk_major, sdk_minor) = sdk_version;
     let (runtime_major, runtime_minor) = runtime_version;
     let major_mismatch = runtime_major != sdk_major;
@@ -2210,8 +2253,8 @@ fn check_version_mismatch(sdk_version: (i32, i32), runtime_version: (i32, i32)) 
         Some(format!(
             "IDA version mismatch: ida-mcp was compiled for IDA \
              {sdk_major}.{sdk_minor}, but the runtime IDA library reports \
-             {runtime_major}.{runtime_minor}. Install the matching IDA \
-             version or use the ida-mcp release built for your IDA version.",
+             {runtime_report}. Install the matching IDA version or use the \
+             ida-mcp release built for your IDA version.",
         ))
     } else {
         None
@@ -2263,22 +2306,45 @@ mod tests {
 
     #[test]
     fn matching_ida_94_version_passes() {
-        assert!(check_version_mismatch((9, 4), (9, 4)).is_none());
+        assert!(check_version_mismatch((9, 4), (9, 4), "9.4.260714").is_none());
     }
 
     #[test]
     fn mismatched_major_version_returns_error() {
-        let msg = check_version_mismatch((9, 4), (8, 4))
+        let msg = check_version_mismatch((9, 4), (8, 4), "8.4.240215")
             .expect("mismatched major version should return an error");
         assert!(msg.contains("compiled for IDA 9.4"), "{msg}");
-        assert!(msg.contains("reports 8.4"), "{msg}");
+        assert!(msg.contains("reports 8.4.240215"), "{msg}");
     }
 
     #[test]
     fn ida_94_rejects_mismatched_minor_version() {
-        let msg = check_version_mismatch((9, 4), (9, 3))
+        let msg = check_version_mismatch((9, 4), (9, 3), "9.3.0")
             .expect("IDA 9.4 should reject a mismatched minor version");
         assert!(msg.contains("reports 9.3"));
+    }
+
+    #[test]
+    fn mismatch_message_names_the_loaded_library() {
+        let report = concat!(
+            "9.0.260213 (loaded from ",
+            "/Applications/IDA Professional 9.3.app/Contents/MacOS/libidalib.dylib)"
+        );
+        let msg = check_version_mismatch((9, 4), (9, 0), report)
+            .expect("IDA 9.3's 9.0 product version must not pass a 9.4 build");
+        assert!(msg.contains(&format!("reports {report}.")), "{msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loaded_idalib_path_resolves_the_linked_ida_library() {
+        // `--as-needed` drops the IDA library from a test binary whose live
+        // code never references it; keep one reference alive.
+        let _ = std::hint::black_box(idalib::version as fn() -> _);
+        let path = crate::ida::loop_impl::loaded_idalib_path()
+            .expect("dladdr should resolve the library exporting get_library_version");
+        let name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
+        assert!(name.starts_with("libida"), "{}", path.display());
     }
 
     /// IDA 9.3 returns product version 9.0.260213 — the minor=0 must
@@ -2288,7 +2354,7 @@ mod tests {
         // sdk_major=9 (from SDK_VERSION=(9,3)), runtime major=9
         // (from get_library_version returning 9.0.260213).
         // The minor versions differ (3 vs 0) but we only compare major.
-        assert!(check_version_mismatch((9, 3), (9, 0)).is_none());
+        assert!(check_version_mismatch((9, 3), (9, 0), "9.0.260213").is_none());
     }
 
     #[test]
