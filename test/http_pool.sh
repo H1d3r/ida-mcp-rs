@@ -297,7 +297,7 @@ open-timeout-cleanup)
     >/dev/null 2>&1
 
   open_args="$(jq -cn --arg path "$large_raw" --arg output "$output" \
-    '{path:$path,idb_out:$output,file_type:"Binary file",processor:"metapc:80386p",bitness:64,auto_analyse:false,timeout_secs:600}')"
+    '{path:$path,idb_out:$output,processor:"metapc:80386p",bitness:64,auto_analyse:false,timeout_secs:600}')"
   open_resp_file="$tmpdir/open-timeout-response.json"
   tool_call "$session_a" 20 open_idb "$open_args" 30 >"$open_resp_file" &
   open_pid=$!

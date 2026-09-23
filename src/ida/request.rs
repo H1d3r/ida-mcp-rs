@@ -61,7 +61,6 @@ pub enum IdaRequest {
         debug_info_verbose: bool,
         force: bool,
         rebuild: bool,
-        file_type: Option<String>,
         auto_analyse: bool,
         raw_target: RawBinaryTarget,
         extra_args: Vec<String>,

@@ -597,7 +597,6 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 debug_info_verbose,
                 force,
                 rebuild,
-                file_type,
                 auto_analyse,
                 raw_target,
                 extra_args,
@@ -617,7 +616,7 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     let _ = resp.send(Err(err));
                     continue;
                 }
-                info!(path = %path, force, rebuild, file_type = ?file_type, auto_analyse, "Opening database");
+                info!(path = %path, force, rebuild, auto_analyse, "Opening database");
                 // `handle_open` never replaces an open database: the same
                 // path is a no-op and a different path returns
                 // DatabaseAlreadyOpen. Debugger teardown therefore belongs to
@@ -634,7 +633,6 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     debug_info_verbose,
                     force,
                     rebuild,
-                    file_type.as_deref(),
                     auto_analyse,
                     &raw_target,
                     &extra_args,

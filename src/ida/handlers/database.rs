@@ -653,7 +653,6 @@ pub fn handle_open(
     debug_info_verbose: bool,
     force: bool,
     rebuild: bool,
-    file_type: Option<&str>,
     auto_analyse: bool,
     raw_target: &RawBinaryTarget,
     extra_args: &[String],
@@ -663,7 +662,6 @@ pub fn handle_open(
 ) -> Result<DbInfo, ToolError> {
     let expanded = expand_path(path);
     let debug_info_path = non_empty_trimmed(debug_info_path);
-    let file_type = non_empty_trimmed(file_type);
     ensure_not_cancelled(cancel.as_ref())?;
     let is_idb = has_ida_database_extension(&expanded);
     let raw_entry_point = normalized_raw_entry_point(raw_target);
@@ -941,10 +939,6 @@ pub fn handle_open(
         opts.auto_analyse(
             auto_analyse && raw_target.bitness.is_none() && raw_target.entry_point.is_none(),
         );
-        if let Some(ft) = file_type {
-            info!(file_type = ft, "Using file type selector (-T flag)");
-            opts.file_type(ft);
-        }
         if let Some(processor) = raw_target.processor.as_deref() {
             opts.processor(processor);
         }
@@ -1238,9 +1232,9 @@ mod tests {
 
     #[test]
     fn init_database_args_preserves_user_args() {
-        let args = init_database_args(&["-Sscript.py".to_string(), "-Tpe".to_string()]);
+        let args = init_database_args(&["-Sscript.py".to_string(), "-pmetapc".to_string()]);
         assert!(args.iter().any(|arg| arg == "-Sscript.py"));
-        assert!(args.iter().any(|arg| arg == "-Tpe"));
+        assert!(args.iter().any(|arg| arg == "-pmetapc"));
     }
 
     #[test]
@@ -1382,7 +1376,7 @@ mod tests {
         let args = init_database_args(&[]);
         assert_eq!(args, vec!["-A".to_string()]);
 
-        let args = init_database_args(&["-A".to_string(), "-Tpe".to_string()]);
+        let args = init_database_args(&["-A".to_string(), "-pmetapc".to_string()]);
         assert_eq!(args.iter().filter(|arg| arg.as_str() == "-A").count(), 1);
     }
 

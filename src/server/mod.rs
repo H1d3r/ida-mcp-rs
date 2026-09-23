@@ -1512,11 +1512,10 @@ impl IdaMcpServer {
     async fn open_dsc_direct(
         &self,
         open_path: &std::path::Path,
-        file_type: Option<&str>,
         module: &str,
         frameworks: &[String],
     ) -> Result<CallToolResult, McpError> {
-        info!(path = %open_path.display(), file_type, "Opening DSC directly through idalib");
+        info!(path = %open_path.display(), "Opening DSC directly through idalib");
 
         let open_path_str = open_path.display().to_string();
         // Bind the image loads below to the database this call opened. The IDA
@@ -1532,7 +1531,6 @@ impl IdaMcpServer {
                 false,
                 false,
                 false,
-                file_type.map(str::to_string),
                 false,
                 RawBinaryTarget::default(),
                 Vec::new(),
@@ -1556,7 +1554,7 @@ impl IdaMcpServer {
             .await
         {
             Ok(image) => loaded_images.push(image),
-            Err(ToolError::NotSupported(message)) if file_type.is_none() => {
+            Err(ToolError::NotSupported(message)) => {
                 dsc_warning = Some(format!(
                     "Opened existing IDA database, but native DSC loading is unavailable: {message}"
                 ));
@@ -1880,7 +1878,6 @@ impl IdaMcpServer {
                 false,
                 false,
                 false,
-                None,
                 auto_analyse,
                 RawBinaryTarget::default(),
                 Vec::new(),
@@ -2528,7 +2525,6 @@ impl IdaMcpServer {
 
         let input_is_database = Self::is_database_path(&path);
         let debug_info_path = req.normalized_debug_info_path();
-        let file_type = req.normalized_file_type();
         let processor = req.normalized_processor();
         if let Some(processor) = processor.as_deref()
             && let Err(error) = validate_raw_processor(processor)
@@ -2662,7 +2658,6 @@ impl IdaMcpServer {
                         req.debug_info_verbose.unwrap_or(false),
                         req.force.unwrap_or(false),
                         req.rebuild.unwrap_or(false),
-                        file_type.clone(),
                         effective_auto_analyse,
                         raw_target.clone(),
                         worker_extra_args.clone(),
@@ -3274,7 +3269,6 @@ impl IdaMcpServer {
                 false,
                 false,
                 req.rebuild.unwrap_or(false),
-                None,
                 false,
                 RawBinaryTarget::default(),
                 Vec::new(),
@@ -5766,7 +5760,7 @@ impl IdaMcpServer {
                 // fallback only guards the type system.
                 let existing = existing_i64.unwrap_or(out_i64);
                 return self
-                    .open_dsc_direct(&existing, None, &req.module, &frameworks)
+                    .open_dsc_direct(&existing, &req.module, &frameworks)
                     .await;
             }
             // IDA 9.4 exposes ida_dscu/dscu_svc_t: the loader can open the DSC
@@ -8338,7 +8332,7 @@ mod tests {
             .collect::<String>();
         assert_eq!(
             digest,
-            "59568456bad624fc92694542ec5ba9d67f59b42b6134ef91f17af9c6a5d975b9"
+            "daa1b74bdc9a0d551535d66fb4187edcd83da9a1696fb813f435b38528070c3f"
         );
     }
 

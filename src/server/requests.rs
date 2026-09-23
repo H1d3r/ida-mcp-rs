@@ -32,10 +32,6 @@ pub struct OpenIdbRequest {
     )]
     pub idb_out: Option<String>,
     #[schemars(
-        description = "IDA file-type selector (-T). Raw binaries only. Empty strings are ignored."
-    )]
-    pub file_type: Option<String>,
-    #[schemars(
         description = "IDA processor selector for a raw blob, including an explicit variant for multi-mode families (for example arm:ARMv7-M or metapc:80386p)."
     )]
     pub processor: Option<String>,
@@ -68,10 +64,6 @@ pub struct OpenIdbRequest {
 impl OpenIdbRequest {
     pub fn normalized_debug_info_path(&self) -> Option<String> {
         non_empty_trimmed(self.debug_info_path.as_deref())
-    }
-
-    pub fn normalized_file_type(&self) -> Option<String> {
-        non_empty_trimmed(self.file_type.as_deref())
     }
 
     pub fn normalized_processor(&self) -> Option<String> {
@@ -119,7 +111,7 @@ rmcp::elicit_safe!(OpenIdbBackgroundChoice);
 mod tests {
     use crate::server::requests::OpenIdbRequest;
 
-    fn open_request(debug_info_path: Option<&str>, file_type: Option<&str>) -> OpenIdbRequest {
+    fn open_request(debug_info_path: Option<&str>) -> OpenIdbRequest {
         OpenIdbRequest {
             path: "/tmp/sample".to_string(),
             load_debug_info: None,
@@ -128,7 +120,6 @@ mod tests {
             force: None,
             rebuild: None,
             idb_out: None,
-            file_type: file_type.map(str::to_string),
             processor: None,
             bitness: None,
             base_address: None,
@@ -142,26 +133,24 @@ mod tests {
 
     #[test]
     fn open_idb_empty_optional_strings_are_ignored() {
-        let req = open_request(Some(" \t "), Some(""));
+        let req = open_request(Some(" \t "));
         assert_eq!(req.normalized_debug_info_path(), None);
-        assert_eq!(req.normalized_file_type(), None);
     }
 
     #[test]
     fn open_idb_optional_strings_are_trimmed() {
-        let mut req = open_request(Some(" C:\\symbols\\sample.pdb "), Some(" pe "));
+        let mut req = open_request(Some(" C:\\symbols\\sample.pdb "));
         req.processor = Some(" arm:ARMv7-M ".to_string());
         assert_eq!(
             req.normalized_debug_info_path(),
             Some("C:\\symbols\\sample.pdb".to_string())
         );
-        assert_eq!(req.normalized_file_type(), Some("pe".to_string()));
         assert_eq!(req.normalized_processor(), Some("arm:ARMv7-M".to_string()));
     }
 
     #[test]
     fn open_idb_output_path_is_trimmed_and_empty_is_ignored() {
-        let mut req = open_request(None, None);
+        let mut req = open_request(None);
         req.idb_out = Some("  /tmp/output.i64  ".to_string());
         assert_eq!(
             req.normalized_idb_out(),
@@ -174,7 +163,7 @@ mod tests {
 
     #[test]
     fn worker_output_path_drives_the_effective_raw_target() {
-        let mut req = open_request(None, None);
+        let mut req = open_request(None);
         req.idb_out = Some("/tmp/public.i64".to_string());
         req.worker_idb_out = Some("  /tmp/worker.i64  ".to_string());
 
