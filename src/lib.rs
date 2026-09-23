@@ -83,6 +83,7 @@ pub mod disasm;
 pub mod dsc;
 pub mod error;
 pub mod ida;
+pub mod macho_fat;
 pub mod server;
 pub mod tool_registry;
 

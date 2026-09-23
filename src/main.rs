@@ -22,7 +22,7 @@ use ida_mcp::{
     expand_path, ida,
     ida::pool::{WorkerPool, WorkerPoolConfig, WorkspaceRegistry},
     ida::worker::WorkerBackend,
-    DbInfo, FunctionInfo, IdaMcpServer, IdaWorker, ServerMode,
+    FunctionInfo, IdaMcpServer, IdaWorker, ServerMode,
 };
 use idalib::{idb::IDBOpenOptions, Address, IDB};
 use rmcp::transport::stdio;
@@ -1114,22 +1114,7 @@ fn run_probe(args: ProbeArgs, allow_lumina: bool) -> anyhow::Result<()> {
     let db =
         db.map_err(|e| anyhow::anyhow!("Failed to open database: {}: {}", path.display(), e))?;
 
-    let meta = db.meta();
-    let info = DbInfo {
-        path: path.display().to_string(),
-        file_type: format!("{:?}", meta.filetype()),
-        processor: db.processor().long_name(),
-        bits: if meta.is_64bit() {
-            64
-        } else if meta.is_32bit_exactly() {
-            32
-        } else {
-            16
-        },
-        function_count: db.function_count(),
-        debug_info: None,
-        analysis_status: ida::handlers::analysis::build_analysis_status(&db),
-    };
+    let info = ida::handlers::database::build_db_info(&db, &path.display().to_string(), None);
     info!("Database opened in {}s", open_start.elapsed().as_secs());
     println!("{}", serde_json::to_string_pretty(&info)?);
 

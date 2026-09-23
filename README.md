@@ -174,6 +174,9 @@ open_idb(path: "~/samples/malware")
 # Keep the generated database away from a read-only input directory
 open_idb(path: "/System/example", idb_out: "~/ida-work/example.i64")
 
+# Pick one slice of a universal (fat) Mach-O
+open_idb(path: "/bin/ls", arch: "arm64e", idb_out: "~/ida-work/ls.i64")
+
 # These work immediately, no analysis needed
 list_functions(limit: 20)
 disasm_by_name(name: "main", count: 20)
@@ -197,6 +200,21 @@ Raw inputs still use IDA's normal loader by default and save to `<input>.i64`.
 directories. An existing output is reused only when IDA's recorded input
 SHA-256 matches the current file; `rebuild: true` can overwrite only a database
 whose hash or recorded input path proves that it belongs to the input.
+
+### Universal (fat) Mach-O
+
+IDA picks a fat slice on its own when it loads one headlessly: x86_64 whenever
+present, and it does not recognize 64-bit fat headers. `open_idb` therefore
+resolves the slice itself. Pass `arch` (for example `arm64e` or `x86_64`), or
+omit it and answer the slice prompt when your client supports input requests.
+Without an answer (no prompt support, declined, or a pre-2026 client that does
+not reply within 30 seconds) the call fails with the list of slices, so
+unattended agents can retry with `arch`. MCP 2026 clients hold the question
+themselves; the server does not wait on them. The chosen slice is copied to
+`<input name>.<arch>` beside the output database and opened as a
+single-architecture Mach-O. An identical copy is reused; a different file at
+that path is never overwritten. The response's `universal` field names the
+slice, and `loader` shows what IDA loaded.
 
 For headerless blobs, the same `open_idb` tool accepts typed loader hints:
 

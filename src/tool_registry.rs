@@ -211,6 +211,13 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
                     Set rebuild=true when the input changed or stale analysis should be overwritten; \
                     overwrite is allowed only when the existing database's hash or recorded input path \
                     proves that it belongs to this input. \
+                    Universal (fat) Mach-O inputs need a slice: pass arch (e.g. arm64e, x86_64), or omit it \
+                    and answer the slice prompt when the client supports input requests (legacy clients \
+                    get 30s before the call fails). Without an answer the error lists the slices. The \
+                    chosen slice is copied to <input name>.<arch> beside the output database (an identical \
+                    copy is reused; a different file is never overwritten) and opened as a \
+                    single-architecture Mach-O; the response's universal field names it. The loader \
+                    field reports what IDA loaded, e.g. \"Mach-O file (EXECUTE). ARM64e\". \
                     Auto-analysis does NOT run by default — open returns quickly with the database \
                     loaded. Check analysis_status in the response: if auto_is_ok is false and you \
                     need xrefs/decompile, call analyze_funcs(background=true) and poll task_status. \
@@ -224,11 +231,12 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
                     Call close_idb when finished to release database locks; in multi-client servers, coordinate before closing. \
                     In HTTP/SSE mode, keep the close_token returned by open_idb for sessionless MCP 2026 or cross-session close requests; the owning legacy session can close directly. \
                     Supports timeout_secs (default 300s, max 600s). Phase transitions are observable via recent_operations. \
-                    Returns metadata about the binary: file type, processor, bitness, function count, analysis_status.",
+                    Returns metadata about the binary: file type, loader, processor, bitness, function count, analysis_status.",
         example: r#"{"path": "/path/to/binary", "auto_analyse": false}"#,
         default: true,
         keywords: &[
-            "open", "load", "database", "binary", "idb", "i64", "macho", "elf", "pe",
+            "open", "load", "database", "binary", "idb", "i64", "macho", "elf", "pe", "fat",
+            "universal", "slice", "arch",
         ],
     },
     ToolInfo {

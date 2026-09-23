@@ -14,6 +14,7 @@ env DEBUGGER_REQUIRE_READY=1 just test-debugger-live # Authorized macOS live lif
 just test-tool-filter # Toolsets, explicit tools, exclusions, and read-only mode
 just test-script  # IDAPython script execution test
 just test-elicitation # open_idb auto-background elicitation test
+just test-universal # Universal (fat) Mach-O slice selection and prompts
 just test-session-cancel # legacy-session cancel-on-disconnect test
 just test-http-startup # HTTP bind-failure exit status (no IDA license needed)
 just test-dsc /path/to/dyld_shared_cache_arm64e  # DSC loading test
@@ -67,6 +68,13 @@ builds the debug binary before running its harness.
   existing output
 - Covers `idb_out` beside read-only inputs, typed raw processor/bitness/base
   configuration, Thumb-tagged entry points, and failed-open cleanup
+
+**Universal Mach-O test** (`just test-universal`)
+- Builds 32- and 64-bit fat fixtures from `fixtures/mini` (arm64 plus an
+  arm64e-header copy); skips on hosts where the fixture is not arm64 Mach-O
+- Covers `arch` selection, slice-list errors, slice reuse, the thin-file arch
+  check, the legacy slice prompt (answered and timed out), and MCP 2026 input
+  requests, including one round that also answers the background question
 
 **Debugger availability test** (`just test-debugger`)
 - Confirms debugger tools are absent by default and stay hidden on unsupported hosts

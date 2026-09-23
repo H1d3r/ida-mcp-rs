@@ -250,10 +250,7 @@ impl ToolMux<IdaMcpServer> {
         // tasks extension capability.
         let should_materialize_task = context.name() == "open_dsc"
             && context.service.workspace_registry.is_none()
-            && context
-                .request_context()
-                .protocol_version()
-                .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28)
+            && speaks_mcp_2026(context.request_context())
             && context
                 .request_context()
                 .client_capabilities()
@@ -660,6 +657,269 @@ enum ForegroundOperationError {
 enum OpenIdbBackgroundDecision {
     Ready(bool),
     InputRequired(InputRequiredResult),
+}
+
+/// Inputs shared by the questions `open_idb` may ask. A stage that answers
+/// from the MRTR fields takes them, so a later stage never sees a response
+/// meant for another.
+struct OpenPrompts {
+    request_state: Option<String>,
+    input_responses: Option<InputResponses>,
+    /// The call's parsed `timeout_secs`, which also bounds inline prompts.
+    timeout_secs: Option<u64>,
+    /// Whether a large input's auto-analysis may be offered as a background
+    /// task (see [`IdaMcpServer::background_prompt_applies`]).
+    background_prompt: bool,
+    /// Whether an MCP 2026 client declared it can show form input requests.
+    form_elicitation: bool,
+}
+
+/// A sealed MCP 2026 (MRTR) stage and the input-request key its question uses.
+struct MrtrStage {
+    seal: &'static [u8],
+    key: &'static str,
+}
+
+const BACKGROUND_STAGE: MrtrStage = MrtrStage {
+    seal: b"open_idb/background-confirmation/v1",
+    key: "background",
+};
+const SLICE_STAGE: MrtrStage = MrtrStage {
+    seal: b"open_idb/universal-slice/v1",
+    key: "slice",
+};
+
+/// One MCP 2026 form stage: asked now, answered on the retry, or impossible
+/// because the client cannot show forms.
+enum MrtrStep {
+    InputRequired(InputRequiredResult),
+    Answered(ElicitResult),
+    NoFormSupport,
+}
+
+/// A universal Mach-O input resolved to the slice file IDA will open.
+#[derive(serde::Serialize)]
+struct UniversalSlice {
+    arch: String,
+    slices: Vec<String>,
+    slice_path: String,
+    /// Background answer collected in the slice prompt, when it asked one.
+    #[serde(skip)]
+    background: Option<bool>,
+}
+
+enum UniversalInput {
+    /// Not a universal Mach-O; open the path as given.
+    NotUniversal,
+    Resolved(UniversalSlice),
+    InputRequired(InputRequiredResult),
+    Rejected(ToolError),
+}
+
+enum SliceAnswer {
+    Chosen(crate::macho_fat::FatSlice, Option<bool>),
+    InputRequired(InputRequiredResult),
+    /// No usable answer; the reason completes "…; <reason>. Pass arch=…".
+    Unanswered(String),
+}
+
+const NO_FORM_SUPPORT: &str = "the client cannot show input requests";
+
+fn speaks_mcp_2026(ctx: &RequestContext<RoleServer>) -> bool {
+    ctx.protocol_version()
+        .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28)
+}
+
+fn client_supports_form_elicitation(ctx: &RequestContext<RoleServer>) -> bool {
+    ctx.client_capabilities()
+        .and_then(|capabilities| capabilities.elicitation)
+        .and_then(|elicitation| elicitation.form)
+        .is_some()
+}
+
+fn exceeds_background_threshold(size_bytes: u64) -> bool {
+    size_bytes > OPEN_IDB_AUTO_BACKGROUND_THRESHOLD_BYTES
+}
+
+/// The background question's schema, shared by every prompt that asks it so
+/// the protocols cannot drift.
+fn background_choice_schema() -> Result<ElicitationSchema, McpError> {
+    ElicitationSchema::from_type::<OpenIdbBackgroundChoice>().map_err(|error| {
+        McpError::internal_error(
+            format!("failed to build open_idb elicitation schema: {error}"),
+            None,
+        )
+    })
+}
+
+/// An accepted background answer; no content or no choice means background.
+fn accepted_background(content: Option<Value>) -> bool {
+    content
+        .and_then(|content| serde_json::from_value::<OpenIdbBackgroundChoice>(content).ok())
+        .and_then(|choice| choice.background)
+        .unwrap_or(true)
+}
+
+fn slice_required_error(
+    path: &str,
+    slices: &[crate::macho_fat::FatSlice],
+    reason: &str,
+) -> ToolError {
+    ToolError::InvalidParams(format!(
+        "{path} is a universal Mach-O with slices {}; {reason}. Pass arch=<slice> to choose one.",
+        crate::macho_fat::slice_names(slices)
+    ))
+}
+
+/// Build the slice prompt. It also carries the background question when the
+/// chosen slice could cross the auto-background threshold, so one round trip
+/// answers both and MCP 2026 needs no chained request state.
+fn universal_slice_form(
+    path: &str,
+    slices: &[crate::macho_fat::FatSlice],
+    ask_background: bool,
+) -> Result<ElicitRequestParams, McpError> {
+    let names = slices.iter().map(|slice| slice.arch.clone()).collect();
+    let titles = slices
+        .iter()
+        .enumerate()
+        .map(|(index, slice)| {
+            format!(
+                "{} (slice {}, {} KiB)",
+                slice.arch,
+                index + 1,
+                slice.size.div_ceil(1024)
+            )
+        })
+        .collect();
+    let arch = EnumSchema::builder(names)
+        .enum_titles(titles)
+        .map_err(|error| McpError::internal_error(error, None))?
+        .description("Architecture slice to analyze")
+        .build();
+    let mut builder = ElicitationSchema::builder().required_enum_schema("arch", arch);
+    let mut message = format!(
+        "'{path}' is a universal Mach-O with {} slices ({}). Which architecture should IDA analyze?",
+        slices.len(),
+        crate::macho_fat::slice_names(slices)
+    );
+    if ask_background {
+        let background = background_choice_schema()?
+            .properties
+            .remove("background")
+            .ok_or_else(|| {
+                McpError::internal_error("background choice schema lost its field", None)
+            })?;
+        builder = builder.property("background", background);
+        message.push_str(&format!(
+            " Slices over {} MiB can run auto-analysis as a background task.",
+            OPEN_IDB_AUTO_BACKGROUND_THRESHOLD_BYTES / (1024 * 1024)
+        ));
+    }
+    let requested_schema = builder
+        .build()
+        .map_err(|error| McpError::internal_error(error, None))?;
+    Ok(ElicitRequestParams::FormElicitationParams {
+        meta: None,
+        message,
+        requested_schema,
+    })
+}
+
+/// The slice (and background answer, when asked) from a slice prompt answer.
+fn slice_answer_from(
+    response: ElicitResult,
+    slices: &[crate::macho_fat::FatSlice],
+    ask_background: bool,
+) -> Result<(crate::macho_fat::FatSlice, Option<bool>), String> {
+    match response.action {
+        ElicitationAction::Accept => {
+            let content = response.content.unwrap_or(Value::Null);
+            let arch = content
+                .get("arch")
+                .and_then(Value::as_str)
+                .ok_or("the answer did not name a slice")?;
+            let slice = crate::macho_fat::select_slice(slices, arch)
+                .ok_or_else(|| format!("no {arch} slice"))?;
+            Ok((
+                slice.clone(),
+                ask_background.then(|| accepted_background(Some(content))),
+            ))
+        }
+        ElicitationAction::Decline | ElicitationAction::Cancel => {
+            Err("the slice prompt was declined".to_string())
+        }
+        // `ElicitationAction` is #[non_exhaustive]; never guess a slice.
+        _ => Err("the slice prompt was not accepted".to_string()),
+    }
+}
+
+/// Slices of a universal Mach-O `input`, or `None` for any other input. An
+/// `arch` that cannot apply to a non-universal input is rejected.
+fn universal_slices(
+    input: &std::path::Path,
+    path: &str,
+    arch: Option<&str>,
+) -> Result<Option<Vec<crate::macho_fat::FatSlice>>, ToolError> {
+    use crate::macho_fat::MachOKind;
+
+    match crate::macho_fat::inspect(input)? {
+        MachOKind::Universal(slices) => Ok(Some(slices)),
+        MachOKind::Thin(thin) => match arch {
+            Some(arch) if !arch.eq_ignore_ascii_case(&thin) => {
+                Err(ToolError::InvalidParams(format!(
+                    "{path} is a single-architecture {thin} Mach-O; arch={arch} does not match"
+                )))
+            }
+            Some(_) | None => Ok(None),
+        },
+        MachOKind::Other => match arch {
+            Some(_) => Err(ToolError::InvalidParams(format!(
+                "arch applies only to Mach-O inputs; {path} is not a Mach-O file"
+            ))),
+            None => Ok(None),
+        },
+    }
+}
+
+/// Copy `slice` of `input` to its slice file beside the output database.
+async fn extract_universal_slice(
+    input: &std::path::Path,
+    idb_out: Option<&str>,
+    slice: &crate::macho_fat::FatSlice,
+) -> Result<std::path::PathBuf, ToolError> {
+    let output = idb_out.map(crate::expand_path);
+    let dest = crate::macho_fat::slice_path(input, output.as_deref(), &slice.arch)
+        .ok_or_else(|| ToolError::InvalidPath(input.display().to_string()))?;
+    if output.as_deref().is_some_and(|output| {
+        crate::ida::handlers::database::paths_refer_to_same_file(output, &dest)
+    }) {
+        return Err(ToolError::InvalidParams(format!(
+            "idb_out {} would overwrite the extracted {} slice",
+            dest.display(),
+            slice.arch
+        )));
+    }
+    let (source, chosen, target) = (input.to_path_buf(), slice.clone(), dest.clone());
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::macho_fat::extract_slice(&source, &chosen, &target)
+    })
+    .await
+    .map_err(|error| {
+        ToolError::OpenFailed(format!(
+            "extracting the {} slice of {} failed: {error}",
+            slice.arch,
+            input.display()
+        ))
+    })??;
+    info!(
+        input = %input.display(),
+        arch = %slice.arch,
+        slice_path = %dest.display(),
+        ?outcome,
+        "Resolved universal Mach-O slice"
+    );
+    Ok(dest)
 }
 
 fn timeout_with_child_grace(timeout_secs: Option<u64>, default_timeout_secs: u64) -> u64 {
@@ -2497,6 +2757,8 @@ impl IdaMcpServer {
         Raw binaries default to a .i64 alongside the input; idb_out selects another output path. \
         Later raw-path opens reuse only a database whose recorded input SHA-256 matches. \
         rebuild=true may replace only a provenance-matched database. \
+        Universal (fat) Mach-O: pass arch (e.g. arm64e) or answer the slice prompt; \
+        the slice is extracted to <input>.<arch> and opened. \
         For raw binaries, auto-analysis is OFF by default — check analysis_status; \
         call analyze_funcs(background=true) for full xrefs/decompile. \
         Returns close_token in HTTP/SSE mode (provide to close_idb). \
@@ -2580,14 +2842,43 @@ impl IdaMcpServer {
             base_address,
             entry_point,
         };
-        if input_is_database && (idb_out.is_some() || !raw_target.is_empty()) {
+        if input_is_database
+            && (idb_out.is_some() || !raw_target.is_empty() || req.normalized_arch().is_some())
+        {
             return Ok(ToolError::InvalidParams(
-                "processor, bitness, base_address, entry_point, and idb_out are only valid when opening a raw input"
+                "processor, bitness, base_address, entry_point, arch, and idb_out are only valid when opening a raw input"
                     .to_string(),
             )
             .to_tool_result()
             .into());
         }
+        let user_auto_analyse = req.auto_analyse.unwrap_or(false);
+        let mut prompts = OpenPrompts {
+            request_state,
+            input_responses,
+            timeout_secs,
+            background_prompt: self.background_prompt_applies(user_auto_analyse),
+            form_elicitation: client_supports_form_elicitation(&ctx),
+        };
+        // A pooled worker opens exactly the path its parent resolved; it has
+        // no client to ask which slice to use.
+        let universal = if input_is_database || matches!(self.mode, ServerMode::Worker) {
+            None
+        } else {
+            let arch = req.normalized_arch();
+            match self
+                .resolve_universal_input(&ctx, &path, arch, idb_out.as_deref(), &mut prompts)
+                .await?
+            {
+                UniversalInput::NotUniversal => None,
+                UniversalInput::Resolved(slice) => Some(slice),
+                UniversalInput::InputRequired(result) => return Ok(result.into()),
+                UniversalInput::Rejected(error) => return Ok(error.to_tool_result().into()),
+            }
+        };
+        let path = universal
+            .as_ref()
+            .map_or(path, |slice| slice.slice_path.clone());
         if !raw_target.is_empty()
             && !req.rebuild.unwrap_or(false)
             && raw_blob_database_exists(&path, idb_out.as_deref())
@@ -2606,37 +2897,28 @@ impl IdaMcpServer {
         };
         let open_timeout_secs = timeout_secs.unwrap_or(300).min(MAX_TIMEOUT_SECS);
         let foreground_timeout_secs = self.foreground_timeout_secs(timeout_secs, 300);
-        let user_auto_analyse = req.auto_analyse.unwrap_or(false);
-        let large_input_size = if !matches!(self.mode, ServerMode::Worker)
-            && user_auto_analyse
-            && !input_is_database
-        {
+        let large_input_size = if prompts.background_prompt && !input_is_database {
             Self::input_size_above_threshold(&path)
         } else {
             None
         };
-        let route_to_background = match large_input_size {
-            Some(size) => match self
-                .choose_open_idb_background(
-                    &ctx,
-                    &path,
-                    size,
-                    timeout_secs,
-                    request_state,
-                    input_responses,
-                )
+        let answered_background = universal.as_ref().and_then(|slice| slice.background);
+        let route_to_background = match (large_input_size, answered_background) {
+            (Some(_), Some(background)) => background,
+            (Some(size), None) => match self
+                .choose_open_idb_background(&ctx, &path, size, &mut prompts)
                 .await?
             {
                 OpenIdbBackgroundDecision::Ready(background) => background,
                 OpenIdbBackgroundDecision::InputRequired(result) => return Ok(result.into()),
             },
-            None if request_state.is_some() || input_responses.is_some() => {
+            (None, _) if prompts.request_state.is_some() || prompts.input_responses.is_some() => {
                 return Err(McpError::invalid_params(
                     "requestState/inputResponses do not match an active open_idb elicitation",
                     None,
                 ));
             }
-            None => false,
+            (None, _) => false,
         };
         // Open the database with auto_analyse disabled when we plan to spawn
         // analysis as a background task; the open call itself stays fast and
@@ -2708,6 +2990,9 @@ impl IdaMcpServer {
                         quick_tools.extend(["decompile", "xrefs_to"]);
                     }
                     map.insert("quick_tools".to_string(), json!(quick_tools));
+                    if let Some(slice) = &universal {
+                        map.insert("universal".to_string(), json!(slice));
+                    }
                     if !matches!(self.mode, ServerMode::Worker) {
                         map.insert("session_id".to_string(), json!(self.session_id));
                         self.apply_close_metadata(map, close_token);
@@ -2771,7 +3056,7 @@ impl IdaMcpServer {
             return None;
         }
         let size = meta.len();
-        (size > OPEN_IDB_AUTO_BACKGROUND_THRESHOLD_BYTES).then_some(size)
+        exceeds_background_threshold(size).then_some(size)
     }
 
     fn is_database_path(path: &str) -> bool {
@@ -2802,6 +3087,100 @@ impl IdaMcpServer {
         )
     }
 
+    /// Offer background analysis only where tasks are routed; a pooled worker
+    /// leaves that decision to its parent.
+    fn background_prompt_applies(&self, auto_analyse: bool) -> bool {
+        auto_analyse && !matches!(self.mode, ServerMode::Worker)
+    }
+
+    /// Whether this call answers prompts through MCP 2026 round trips. Older
+    /// clients answer inline, where MRTR fields are meaningless.
+    fn uses_mrtr(
+        ctx: &RequestContext<RoleServer>,
+        prompts: &OpenPrompts,
+    ) -> Result<bool, McpError> {
+        if speaks_mcp_2026(ctx) {
+            return Ok(true);
+        }
+        if prompts.request_state.is_some() || prompts.input_responses.is_some() {
+            return Err(McpError::invalid_params(
+                "requestState and inputResponses require MCP 2026-07-28",
+                None,
+            ));
+        }
+        Ok(false)
+    }
+
+    /// Run one MCP 2026 form stage: ask `form` on the first call, or read the
+    /// answer from the sealed retry. `associated_data` binds the sealed state
+    /// to the inputs the question depends on.
+    fn mrtr_form_stage(
+        &self,
+        prompts: &mut OpenPrompts,
+        stage: &MrtrStage,
+        associated_data: &str,
+        form: ElicitRequestParams,
+    ) -> Result<MrtrStep, McpError> {
+        let supports_form = prompts.form_elicitation;
+        let Some(sealed) = prompts.request_state.take() else {
+            if prompts.input_responses.is_some() {
+                return Err(McpError::invalid_params(
+                    "inputResponses require a matching requestState",
+                    None,
+                ));
+            }
+            if !supports_form {
+                return Ok(MrtrStep::NoFormSupport);
+            }
+            let sealed = self.request_state_codec.seal_with(
+                stage.seal,
+                &SealOptions::new()
+                    .associated_data(associated_data.as_bytes())
+                    .ttl(Duration::from_secs(OPEN_IDB_REQUEST_STATE_TTL_SECS)),
+            );
+            let mut input_requests = InputRequests::new();
+            input_requests.insert(
+                stage.key.to_string(),
+                InputRequest::Elicitation(ElicitRequest::new(form)),
+            );
+            return Ok(MrtrStep::InputRequired(InputRequiredResult::new(
+                Some(input_requests),
+                Some(sealed),
+            )));
+        };
+        let responses = prompts.input_responses.take();
+        if !supports_form {
+            return Err(McpError::invalid_params(
+                "MRTR retry omitted the form elicitation capability",
+                None,
+            ));
+        }
+        let opened = self
+            .request_state_codec
+            .open_with(&sealed, associated_data.as_bytes())
+            .map_err(|_| {
+                McpError::invalid_params("expired, tampered, or unknown requestState", None)
+            })?;
+        if opened != stage.seal {
+            return Err(McpError::invalid_params(
+                "requestState belongs to a different MRTR stage",
+                None,
+            ));
+        }
+        let key = stage.key;
+        let response = responses
+            .as_ref()
+            .and_then(|responses| responses.get(key))
+            .ok_or_else(|| {
+                McpError::invalid_params(format!("missing {key} elicitation response"), None)
+            })?;
+        serde_json::from_value(response.clone())
+            .map(MrtrStep::Answered)
+            .map_err(|_| {
+                McpError::invalid_params(format!("invalid {key} elicitation response action"), None)
+            })
+    }
+
     /// Decide whether `open_idb` should route auto-analysis to a background
     /// task. Asks the user via MCP elicitation when the client advertises the
     /// capability; falls back to "background" silently otherwise so large
@@ -2813,31 +3192,13 @@ impl IdaMcpServer {
         ctx: &RequestContext<RoleServer>,
         path: &str,
         size_bytes: u64,
-        request_timeout_secs: Option<u64>,
-        request_state: Option<String>,
-        input_responses: Option<InputResponses>,
+        prompts: &mut OpenPrompts,
     ) -> Result<OpenIdbBackgroundDecision, McpError> {
         use rmcp::service::{ElicitationError, ServiceError};
 
         let size_mib = size_bytes / (1024 * 1024);
-        let modern_protocol = ctx
-            .protocol_version()
-            .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28);
-        if modern_protocol {
-            return self.modern_choose_open_idb_background(
-                ctx,
-                path,
-                size_bytes,
-                request_state,
-                input_responses,
-            );
-        }
-
-        if request_state.is_some() || input_responses.is_some() {
-            return Err(McpError::invalid_params(
-                "requestState and inputResponses require MCP 2026-07-28",
-                None,
-            ));
+        if Self::uses_mrtr(ctx, prompts)? {
+            return self.modern_open_idb_background_decision(path, size_bytes, prompts);
         }
 
         if ctx.peer.supported_elicitation_modes().is_empty() {
@@ -2851,7 +3212,7 @@ impl IdaMcpServer {
         let prompt = Self::open_idb_background_prompt(path, size_bytes);
 
         let elicitation_timeout_secs =
-            Self::open_idb_elicitation_timeout_secs(request_timeout_secs);
+            Self::open_idb_elicitation_timeout_secs(prompts.timeout_secs);
         let client_cancel = ctx.ct.clone();
         let elicitation = ctx.peer.elicit_with_timeout::<OpenIdbBackgroundChoice>(
             prompt,
@@ -2901,126 +3262,171 @@ impl IdaMcpServer {
         Ok(OpenIdbBackgroundDecision::Ready(background))
     }
 
-    /// MCP 2026 (MRTR) preamble for the background decision: validates the
-    /// requestState/capability pairing before the sealed-state round-trip.
-    fn modern_choose_open_idb_background(
-        &self,
-        ctx: &RequestContext<RoleServer>,
-        path: &str,
-        size_bytes: u64,
-        request_state: Option<String>,
-        input_responses: Option<InputResponses>,
-    ) -> Result<OpenIdbBackgroundDecision, McpError> {
-        if request_state.is_none() && input_responses.is_some() {
-            return Err(McpError::invalid_params(
-                "inputResponses require a matching requestState",
-                None,
-            ));
-        }
-        let supports_form_elicitation = ctx
-            .client_capabilities()
-            .and_then(|capabilities| capabilities.elicitation)
-            .and_then(|elicitation| elicitation.form)
-            .is_some();
-        if request_state.is_none() && !supports_form_elicitation {
-            info!(
-                path,
-                size_mib = size_bytes / (1024 * 1024),
-                "client lacks form elicitation; routing open_idb auto-analysis to background"
-            );
-            return Ok(OpenIdbBackgroundDecision::Ready(true));
-        }
-        if !supports_form_elicitation {
-            return Err(McpError::invalid_params(
-                "MRTR retry omitted the form elicitation capability",
-                None,
-            ));
-        }
-        self.modern_open_idb_background_decision(path, size_bytes, request_state, input_responses)
-    }
-
+    /// MCP 2026 (MRTR) form of the background question.
     fn modern_open_idb_background_decision(
         &self,
         path: &str,
         size_bytes: u64,
-        request_state: Option<String>,
-        input_responses: Option<InputResponses>,
+        prompts: &mut OpenPrompts,
     ) -> Result<OpenIdbBackgroundDecision, McpError> {
-        const STAGE: &[u8] = b"open_idb/background-confirmation/v1";
-        const INPUT_KEY: &str = "background";
-
+        let form = ElicitRequestParams::FormElicitationParams {
+            meta: None,
+            message: Self::open_idb_background_prompt(path, size_bytes),
+            requested_schema: background_choice_schema()?,
+        };
         let associated_data = format!("tools/call:open_idb\0{path}\0{size_bytes}");
-        let Some(sealed) = request_state else {
-            if input_responses.is_some() {
-                return Err(McpError::invalid_params(
-                    "inputResponses require a matching requestState",
-                    None,
-                ));
+        let step = self.mrtr_form_stage(prompts, &BACKGROUND_STAGE, &associated_data, form)?;
+        Ok(match step {
+            MrtrStep::InputRequired(result) => OpenIdbBackgroundDecision::InputRequired(result),
+            MrtrStep::NoFormSupport => {
+                info!(
+                    path,
+                    size_mib = size_bytes / (1024 * 1024),
+                    "client lacks form elicitation; routing open_idb auto-analysis to background"
+                );
+                OpenIdbBackgroundDecision::Ready(true)
             }
-            let sealed = self.request_state_codec.seal_with(
-                STAGE,
-                &SealOptions::new()
-                    .associated_data(associated_data.as_bytes())
-                    .ttl(Duration::from_secs(OPEN_IDB_REQUEST_STATE_TTL_SECS)),
-            );
-            // Reuse the same schema the legacy elicitation path derives from
-            // `OpenIdbBackgroundChoice`, so the two protocols cannot drift.
-            let requested_schema = ElicitationSchema::from_type::<OpenIdbBackgroundChoice>()
-                .map_err(|error| {
-                    McpError::internal_error(
-                        format!("failed to build open_idb elicitation schema: {error}"),
-                        None,
-                    )
-                })?;
-            let mut input_requests = InputRequests::new();
-            input_requests.insert(
-                INPUT_KEY.to_string(),
-                InputRequest::Elicitation(ElicitRequest::new(
-                    ElicitRequestParams::FormElicitationParams {
-                        meta: None,
-                        message: Self::open_idb_background_prompt(path, size_bytes),
-                        requested_schema,
-                    },
-                )),
-            );
-            return Ok(OpenIdbBackgroundDecision::InputRequired(
-                InputRequiredResult::new(Some(input_requests), Some(sealed)),
-            ));
-        };
+            MrtrStep::Answered(response) => {
+                OpenIdbBackgroundDecision::Ready(match response.action {
+                    ElicitationAction::Accept => accepted_background(response.content),
+                    ElicitationAction::Decline | ElicitationAction::Cancel => false,
+                    // `ElicitationAction` is #[non_exhaustive]; treat unknown
+                    // future actions as a decline so we never background
+                    // without consent.
+                    _ => false,
+                })
+            }
+        })
+    }
 
-        let opened = self
-            .request_state_codec
-            .open_with(&sealed, associated_data.as_bytes())
-            .map_err(|_| {
-                McpError::invalid_params("expired, tampered, or unknown requestState", None)
-            })?;
-        if opened != STAGE {
-            return Err(McpError::invalid_params(
-                "requestState belongs to a different MRTR stage",
-                None,
-            ));
-        }
-        let response = input_responses
-            .as_ref()
-            .and_then(|responses| responses.get(INPUT_KEY))
-            .ok_or_else(|| {
-                McpError::invalid_params("missing background elicitation response", None)
-            })?;
-        let response: ElicitResult = serde_json::from_value(response.clone()).map_err(|_| {
-            McpError::invalid_params("invalid background elicitation response action", None)
-        })?;
-        let background = match response.action {
-            ElicitationAction::Accept => response
-                .content
-                .and_then(|content| serde_json::from_value::<OpenIdbBackgroundChoice>(content).ok())
-                .and_then(|choice| choice.background)
-                .unwrap_or(true),
-            ElicitationAction::Decline | ElicitationAction::Cancel => false,
-            // `ElicitationAction` is #[non_exhaustive]; treat unknown future
-            // actions as a decline so we never background without consent.
-            _ => false,
+    /// Resolve a universal Mach-O input to one slice file before opening it.
+    ///
+    /// The slice comes from `arch`, from a single-slice file, or from the user
+    /// through an input request. Without an answer (no form support, declined,
+    /// timed out) the call fails with the slice list so the caller can retry
+    /// with `arch`; it never guesses.
+    async fn resolve_universal_input(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        path: &str,
+        arch: Option<String>,
+        idb_out: Option<&str>,
+        prompts: &mut OpenPrompts,
+    ) -> Result<UniversalInput, McpError> {
+        let input = crate::expand_path(path);
+        let slices = match universal_slices(&input, path, arch.as_deref()) {
+            Ok(Some(slices)) => slices,
+            Ok(None) => return Ok(UniversalInput::NotUniversal),
+            Err(error) => return Ok(UniversalInput::Rejected(error)),
         };
-        Ok(OpenIdbBackgroundDecision::Ready(background))
+        let (slice, background) = match (arch, slices.as_slice()) {
+            (Some(arch), _) => match crate::macho_fat::select_slice(&slices, &arch) {
+                Some(slice) => (slice.clone(), None),
+                None => {
+                    let reason = format!("no {arch} slice");
+                    return Ok(UniversalInput::Rejected(slice_required_error(
+                        path, &slices, &reason,
+                    )));
+                }
+            },
+            (None, [only]) => (only.clone(), None),
+            (None, _) => match self.ask_for_slice(ctx, path, &slices, prompts).await? {
+                SliceAnswer::Chosen(slice, background) => (slice, background),
+                SliceAnswer::InputRequired(result) => {
+                    return Ok(UniversalInput::InputRequired(result));
+                }
+                SliceAnswer::Unanswered(reason) => {
+                    return Ok(UniversalInput::Rejected(slice_required_error(
+                        path, &slices, &reason,
+                    )));
+                }
+            },
+        };
+        let slice_path = match extract_universal_slice(&input, idb_out, &slice).await {
+            Ok(slice_path) => slice_path,
+            Err(error) => return Ok(UniversalInput::Rejected(error)),
+        };
+        Ok(UniversalInput::Resolved(UniversalSlice {
+            arch: slice.arch,
+            slices: slices.into_iter().map(|slice| slice.arch).collect(),
+            slice_path: slice_path.display().to_string(),
+            background,
+        }))
+    }
+
+    /// Ask the user which slice of a universal Mach-O to analyze.
+    async fn ask_for_slice(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        path: &str,
+        slices: &[crate::macho_fat::FatSlice],
+        prompts: &mut OpenPrompts,
+    ) -> Result<SliceAnswer, McpError> {
+        let ask_background = prompts.background_prompt
+            && slices
+                .iter()
+                .any(|slice| exceeds_background_threshold(slice.size));
+        let form = universal_slice_form(path, slices, ask_background)?;
+        let response = if Self::uses_mrtr(ctx, prompts)? {
+            let layout = slices
+                .iter()
+                .map(|slice| format!("{}@{:#x}+{:#x}", slice.arch, slice.offset, slice.size))
+                .collect::<Vec<_>>()
+                .join(",");
+            let associated_data =
+                format!("tools/call:open_idb\0{path}\0{layout}\0{ask_background}");
+            match self.mrtr_form_stage(prompts, &SLICE_STAGE, &associated_data, form)? {
+                MrtrStep::InputRequired(result) => return Ok(SliceAnswer::InputRequired(result)),
+                MrtrStep::NoFormSupport => {
+                    return Ok(SliceAnswer::Unanswered(NO_FORM_SUPPORT.to_string()));
+                }
+                MrtrStep::Answered(response) => response,
+            }
+        } else {
+            match Self::elicit_slice_inline(ctx, path, form, prompts.timeout_secs).await {
+                Ok(response) => response,
+                Err(reason) => return Ok(SliceAnswer::Unanswered(reason)),
+            }
+        };
+        Ok(match slice_answer_from(response, slices, ask_background) {
+            Ok((slice, background)) => SliceAnswer::Chosen(slice, background),
+            Err(reason) => SliceAnswer::Unanswered(reason),
+        })
+    }
+
+    /// Ask a pre-2026 client inline, bounded by the prompt timeout. `Err`
+    /// says why no answer arrived.
+    async fn elicit_slice_inline(
+        ctx: &RequestContext<RoleServer>,
+        path: &str,
+        form: ElicitRequestParams,
+        request_timeout_secs: Option<u64>,
+    ) -> Result<ElicitResult, String> {
+        use rmcp::service::{ElicitationMode, ServiceError};
+
+        if !ctx
+            .peer
+            .supported_elicitation_modes()
+            .contains(&ElicitationMode::Form)
+        {
+            return Err(NO_FORM_SUPPORT.to_string());
+        }
+        let timeout_secs = Self::open_idb_elicitation_timeout_secs(request_timeout_secs);
+        let elicitation = ctx
+            .peer
+            .create_elicitation_with_timeout(form, Some(Duration::from_secs(timeout_secs)));
+        let result = tokio::select! {
+            biased;
+            _ = ctx.ct.cancelled() => return Err("the request was cancelled".to_string()),
+            result = elicitation => result,
+        };
+        result.map_err(|error| match error {
+            ServiceError::Timeout { .. } => {
+                info!(path, timeout_secs, "open_idb slice prompt timed out");
+                format!("no slice was chosen within {timeout_secs}s")
+            }
+            error => format!("the slice prompt failed: {error}"),
+        })
     }
 
     #[tool(
@@ -8332,7 +8738,7 @@ mod tests {
             .collect::<String>();
         assert_eq!(
             digest,
-            "daa1b74bdc9a0d551535d66fb4187edcd83da9a1696fb813f435b38528070c3f"
+            "462e7b71370fea94c5cf66d8927e072b92adf0e34c5576d5949779de1e50a119"
         );
     }
 
@@ -8768,13 +9174,26 @@ mod tests {
         ));
     }
 
+    fn mrtr_prompts(
+        request_state: Option<String>,
+        input_responses: Option<InputResponses>,
+    ) -> crate::server::OpenPrompts {
+        crate::server::OpenPrompts {
+            request_state,
+            input_responses,
+            timeout_secs: None,
+            background_prompt: true,
+            form_elicitation: true,
+        }
+    }
+
     #[test]
     fn modern_open_idb_mrtr_is_bound_and_integrity_checked() {
         let server = test_server();
         let path = "/tmp/large-macho";
         let size = crate::server::OPEN_IDB_AUTO_BACKGROUND_THRESHOLD_BYTES + 1;
         let first = server
-            .modern_open_idb_background_decision(path, size, None, None)
+            .modern_open_idb_background_decision(path, size, &mut mrtr_prompts(None, None))
             .expect("first MRTR round");
         let OpenIdbBackgroundDecision::InputRequired(input_required) = first else {
             panic!("first round must request input");
@@ -8797,8 +9216,7 @@ mod tests {
             .modern_open_idb_background_decision(
                 path,
                 size,
-                Some(request_state.clone()),
-                Some(responses),
+                &mut mrtr_prompts(Some(request_state.clone()), Some(responses)),
             )
             .expect("valid retry");
         assert!(matches!(retry, OpenIdbBackgroundDecision::Ready(true)));
@@ -8807,16 +9225,17 @@ mod tests {
             .modern_open_idb_background_decision(
                 "/tmp/different-macho",
                 size,
-                Some(request_state.clone()),
-                Some(InputResponses::new()),
+                &mut mrtr_prompts(Some(request_state.clone()), Some(InputResponses::new())),
             )
             .is_err());
         assert!(server
             .modern_open_idb_background_decision(
                 path,
                 size,
-                Some(format!("{request_state}tampered")),
-                Some(InputResponses::new()),
+                &mut mrtr_prompts(
+                    Some(format!("{request_state}tampered")),
+                    Some(InputResponses::new()),
+                ),
             )
             .is_err());
     }
@@ -8827,7 +9246,7 @@ mod tests {
         let path = "/tmp/large-macho";
         let size = crate::server::OPEN_IDB_AUTO_BACKGROUND_THRESHOLD_BYTES + 1;
         let first = server
-            .modern_open_idb_background_decision(path, size, None, None)
+            .modern_open_idb_background_decision(path, size, &mut mrtr_prompts(None, None))
             .expect("first MRTR round");
         let OpenIdbBackgroundDecision::InputRequired(input_required) = first else {
             panic!("first round must request input");
@@ -8838,8 +9257,7 @@ mod tests {
             .modern_open_idb_background_decision(
                 path,
                 size,
-                input_required.request_state,
-                Some(responses),
+                &mut mrtr_prompts(input_required.request_state, Some(responses)),
             )
             .expect("valid decline");
 
@@ -8971,5 +9389,97 @@ mod tests {
         assert!(!map.contains_key("close_token"));
         assert!(!map.contains_key("close_owner_session_id"));
         assert!(!map.contains_key("close_recovery_hint"));
+    }
+
+    fn universal_slices() -> Vec<crate::macho_fat::FatSlice> {
+        vec![
+            crate::macho_fat::FatSlice {
+                arch: "x86_64".to_string(),
+                offset: 0x4000,
+                size: 60 * 1024 * 1024,
+            },
+            crate::macho_fat::FatSlice {
+                arch: "arm64e".to_string(),
+                offset: 0x400_0000,
+                size: 4096,
+            },
+        ]
+    }
+
+    fn elicit_result(value: Value) -> rmcp::model::ElicitResult {
+        serde_json::from_value(value).expect("elicit result")
+    }
+
+    fn slice_form(ask_background: bool) -> Value {
+        let form =
+            crate::server::universal_slice_form("/x/ls", &universal_slices(), ask_background)
+                .expect("slice form");
+        serde_json::to_value(form).expect("form json")
+    }
+
+    #[test]
+    fn slice_prompt_adds_the_background_question_only_when_asked() {
+        let form = slice_form(false);
+        let schema = &form["requestedSchema"];
+        assert_eq!(schema["required"], json!(["arch"]));
+        let consts: Vec<_> = schema["properties"]["arch"]["oneOf"]
+            .as_array()
+            .expect("titled enum")
+            .iter()
+            .map(|option| option["const"].clone())
+            .collect();
+        assert_eq!(consts, [json!("x86_64"), json!("arm64e")]);
+        assert!(schema["properties"].get("background").is_none(), "{schema}");
+        let message = form["message"].as_str().expect("message");
+        assert!(message.contains("2 slices (x86_64, arm64e)"), "{message}");
+
+        let form = slice_form(true);
+        let background_schema = crate::server::background_choice_schema().expect("schema");
+        assert_eq!(
+            form["requestedSchema"]["properties"]["background"],
+            serde_json::to_value(&background_schema.properties["background"]).expect("json"),
+            "the slice prompt must ask the background question exactly as its own prompt does"
+        );
+        let message = form["message"].as_str().expect("message");
+        assert!(message.contains("background task"), "{message}");
+    }
+
+    #[test]
+    fn slice_answers_pick_a_listed_slice_or_say_why_not() {
+        let slices = universal_slices();
+        let answer = |value, ask_background| {
+            crate::server::slice_answer_from(elicit_result(value), &slices, ask_background)
+                .map(|(slice, background)| (slice.arch, background))
+        };
+        assert_eq!(
+            answer(
+                json!({"action": "accept", "content": {"arch": "ARM64E"}}),
+                false
+            ),
+            Ok(("arm64e".to_string(), None))
+        );
+        assert_eq!(
+            answer(
+                json!({"action": "accept", "content": {"arch": "x86_64"}}),
+                true
+            ),
+            Ok(("x86_64".to_string(), Some(true))),
+            "an omitted background answer means background, as in the background prompt"
+        );
+        assert_eq!(
+            answer(
+                json!({"action": "accept", "content": {"arch": "x86_64", "background": false}}),
+                true
+            ),
+            Ok(("x86_64".to_string(), Some(false)))
+        );
+        let reason = |value| answer(value, false).expect_err("no slice");
+        assert_eq!(
+            reason(json!({"action": "accept", "content": {"arch": "arm64"}})),
+            "no arm64 slice"
+        );
+        assert!(reason(json!({"action": "accept", "content": {}})).contains("did not name a slice"));
+        assert!(reason(json!({"action": "decline"})).contains("declined"));
+        assert!(reason(json!({"action": "cancel"})).contains("declined"));
     }
 }

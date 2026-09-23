@@ -32,6 +32,10 @@ pub struct OpenIdbRequest {
     )]
     pub idb_out: Option<String>,
     #[schemars(
+        description = "Slice to analyze when path is a universal (fat) Mach-O, e.g. arm64e or x86_64. The slice is copied to <input name>.<arch> beside the output database and opened as a single-architecture Mach-O. Omit it to be asked when the client supports input requests; otherwise the error lists the slices. A thin Mach-O accepts only its own arch."
+    )]
+    pub arch: Option<String>,
+    #[schemars(
         description = "IDA processor selector for a raw blob, including an explicit variant for multi-mode families (for example arm:ARMv7-M or metapc:80386p)."
     )]
     pub processor: Option<String>,
@@ -64,6 +68,10 @@ pub struct OpenIdbRequest {
 impl OpenIdbRequest {
     pub fn normalized_debug_info_path(&self) -> Option<String> {
         non_empty_trimmed(self.debug_info_path.as_deref())
+    }
+
+    pub fn normalized_arch(&self) -> Option<String> {
+        non_empty_trimmed(self.arch.as_deref())
     }
 
     pub fn normalized_processor(&self) -> Option<String> {
@@ -120,6 +128,7 @@ mod tests {
             force: None,
             rebuild: None,
             idb_out: None,
+            arch: None,
             processor: None,
             bitness: None,
             base_address: None,

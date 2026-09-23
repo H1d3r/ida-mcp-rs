@@ -86,6 +86,8 @@ impl RawBinaryTarget {
 pub struct DbInfo {
     pub path: String,
     pub file_type: String,
+    /// IDA's loader description; names the chosen slice for fat inputs.
+    pub loader: String,
     pub processor: String,
     pub bits: u32,
     pub function_count: usize,

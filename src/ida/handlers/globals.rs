@@ -100,6 +100,7 @@ pub fn handle_idb_meta(idb: &Option<IDB>) -> Result<Value, ToolError> {
 
     Ok(json!({
         "file_type": format!("{:?}", meta.filetype()),
+        "loader": crate::ida::handlers::database::loader_name(),
         "processor": db.processor().long_name(),
         "bits": bits,
         "function_count": db.function_count(),

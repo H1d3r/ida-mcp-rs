@@ -210,6 +210,10 @@ test-observability: build
 test-elicitation: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-elicitation
 
+# Verify universal (fat) Mach-O slice selection through open_idb (debug)
+test-universal: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-universal
+
 # Verify MCP 2026 discover/stateless lifecycle and the pooled legacy boundary.
 test-modern: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-modern

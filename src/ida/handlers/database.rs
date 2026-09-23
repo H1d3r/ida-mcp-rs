@@ -34,7 +34,7 @@ use crate::ida::types::{DbInfo, DebugInfoLoad, RawBinaryTarget};
 use idalib::{IDBOpenOptions, IDB};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::ffi::OsString;
+use std::ffi::{c_char, CStr, OsString};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -55,11 +55,30 @@ pub(crate) fn database_bitness(db: &IDB) -> u32 {
     }
 }
 
-fn build_db_info(db: &IDB, path: &str, debug_info: Option<DebugInfoLoad>) -> DbInfo {
+unsafe extern "C" {
+    fn get_file_type_name(buf: *mut c_char, bufsize: usize) -> usize;
+}
+
+/// IDA's description of the loader that created the open database, e.g.
+/// `Fat Mach-O file, 2. X86_64` or `Mach-O file (EXECUTE). ARM64e`. For a
+/// universal input it names the slice IDA picked.
+pub(crate) fn loader_name() -> String {
+    let mut buf = [0_u8; 512];
+    // SAFETY: get_file_type_name writes at most `bufsize` bytes into `buf`,
+    // which is valid and exclusively borrowed for the call. It reads the open
+    // database's metadata and runs on the IDA main thread like every handler.
+    unsafe { get_file_type_name(buf.as_mut_ptr().cast::<c_char>(), buf.len()) };
+    CStr::from_bytes_until_nul(&buf)
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+pub fn build_db_info(db: &IDB, path: &str, debug_info: Option<DebugInfoLoad>) -> DbInfo {
     let meta = db.meta();
     DbInfo {
         path: path.to_string(),
         file_type: format!("{:?}", meta.filetype()),
+        loader: loader_name(),
         processor: db.processor().long_name(),
         bits: database_bitness(db),
         function_count: db.function_count(),
@@ -256,7 +275,7 @@ fn sha256_file(path: &Path, cancel: Option<&CancellationToken>) -> Result<[u8; 3
     sha256_reader(&mut file, path, cancel)
 }
 
-fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
+pub(crate) fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
     match (left.canonicalize(), right.canonicalize()) {
         (Ok(left), Ok(right)) => left == right,
         _ => left == right,

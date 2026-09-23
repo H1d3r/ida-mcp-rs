@@ -462,6 +462,18 @@ test-elicitation: fixture
     RUST_LOG="{{ rust_log }}" MCP_STDIO_BIN="{{ server_bin }}" bash ./stdio_elicitation.sh
     echo "✅ Elicitation test passed"
 
+# Verify universal (fat) Mach-O slice selection: arch, prompts, MCP 2026 input requests
+test-universal: fixture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'cargo build --release' first"
+        exit 1
+    fi
+    echo "🧪 Running universal Mach-O integration test..."
+    RUST_LOG="{{ rust_log }}" MCP_STDIO_BIN="{{ server_bin }}" bash ./stdio_universal.sh
+
 # Verify the MCP 2026 discover lifecycle over stdio and stateless HTTP, plus
 # the explicit legacy-only pooled HTTP boundary.
 test-modern:
