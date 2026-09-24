@@ -293,9 +293,8 @@ bump:
         echo "Cargo.toml already at ${VERSION}"
     else
         sed -i '' "s/^version = \"${CURRENT}\"/version = \"${VERSION}\"/" Cargo.toml
-        sed -i '' "s/^version: '${CURRENT}'/version: '${VERSION}'/" snap/snapcraft.yaml
         cargo update -p ida-mcp
-        git add Cargo.toml Cargo.lock snap/snapcraft.yaml
+        git add Cargo.toml Cargo.lock
         git commit -m "chore: release ${VERSION}"
     fi
     git tag -a "$TAG" -m "Release $TAG"
