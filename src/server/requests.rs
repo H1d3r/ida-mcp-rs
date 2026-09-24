@@ -523,7 +523,9 @@ pub struct ApplyTypesRequest {
     #[schemars(description = "Address to apply type (string/number)")]
     #[serde(alias = "ea", alias = "addr", alias = "addresses")]
     pub address: Option<Value>,
-    #[schemars(description = "Function or symbol name (alternative to address)")]
+    #[schemars(
+        description = "Exact, case-sensitive symbol name to type (alternative to address; pass one, not both)"
+    )]
     #[serde(alias = "name", alias = "symbol")]
     pub target_name: Option<String>,
     #[schemars(description = "Offset added to resolved name address (default: 0)")]
@@ -561,7 +563,9 @@ pub struct DeclareStackRequest {
     #[schemars(description = "Function address (string/number)")]
     #[serde(alias = "ea", alias = "addr", alias = "addresses")]
     pub address: Option<Value>,
-    #[schemars(description = "Function name (alternative to address)")]
+    #[schemars(
+        description = "Exact, case-sensitive name of the function (alternative to address; pass one, not both)"
+    )]
     #[serde(alias = "function", alias = "name")]
     pub target_name: Option<String>,
     #[schemars(description = "Stack offset in bytes (negative for locals, positive for args)")]
@@ -579,7 +583,9 @@ pub struct DeleteStackRequest {
     #[schemars(description = "Function address (string/number)")]
     #[serde(alias = "ea", alias = "addr", alias = "addresses")]
     pub address: Option<Value>,
-    #[schemars(description = "Function name (alternative to address)")]
+    #[schemars(
+        description = "Exact, case-sensitive name of the function (alternative to address; pass one, not both)"
+    )]
     #[serde(alias = "function", alias = "name")]
     pub target_name: Option<String>,
     #[schemars(description = "Stack offset in bytes (negative for locals, positive for args)")]
@@ -635,7 +641,9 @@ pub struct LuminaApplyRequest {
     #[schemars(description = "Function address (string/number)")]
     #[serde(alias = "ea", alias = "addr", alias = "addresses")]
     pub address: Option<Value>,
-    #[schemars(description = "Function name (alternative to address)")]
+    #[schemars(
+        description = "Exact, case-sensitive name of the function or a symbol inside it (alternative to address; pass one, not both)"
+    )]
     #[serde(alias = "function", alias = "name", alias = "symbol")]
     pub target_name: Option<String>,
     #[schemars(description = "Offset added before resolving the containing function (default: 0)")]
@@ -704,7 +712,9 @@ pub struct SetCommentsRequest {
     #[schemars(description = "Address to comment (string/number)")]
     #[serde(alias = "ea", alias = "addr", alias = "addresses")]
     pub address: Option<Value>,
-    #[schemars(description = "Function or symbol name to comment (alternative to address)")]
+    #[schemars(
+        description = "Exact, case-sensitive symbol name to comment (alternative to address; pass one, not both)"
+    )]
     #[serde(alias = "name", alias = "symbol")]
     pub target_name: Option<String>,
     #[schemars(description = "Offset added to resolved name address (default: 0)")]
@@ -722,7 +732,9 @@ pub struct RenameRequest {
     #[schemars(description = "Address to rename (string/number)")]
     #[serde(alias = "ea", alias = "addr", alias = "addresses")]
     pub address: Option<Value>,
-    #[schemars(description = "Current name to resolve (alternative to address)")]
+    #[schemars(
+        description = "Exact, case-sensitive current name (alternative to address; pass one, not both)"
+    )]
     #[serde(alias = "current", alias = "old_name", alias = "from")]
     pub current_name: Option<String>,
     #[schemars(description = "New name for the symbol")]
@@ -737,7 +749,9 @@ pub struct PatchRequest {
     #[schemars(description = "Address to patch (string/number)")]
     #[serde(alias = "ea", alias = "addr", alias = "addresses")]
     pub address: Option<Value>,
-    #[schemars(description = "Function or symbol name to patch (alternative to address)")]
+    #[schemars(
+        description = "Exact, case-sensitive symbol name to patch (alternative to address; pass one, not both)"
+    )]
     #[serde(alias = "name", alias = "symbol")]
     pub target_name: Option<String>,
     #[schemars(description = "Offset added to resolved name address (default: 0)")]
@@ -754,7 +768,9 @@ pub struct PatchAsmRequest {
     #[schemars(description = "Address to patch (string/number)")]
     #[serde(alias = "ea", alias = "addr", alias = "addresses")]
     pub address: Option<Value>,
-    #[schemars(description = "Function or symbol name to patch (alternative to address)")]
+    #[schemars(
+        description = "Exact, case-sensitive symbol name to patch (alternative to address; pass one, not both)"
+    )]
     #[serde(alias = "name", alias = "symbol")]
     pub target_name: Option<String>,
     #[schemars(description = "Offset added to resolved name address (default: 0)")]

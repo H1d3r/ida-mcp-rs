@@ -169,8 +169,19 @@ assert_ok "Phase 1 open_idb" "$(wait_response 2 180)"
 assert_log_absent "Reusing SHA-256-verified IDA database for raw input"
 assert_log_absent "Rebuilding raw input and overwriting provenance-matched IDA database"
 
-send "$(jq -cn --arg name "$CANARY" \
-  '{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"rename",arguments:{current_name:"interesting_function",name:$name,flags:0}}}')"
+# rename needs the exact symbol name, which depends on the binary format
+# (Mach-O "_interesting_function", ELF "interesting_function").
+send '{"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"list_functions","arguments":{"filter":"interesting_function"}}}'
+functions="$(wait_response 30 30)"
+assert_ok "Phase 1 list_functions" "$functions"
+target_name="$(jq -r '.result.content[0].text | fromjson | [.functions[].name
+  | select(test("^_?interesting_function$"))][0] // empty' <<<"$functions")"
+[[ -n "$target_name" ]] || {
+  echo "❌ interesting_function not found in the raw fixture" >&2
+  exit 1
+}
+send "$(jq -cn --arg name "$CANARY" --arg current "$target_name" \
+  '{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"rename",arguments:{current_name:$current,name:$name,flags:0}}}')"
 assert_ok "Phase 1 rename" "$(wait_response 3 30)"
 
 send '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"close_idb","arguments":{}}}'

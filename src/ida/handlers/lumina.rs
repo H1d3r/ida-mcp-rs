@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 
 use crate::error::ToolError;
 use crate::ida::handlers::resolve_address;
+use crate::ida::handlers::target::{acting_at, resolve_mutation_target, TargetSpec};
 
 fn status_name(status: PullStatus) -> String {
     match status {
@@ -18,12 +19,14 @@ fn status_name(status: PullStatus) -> String {
     }
 }
 
-pub fn handle_pull(
+/// Look up (`apply = false`) or apply Lumina metadata for the function
+/// containing the target. Applying changes the database, so it resolves the
+/// target exactly; a lookup keeps the discovery-style name resolution.
+pub(crate) fn handle_pull(
     idb: &Option<IDB>,
     allow_lumina: bool,
-    addr: Option<u64>,
-    name: Option<&str>,
-    offset: i64,
+    database: Option<&std::path::Path>,
+    target: TargetSpec<'_>,
     apply: bool,
     force: bool,
 ) -> Result<Value, ToolError> {
@@ -36,7 +39,13 @@ pub fn handle_pull(
     }
 
     let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
-    let requested_address = resolve_address(idb, addr, name, offset)?;
+    let (requested_address, mutation_target) = if apply {
+        let (address, resolved) = resolve_mutation_target(db, database, target)?;
+        (address, Some(resolved))
+    } else {
+        let address = resolve_address(idb, target.addr, target.name, target.offset)?;
+        (address, None)
+    };
     let function = db
         .function_at(requested_address)
         .ok_or(ToolError::FunctionNotFound(requested_address))?;
@@ -45,7 +54,7 @@ pub fn handle_pull(
     let result = lumina::pull(address, apply, force)?;
     let current_name = db.function_at(address).and_then(|func| func.name());
 
-    Ok(json!({
+    let mut response = json!({
         "address": format!("{address:#x}"),
         "status": status_name(result.status),
         "matched_name": result.name,
@@ -59,13 +68,19 @@ pub fn handle_pull(
         "previous_name": previous_name,
         "current_name": current_name,
         "error": result.error,
-    }))
+    });
+    // Lumina acts on the containing function, not the requested address.
+    if let (Some(target), Value::Object(map)) = (mutation_target, &mut response) {
+        map.insert("target".to_string(), json!(acting_at(target, address)));
+    }
+    Ok(response)
 }
 
 #[cfg(test)]
 mod tests {
     use crate::error::ToolError;
     use crate::ida::handlers::lumina::{handle_pull, status_name};
+    use crate::ida::handlers::target::TargetSpec;
     use idalib::lumina::PullStatus;
 
     #[test]
@@ -75,7 +90,12 @@ mod tests {
 
     #[test]
     fn disabled_lumina_is_rejected_before_database_access() {
-        let err = handle_pull(&None, false, Some(0x1000), None, 0, false, false)
+        let target = TargetSpec {
+            addr: Some(0x1000),
+            name: None,
+            offset: 0,
+        };
+        let err = handle_pull(&None, false, None, target, false, false)
             .expect_err("disabled Lumina access must be rejected");
 
         assert!(matches!(

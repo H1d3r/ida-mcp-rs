@@ -462,6 +462,18 @@ test-elicitation: fixture
     RUST_LOG="{{ rust_log }}" MCP_STDIO_BIN="{{ server_bin }}" bash ./stdio_elicitation.sh
     echo "✅ Elicitation test passed"
 
+# Verify mutating tools take exact targets and report what they resolved
+test-mutation-targets: fixture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'cargo build --release' first"
+        exit 1
+    fi
+    echo "🧪 Running mutation target integration test..."
+    RUST_LOG="{{ rust_log }}" MCP_STDIO_BIN="{{ server_bin }}" bash ./stdio_mutation_targets.sh
+
 # Verify universal (fat) Mach-O slice selection: arch, prompts, MCP 2026 input requests
 test-universal: fixture
     #!/usr/bin/env bash

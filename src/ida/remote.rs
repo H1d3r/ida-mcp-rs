@@ -160,8 +160,40 @@ pub(crate) async fn call_tool(
 mod tests {
     use crate::error::ToolError;
     use crate::ida::remote::{parse_json, parse_value};
+    use crate::ida::types::{MutationTarget, StackVarResult, TargetSelector};
     use rmcp::model::{CallToolResult, ContentBlock as Content};
     use serde_json::{json, Value};
+
+    /// Pooled and workspace parents decode a child's stack result into the
+    /// typed struct; the target record must survive that round trip,
+    /// including an unnamed (null) symbol.
+    #[test]
+    fn parse_json_keeps_mutation_target_in_stack_results() {
+        for (selector, symbol) in [
+            (TargetSelector::Name, Some("_main".to_string())),
+            (TargetSelector::Address, None),
+        ] {
+            let child = StackVarResult {
+                function: "0x100000460".to_string(),
+                name: "var_8".to_string(),
+                offset: -8,
+                code: 0,
+                status: "ok".to_string(),
+                target: MutationTarget {
+                    database: Some("/tmp/sample.i64".to_string()),
+                    selector,
+                    symbol,
+                    base: "0x100000460".to_string(),
+                    requested_address: "0x100000460".to_string(),
+                    address: "0x100000460".to_string(),
+                },
+            };
+            let text = serde_json::to_string_pretty(&child).expect("serialize child result");
+            let result = CallToolResult::success(vec![Content::text(text)]);
+            let parsed: StackVarResult = parse_json(result, "declare_stack").expect("decode");
+            assert_eq!(parsed.target, child.target);
+        }
+    }
 
     #[test]
     fn parse_value_rejects_structured_error_results() {

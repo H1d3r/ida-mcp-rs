@@ -2,6 +2,7 @@
 
 use crate::error::ToolError;
 use crate::ida::handlers::resolve_address;
+use crate::ida::handlers::target::{resolve_mutation_target, TargetSpec};
 use crate::ida::types::{
     ApplyTypeResult, DeclareTypeResult, DeclareTypesResult, FrameInfo, FrameMemberInfo, FrameRange,
     GuessTypeResult, LocalTypeInfo, LocalTypeListResult, StackVarResult,
@@ -144,11 +145,10 @@ pub fn handle_declare_type(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn handle_apply_types(
+pub(crate) fn handle_apply_types(
     idb: &Option<IDB>,
-    addr: Option<u64>,
-    name: Option<&str>,
-    offset: i64,
+    database: Option<&std::path::Path>,
+    target: TargetSpec<'_>,
     stack_offset: Option<i64>,
     stack_name: Option<&str>,
     decl: Option<&str>,
@@ -158,8 +158,9 @@ pub fn handle_apply_types(
     strict: bool,
 ) -> Result<serde_json::Value, ToolError> {
     let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
+    let (address, target) = resolve_mutation_target(db, database, target)?;
     if stack_offset.is_some() || stack_name.is_some() {
-        let func_addr = resolve_address(idb, addr, name, offset)?;
+        let func_addr = address;
         let decl = decl.ok_or_else(|| {
             ToolError::InvalidParams("apply_types for stack var requires decl".to_string())
         })?;
@@ -175,12 +176,12 @@ pub fn handle_apply_types(
             offset: result.offset,
             code: result.code,
             status: status.to_string(),
+            target,
         };
         return Ok(serde_json::to_value(out)
             .unwrap_or_else(|_| serde_json::json!({ "code": result.code })));
     }
 
-    let address = resolve_address(idb, addr, name, offset)?;
     let (applied, source) = if let Some(decl) = decl {
         (
             db.apply_decl_type(address, decl, relaxed, delay, strict),
@@ -198,6 +199,7 @@ pub fn handle_apply_types(
         address: format!("{:#x}", address),
         applied,
         source: source.to_string(),
+        target,
     })
     .unwrap_or_else(|_| serde_json::json!({ "applied": applied })))
 }
@@ -226,17 +228,23 @@ pub fn handle_infer_types(
     })
 }
 
-pub fn handle_declare_stack(
+/// `function` is the frame's function, named by `function.addr` or
+/// `function.name` (its `offset` is ignored); `offset` is the stack offset.
+pub(crate) fn handle_declare_stack(
     idb: &Option<IDB>,
-    addr: Option<u64>,
-    name: Option<&str>,
+    database: Option<&std::path::Path>,
+    function: TargetSpec<'_>,
     offset: i64,
     var_name: Option<&str>,
     decl: &str,
     relaxed: bool,
 ) -> Result<StackVarResult, ToolError> {
     let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
-    let func_addr = resolve_address(idb, addr, name, 0)?;
+    let function = TargetSpec {
+        offset: 0,
+        ..function
+    };
+    let (func_addr, target) = resolve_mutation_target(db, database, function)?;
     let result = db.define_stack_var(func_addr, var_name, offset, decl, relaxed);
     let status = if result.code == 0 { "ok" } else { "error" };
     Ok(StackVarResult {
@@ -245,13 +253,16 @@ pub fn handle_declare_stack(
         offset: result.offset,
         code: result.code,
         status: status.to_string(),
+        target,
     })
 }
 
-pub fn handle_delete_stack(
+/// `function` names the frame's function as in [`handle_declare_stack`];
+/// `offset` is the stack offset.
+pub(crate) fn handle_delete_stack(
     idb: &Option<IDB>,
-    addr: Option<u64>,
-    name: Option<&str>,
+    database: Option<&std::path::Path>,
+    function: TargetSpec<'_>,
     offset: Option<i64>,
     var_name: Option<&str>,
 ) -> Result<StackVarResult, ToolError> {
@@ -261,7 +272,11 @@ pub fn handle_delete_stack(
             "delete_stack requires offset or name".to_string(),
         ));
     }
-    let func_addr = resolve_address(idb, addr, name, 0)?;
+    let function = TargetSpec {
+        offset: 0,
+        ..function
+    };
+    let (func_addr, target) = resolve_mutation_target(db, database, function)?;
     let use_offset = offset.is_some();
     let off = offset.unwrap_or(0);
     let result = db.delete_stack_var(func_addr, var_name, off, use_offset);
@@ -272,5 +287,6 @@ pub fn handle_delete_stack(
         offset: result.offset,
         code: result.code,
         status: status.to_string(),
+        target,
     })
 }

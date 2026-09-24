@@ -1,7 +1,10 @@
 //! Memory read/write handlers.
 
+use std::path::Path;
+
 use crate::error::ToolError;
 use crate::ida::handlers::resolve_address;
+use crate::ida::handlers::target::{resolve_mutation_target, TargetSpec};
 use crate::ida::types::BytesResult;
 use idalib::IDB;
 use serde_json::{json, Value};
@@ -32,31 +35,30 @@ pub fn handle_get_bytes(
     })
 }
 
-pub fn handle_patch_bytes(
+pub(crate) fn handle_patch_bytes(
     idb: &Option<IDB>,
-    addr: Option<u64>,
-    name: Option<&str>,
-    offset: i64,
+    database: Option<&Path>,
+    target: TargetSpec<'_>,
     bytes: &[u8],
 ) -> Result<Value, ToolError> {
     let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
-    let addr = resolve_address(idb, addr, name, offset)?;
+    let (addr, target) = resolve_mutation_target(db, database, target)?;
     db.patch_bytes(addr, bytes)?;
     Ok(json!({
         "address": format!("{:#x}", addr),
         "length": bytes.len(),
+        "target": target,
     }))
 }
 
-pub fn handle_patch_asm(
+pub(crate) fn handle_patch_asm(
     idb: &Option<IDB>,
-    addr: Option<u64>,
-    name: Option<&str>,
-    offset: i64,
+    database: Option<&Path>,
+    target: TargetSpec<'_>,
     line: &str,
 ) -> Result<Value, ToolError> {
     let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
-    let addr = resolve_address(idb, addr, name, offset)?;
+    let (addr, target) = resolve_mutation_target(db, database, target)?;
     let bytes = db
         .assemble_line(addr, line)
         .map_err(|e| ToolError::IdaError(e.to_string()))?;
@@ -71,6 +73,7 @@ pub fn handle_patch_asm(
         "line": line,
         "length": bytes.len(),
         "bytes": hex,
+        "target": target,
     }))
 }
 

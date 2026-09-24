@@ -210,6 +210,10 @@ test-observability: build
 test-elicitation: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-elicitation
 
+# Verify mutating tools take exact targets and report them (debug)
+test-mutation-targets: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-mutation-targets
+
 # Verify universal (fat) Mach-O slice selection through open_idb (debug)
 test-universal: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-universal

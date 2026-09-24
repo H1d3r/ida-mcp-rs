@@ -1247,6 +1247,28 @@ impl IdaMcpServer {
             .ok_or_else(|| ToolError::InvalidAddress("empty address list".to_string()))
     }
 
+    /// The address selector of a mutating tool, after checking the caller
+    /// named exactly one target: one address or one non-empty name.
+    fn mutation_target_address(
+        address: Option<&Value>,
+        name: Option<&str>,
+        name_field: &str,
+    ) -> Result<Option<u64>, ToolError> {
+        match (address, name) {
+            (Some(_), Some(_)) => Err(ToolError::InvalidParams(format!(
+                "pass either address or {name_field} for the target, not both"
+            ))),
+            (None, None) => Err(ToolError::InvalidParams(format!(
+                "pass address or {name_field} for the target"
+            ))),
+            (Some(value), None) => Self::value_to_exactly_one_address(value, "address").map(Some),
+            (None, Some("")) => Err(ToolError::InvalidParams(format!(
+                "{name_field} must not be empty"
+            ))),
+            (None, Some(_)) => Ok(None),
+        }
+    }
+
     fn value_to_exactly_one_address(value: &Value, field_name: &str) -> Result<u64, ToolError> {
         let addresses = Self::value_to_addresses(value)?;
         match addresses.as_slice() {
@@ -5453,11 +5475,11 @@ impl IdaMcpServer {
             req.timeout_secs,
             "timeout_secs"
         ));
-        let addr = try_param!(req
-            .address
-            .as_ref()
-            .map(Self::value_to_single_address)
-            .transpose());
+        let addr = try_param!(Self::mutation_target_address(
+            req.address.as_ref(),
+            req.target_name.as_deref(),
+            "target_name",
+        ));
         match self
             .worker
             .lumina_apply(addr, req.target_name.clone(), offset, force, timeout_secs)
@@ -5477,12 +5499,13 @@ impl IdaMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let repeatable = req.repeatable.unwrap_or(false);
         let offset = req.offset.unwrap_or(0);
-        let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
-                Ok(v) => Some(v),
-                Err(e) => return Ok(e.to_tool_result()),
-            },
-            None => None,
+        let addr = match Self::mutation_target_address(
+            req.address.as_ref(),
+            req.target_name.as_deref(),
+            "target_name",
+        ) {
+            Ok(addr) => addr,
+            Err(e) => return Ok(e.to_tool_result()),
         };
         match self
             .worker
@@ -5508,12 +5531,13 @@ impl IdaMcpServer {
         Parameters(req): Parameters<PatchAsmRequest>,
     ) -> Result<CallToolResult, McpError> {
         let offset = req.offset.unwrap_or(0);
-        let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
-                Ok(v) => Some(v),
-                Err(e) => return Ok(e.to_tool_result()),
-            },
-            None => None,
+        let addr = match Self::mutation_target_address(
+            req.address.as_ref(),
+            req.target_name.as_deref(),
+            "target_name",
+        ) {
+            Ok(addr) => addr,
+            Err(e) => return Ok(e.to_tool_result()),
         };
         match self
             .worker
@@ -5569,12 +5593,13 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<DeclareStackRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
-                Ok(v) => Some(v),
-                Err(e) => return Ok(e.to_tool_result()),
-            },
-            None => None,
+        let addr = match Self::mutation_target_address(
+            req.address.as_ref(),
+            req.target_name.as_deref(),
+            "target_name",
+        ) {
+            Ok(addr) => addr,
+            Err(e) => return Ok(e.to_tool_result()),
         };
         let relaxed = req.relaxed.unwrap_or(false);
         match self
@@ -5601,12 +5626,13 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<DeleteStackRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
-                Ok(v) => Some(v),
-                Err(e) => return Ok(e.to_tool_result()),
-            },
-            None => None,
+        let addr = match Self::mutation_target_address(
+            req.address.as_ref(),
+            req.target_name.as_deref(),
+            "target_name",
+        ) {
+            Ok(addr) => addr,
+            Err(e) => return Ok(e.to_tool_result()),
         };
         match self
             .worker
@@ -5807,12 +5833,13 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<ApplyTypesRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
-                Ok(v) => Some(v),
-                Err(e) => return Ok(e.to_tool_result()),
-            },
-            None => None,
+        let addr = match Self::mutation_target_address(
+            req.address.as_ref(),
+            req.target_name.as_deref(),
+            "target_name",
+        ) {
+            Ok(addr) => addr,
+            Err(e) => return Ok(e.to_tool_result()),
         };
         let offset = req.offset.unwrap_or(0);
         let relaxed = req.relaxed.unwrap_or(false);
@@ -6046,12 +6073,13 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<RenameRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
-                Ok(v) => Some(v),
-                Err(e) => return Ok(e.to_tool_result()),
-            },
-            None => None,
+        let addr = match Self::mutation_target_address(
+            req.address.as_ref(),
+            req.current_name.as_deref(),
+            "current_name",
+        ) {
+            Ok(addr) => addr,
+            Err(e) => return Ok(e.to_tool_result()),
         };
         let flags = try_param!(parse_optional_unsigned::<i32>(req.flags, "flags")).unwrap_or(0);
         match self
@@ -6071,12 +6099,13 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<PatchRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
-                Ok(v) => Some(v),
-                Err(e) => return Ok(e.to_tool_result()),
-            },
-            None => None,
+        let addr = match Self::mutation_target_address(
+            req.address.as_ref(),
+            req.target_name.as_deref(),
+            "target_name",
+        ) {
+            Ok(addr) => addr,
+            Err(e) => return Ok(e.to_tool_result()),
         };
         let offset = req.offset.unwrap_or(0);
         let bytes = match Self::value_to_bytes(&req.bytes) {
@@ -8738,7 +8767,7 @@ mod tests {
             .collect::<String>();
         assert_eq!(
             digest,
-            "462e7b71370fea94c5cf66d8927e072b92adf0e34c5576d5949779de1e50a119"
+            "e665ac0a0c5dc5eae45e24e62a651461f5d9d1322ca99a820230cba790dc89d3"
         );
     }
 
@@ -9481,5 +9510,29 @@ mod tests {
         assert!(reason(json!({"action": "accept", "content": {}})).contains("did not name a slice"));
         assert!(reason(json!({"action": "decline"})).contains("declined"));
         assert!(reason(json!({"action": "cancel"})).contains("declined"));
+    }
+
+    #[test]
+    fn mutation_targets_take_exactly_one_selector() {
+        let target = |address: Option<Value>, name: Option<&str>| {
+            IdaMcpServer::mutation_target_address(address.as_ref(), name, "target_name")
+        };
+        assert_eq!(target(Some(json!("0x10")), None).ok(), Some(Some(0x10)));
+        assert_eq!(target(None, Some("_main")).ok(), Some(None));
+
+        let rejected = |address: Option<Value>, name: Option<&str>| {
+            target(address, name)
+                .expect_err("must be rejected")
+                .to_string()
+        };
+        assert!(rejected(Some(json!("0x10")), Some("_main")).contains("not both"));
+        assert!(rejected(None, None).contains("pass address or target_name"));
+        assert!(rejected(None, Some("")).contains("must not be empty"));
+        for several in [json!(["0x10", "0x20"]), json!("0x10, 0x20")] {
+            assert!(
+                rejected(Some(several), None).contains("exactly one value"),
+                "multi-address input must not be truncated to its first entry"
+            );
+        }
     }
 }

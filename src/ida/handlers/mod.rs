@@ -18,6 +18,7 @@ pub mod search;
 pub mod segments;
 pub mod strings;
 pub mod structs;
+pub mod target;
 pub mod types;
 pub mod xrefs;
 

@@ -11,6 +11,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::error::ToolError;
 use crate::ida::handlers::resolve_address;
+use crate::ida::handlers::target::TargetSpec;
 use crate::ida::handlers::{
     address, analysis, annotations, controlflow, database, debugger, disasm, dscu, functions,
     globals, imports, lumina, memory, script, search, segments, strings, structs, types, xrefs,
@@ -1107,9 +1108,12 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 let result = crate::crash_guard::crash_guarded("handle_apply_types", || {
                     types::handle_apply_types(
                         &idb,
-                        addr,
-                        name.as_deref(),
-                        offset,
+                        effective_database_path.as_deref(),
+                        TargetSpec {
+                            addr,
+                            name: name.as_deref(),
+                            offset,
+                        },
                         stack_offset,
                         stack_name.as_deref(),
                         decl.as_deref(),
@@ -1210,8 +1214,12 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 let result = crate::crash_guard::crash_guarded("handle_declare_stack", || {
                     types::handle_declare_stack(
                         &idb,
-                        addr,
-                        name.as_deref(),
+                        effective_database_path.as_deref(),
+                        TargetSpec {
+                            addr,
+                            name: name.as_deref(),
+                            offset: 0,
+                        },
                         offset,
                         var_name.as_deref(),
                         &decl,
@@ -1241,8 +1249,12 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 let result = crate::crash_guard::crash_guarded("handle_delete_stack", || {
                     types::handle_delete_stack(
                         &idb,
-                        addr,
-                        name.as_deref(),
+                        effective_database_path.as_deref(),
+                        TargetSpec {
+                            addr,
+                            name: name.as_deref(),
+                            offset: 0,
+                        },
                         offset,
                         var_name.as_deref(),
                     )
@@ -1439,9 +1451,12 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     lumina::handle_pull(
                         &idb,
                         allow_lumina,
-                        addr,
-                        name.as_deref(),
-                        offset,
+                        effective_database_path.as_deref(),
+                        TargetSpec {
+                            addr,
+                            name: name.as_deref(),
+                            offset,
+                        },
                         false,
                         false,
                     )
@@ -1465,9 +1480,12 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     lumina::handle_pull(
                         &idb,
                         allow_lumina,
-                        addr,
-                        name.as_deref(),
-                        offset,
+                        effective_database_path.as_deref(),
+                        TargetSpec {
+                            addr,
+                            name: name.as_deref(),
+                            offset,
+                        },
                         true,
                         force,
                     )
@@ -1526,9 +1544,12 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 let result = crate::crash_guard::crash_guarded("handle_set_comments", || {
                     annotations::handle_set_comments(
                         &idb,
-                        addr,
-                        name.as_deref(),
-                        offset,
+                        effective_database_path.as_deref(),
+                        TargetSpec {
+                            addr,
+                            name: name.as_deref(),
+                            offset,
+                        },
                         &comment,
                         repeatable,
                     )
@@ -1557,8 +1578,12 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 let result = crate::crash_guard::crash_guarded("handle_rename", || {
                     annotations::handle_rename(
                         &idb,
-                        addr,
-                        current_name.as_deref(),
+                        effective_database_path.as_deref(),
+                        TargetSpec {
+                            addr,
+                            name: current_name.as_deref(),
+                            offset: 0,
+                        },
                         &new_name,
                         flags,
                     )
@@ -1586,7 +1611,16 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     "Patching bytes"
                 );
                 let result = crate::crash_guard::crash_guarded("handle_patch_bytes", || {
-                    memory::handle_patch_bytes(&idb, addr, name.as_deref(), offset, &bytes)
+                    memory::handle_patch_bytes(
+                        &idb,
+                        effective_database_path.as_deref(),
+                        TargetSpec {
+                            addr,
+                            name: name.as_deref(),
+                            offset,
+                        },
+                        &bytes,
+                    )
                 });
                 if let Err(e) = &result {
                     warn!(error = %e, "Failed to patch bytes");
@@ -1630,7 +1664,16 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     "Patching asm"
                 );
                 let result = crate::crash_guard::crash_guarded("handle_patch_asm", || {
-                    memory::handle_patch_asm(&idb, addr, name.as_deref(), offset, &line)
+                    memory::handle_patch_asm(
+                        &idb,
+                        effective_database_path.as_deref(),
+                        TargetSpec {
+                            addr,
+                            name: name.as_deref(),
+                            offset,
+                        },
+                        &line,
+                    )
                 });
                 if let Err(e) = &result {
                     warn!(error = %e, "Failed to patch asm");

@@ -416,6 +416,7 @@ pub struct ApplyTypeResult {
     pub address: String,
     pub applied: bool,
     pub source: String,
+    pub target: MutationTarget,
 }
 
 /// Guess type result
@@ -436,6 +437,35 @@ pub struct StackVarResult {
     pub offset: i64,
     pub code: i32,
     pub status: String,
+    pub target: MutationTarget,
+}
+
+/// Which selector a mutating tool's caller used for its target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TargetSelector {
+    Address,
+    Name,
+}
+
+/// The target a mutating tool resolved, recorded before it changed anything.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct MutationTarget {
+    /// Database the mutation applied to, as `open_idb` reported it.
+    pub database: Option<String>,
+    pub selector: TargetSelector,
+    /// Name at `base` before the mutation: the exact name that was matched,
+    /// or the listed name at a given address. `None` when that address has
+    /// no listed name; nearby or generated names are never substituted.
+    pub symbol: Option<String>,
+    /// Address the selector resolved to.
+    pub base: String,
+    /// `base` plus the caller's `offset`: the address the caller asked for.
+    pub requested_address: String,
+    /// Address the tool acted on. Equal to `requested_address` except where
+    /// a tool normalizes it; `lumina_apply` acts on the start of the
+    /// function containing `requested_address`.
+    pub address: String,
 }
 
 /// Xrefs to a struct field
